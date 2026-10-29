@@ -6,21 +6,267 @@ use std::fs;
 use std::io::{self, Write};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{
-    ERROR_NO_MORE_FILES, GetLastError, INVALID_HANDLE_VALUE, STILL_ACTIVE,
+    ERROR_NO_MORE_FILES, FILETIME, GetLastError, INVALID_HANDLE_VALUE, STILL_ACTIVE, WAIT_FAILED,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
+use windows_sys::Win32::System::JobObjects::IsProcessInJob;
 use windows_sys::Win32::System::Threading::{
-    GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
 };
 
 use support::{
     TestDir, ocm_env, ocm_test_binary_path, path_string, run_ocm, stderr, windows_job::FixtureJob,
 };
+
+#[derive(serde::Deserialize)]
+struct PackIdentity {
+    pid: u32,
+    nonce: String,
+    proof: Option<String>,
+}
+
+#[derive(Debug)]
+struct ProcessObservation {
+    wait: u32,
+    wait_error: Option<u32>,
+    exit: Option<u32>,
+    exit_error: Option<u32>,
+}
+
+impl ProcessObservation {
+    fn signaled(&self) -> bool {
+        self.wait == WAIT_OBJECT_0
+    }
+
+    fn live(&self) -> bool {
+        self.wait == WAIT_TIMEOUT && self.exit == Some(STILL_ACTIVE as u32)
+    }
+}
+
+struct PinnedPostpack {
+    handle: OwnedHandle,
+    pid: u32,
+    created: u64,
+    proof: String,
+    authenticated: bool,
+}
+
+impl PinnedPostpack {
+    fn open(identity: &PackIdentity) -> Result<Self, String> {
+        let raw = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE,
+                0,
+                identity.pid,
+            )
+        };
+        if raw.is_null() {
+            return Err(format!(
+                "open postpack {}: {}",
+                identity.pid,
+                io::Error::last_os_error()
+            ));
+        }
+        let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
+        let mut created = FILETIME::default();
+        let mut exited = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        if unsafe { GetProcessTimes(raw, &mut created, &mut exited, &mut kernel, &mut user) } == 0 {
+            return Err(format!(
+                "postpack creation identity: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        let created = ((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64;
+        Ok(Self {
+            handle,
+            pid: identity.pid,
+            created,
+            proof: format!("{}:{}:{created}", identity.nonce, identity.pid),
+            authenticated: false,
+        })
+    }
+
+    fn observe(&self, timeout_ms: u32) -> ProcessObservation {
+        let wait = unsafe { WaitForSingleObject(self.handle.as_raw_handle(), timeout_ms) };
+        let wait_error = (wait == WAIT_FAILED).then(|| unsafe { GetLastError() });
+        let mut exit = 0;
+        let queried = unsafe { GetExitCodeProcess(self.handle.as_raw_handle(), &mut exit) };
+        let exit_error = (queried == 0).then(|| unsafe { GetLastError() });
+        ProcessObservation {
+            wait,
+            wait_error,
+            exit: (queried != 0).then_some(exit),
+            exit_error,
+        }
+    }
+
+    fn qualify_live_member(&self, job: &FixtureJob) -> Result<ProcessObservation, String> {
+        if !self.authenticated {
+            return Err("postpack handle has no fresh child acknowledgement".into());
+        }
+        let mut member = 0;
+        if unsafe { IsProcessInJob(self.handle.as_raw_handle(), job.handle(), &mut member) } == 0 {
+            return Err(format!(
+                "postpack membership query: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        if member == 0 {
+            return Err(format!(
+                "verified postpack pid={} created={} membership=false in the specific FixtureJob",
+                self.pid, self.created
+            ));
+        }
+        let observed = self.observe(0);
+        if !observed.live() {
+            return Err(format!("postpack not live at qualification: {observed:?}"));
+        }
+        Ok(observed)
+    }
+}
+
+// This owns the fixture until the added held child has been proven settled.
+// No assertion is raised in the armed interval before this finalizer runs.
+struct PackCapture {
+    fixture: Option<TestDir>,
+    job: FixtureJob,
+    helper: Child,
+    nonce: Option<String>,
+    postpack: Option<PinnedPostpack>,
+    containment_confirmed: bool,
+    stop_attempted: bool,
+    stop_ok: bool,
+    settled: bool,
+    rescue_attempted: bool,
+}
+
+impl PackCapture {
+    fn path(&self, suffix: &str) -> Result<std::path::PathBuf, String> {
+        let nonce = self.nonce.as_deref().ok_or("capture nonce unavailable")?;
+        Ok(self
+            .fixture
+            .as_ref()
+            .unwrap()
+            .child(format!("postpack-{nonce}.{suffix}")))
+    }
+
+    fn identity(&self, suffix: &str) -> Result<PackIdentity, String> {
+        let bytes = fs::read(self.path(suffix)?).map_err(|error| error.to_string())?;
+        let identity: PackIdentity =
+            serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        if identity.pid == 0 || Some(identity.nonce.as_str()) != self.nonce.as_deref() {
+            return Err("postpack PID/nonce does not match this fixture".into());
+        }
+        Ok(identity)
+    }
+
+    fn write_once(&self, suffix: &str, value: serde_json::Value) -> Result<(), String> {
+        let path = self.path(suffix)?;
+        let mut file = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let existing: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&path).map_err(|error| error.to_string())?)
+                        .map_err(|error| error.to_string())?;
+                return if existing["nonce"].as_str() == self.nonce.as_deref() {
+                    Ok(())
+                } else {
+                    Err("foreign capture marker".into())
+                };
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        file.write_all(value.to_string().as_bytes())
+            .map_err(|error| error.to_string())
+    }
+
+    fn release(&self) -> Result<(), String> {
+        self.write_once("release", serde_json::json!({"nonce": self.nonce}))
+    }
+
+    fn stop(&mut self) -> Result<support::windows_job::StopAccounting, String> {
+        self.stop_attempted = true;
+        let result = self.job.stop();
+        self.stop_ok = result.is_ok();
+        result
+    }
+
+    fn rescue(&mut self) {
+        if self.settled || self.rescue_attempted {
+            return;
+        }
+        self.rescue_attempted = true;
+        let release = self.release();
+        let done = self.write_once(
+            "done",
+            serde_json::json!({"nonce": self.nonce, "hold": false}),
+        );
+        let stop = if self.stop_attempted {
+            None
+        } else {
+            Some(self.stop())
+        };
+        let mut helper_wait = unsafe { WaitForSingleObject(self.helper.as_raw_handle(), 10_000) };
+        if helper_wait != WAIT_OBJECT_0 {
+            let _ = self.helper.kill();
+            helper_wait = unsafe { WaitForSingleObject(self.helper.as_raw_handle(), 10_000) };
+        }
+        if helper_wait == WAIT_OBJECT_0 {
+            let _ = self.helper.wait();
+        }
+        let mut termination = None;
+        let observed = self
+            .postpack
+            .as_ref()
+            .filter(|process| process.authenticated)
+            .map(|process| {
+                let mut observed = process.observe(10_000);
+                if !observed.signaled() {
+                    let killed = unsafe { TerminateProcess(process.handle.as_raw_handle(), 1) };
+                    termination = Some((killed, (killed == 0).then(|| unsafe { GetLastError() })));
+                    observed = process.observe(10_000);
+                }
+                observed
+            });
+        let rescue_settled = self.containment_confirmed
+            && self.stop_ok
+            && helper_wait == WAIT_OBJECT_0
+            && observed.as_ref().is_some_and(ProcessObservation::signaled);
+        // Rescue does not establish the original descendant-settlement sequence.
+        // Keep the fixture on failure, even when the pinned child is now stopped.
+        eprintln!(
+            "failure-only settlement: release={release:?}, done={done:?}, stop={stop:?}, helper_wait={helper_wait}, termination={termination:?}, postpack={observed:?}, rescued_child_settled={rescue_settled}"
+        );
+    }
+}
+
+impl Drop for PackCapture {
+    fn drop(&mut self) {
+        self.rescue();
+        if !self.settled {
+            if let Some(fixture) = self.fixture.take() {
+                eprintln!(
+                    "cleanup unconfirmed; retaining fixture {:?}",
+                    fixture.path()
+                );
+                std::mem::forget(fixture);
+            }
+        }
+    }
+}
 
 fn pin_stage_holder(owner: u32, executable: &str) -> io::Result<Option<OwnedHandle>> {
     let raw = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
@@ -68,7 +314,14 @@ fn pin_stage_holder(owner: u32, executable: &str) -> io::Result<Option<OwnedHand
 
 #[test]
 fn native_windows_pack_preserves_live_child_archive() {
+    // The matched observer control must qualify before the forced-tail arm.
+    run_pack_capture(true);
+    run_pack_capture(false);
+}
+
+fn run_pack_capture(natural_release: bool) {
     let fixture = TestDir::new("native-windows-runtime-pack & %PATH% !literal! 雪");
+    let root = fixture.path().to_path_buf();
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
     let output_path = fixture.child("proof.log");
     let output = fs::File::create(&output_path).unwrap();
@@ -98,8 +351,19 @@ fn native_windows_pack_preserves_live_child_archive() {
         let _ = child.wait();
         panic!("{error}");
     }
-    // The helper must not spawn OCM until all descendants belong to our Job.
-    child.stdin.take().unwrap().write_all(b"owned\n").unwrap();
+    drop(command);
+    let mut capture = PackCapture {
+        fixture: Some(fixture),
+        job,
+        helper: child,
+        nonce: None,
+        postpack: None,
+        containment_confirmed: false,
+        stop_attempted: false,
+        stop_ok: false,
+        settled: false,
+        rescue_attempted: false,
+    };
     let deadline = Instant::now() + Duration::from_secs(120);
     let executable = ocm_test_binary_path();
     let executable = executable
@@ -109,57 +373,167 @@ fn native_windows_pack_preserves_live_child_archive() {
         .into_owned();
     let mut holder = None;
     let mut holder_terminated = false;
-    let result = loop {
-        if holder.is_none() {
-            if let Some(owner) = fs::read_to_string(fixture.child("owner-pid"))
-                .ok()
-                .and_then(|value| value.parse::<u32>().ok())
-            {
-                match pin_stage_holder(owner, &executable) {
-                    Ok(Some(process)) => {
+    let mut armed = false;
+    let result = (|| -> Result<std::process::ExitStatus, String> {
+        // No descendant is allowed to start before the helper is assigned.
+        capture
+            .helper
+            .stdin
+            .take()
+            .ok_or("helper stdin missing")?
+            .write_all(b"owned\n")
+            .map_err(|error| error.to_string())?;
+        loop {
+            if holder.is_none() {
+                if let Some(owner) = fs::read_to_string(root.join("owner-pid"))
+                    .ok()
+                    .and_then(|value| value.parse::<u32>().ok())
+                {
+                    if let Some(process) =
+                        pin_stage_holder(owner, &executable).map_err(|error| error.to_string())?
+                    {
                         holder = Some(process);
-                        fs::write(fixture.child("helper-observed"), "observed").unwrap();
+                        let nonce = fs::read_to_string(root.join("capture-nonce"))
+                            .map_err(|error| error.to_string())?;
+                        if nonce.len() != 36
+                            || !nonce.bytes().all(|c| c.is_ascii_hexdigit() || c == b'-')
+                        {
+                            return Err("invalid fixture capture nonce".into());
+                        }
+                        capture.nonce = Some(nonce);
+                        let identity = capture.identity("ready")?;
+                        // A PID record alone does not authenticate this handle:
+                        // the original child could have exited and its PID reused.
+                        capture.postpack = Some(PinnedPostpack::open(&identity)?);
+                        capture.write_once(
+                            "challenge",
+                            serde_json::json!({
+                                "pid": identity.pid, "nonce": identity.nonce,
+                                "proof": capture.postpack.as_ref().unwrap().proof
+                            }),
+                        )?;
                     }
-                    Ok(None) => {}
-                    Err(error) => break Err(error.to_string()),
                 }
             }
-        }
-        if !holder_terminated && fixture.child("owner-killed").exists() {
-            if let Some(process) = &holder {
-                let mut code = 0;
-                if unsafe { GetExitCodeProcess(process.as_raw_handle(), &mut code) } == 0 {
-                    break Err(io::Error::last_os_error().to_string());
+            if !armed && capture.postpack.is_some() && capture.path("pinned")?.exists() {
+                let acknowledgement = capture.identity("pinned")?;
+                let process = capture.postpack.as_mut().unwrap();
+                if acknowledgement.pid != process.pid
+                    || acknowledgement.proof.as_deref() != Some(process.proof.as_str())
+                    || !process.observe(0).live()
+                {
+                    return Err(
+                        "post-open acknowledgement did not authenticate the live handle".into(),
+                    );
                 }
-                if code != STILL_ACTIVE as u32 {
-                    holder_terminated = true;
-                    fs::write(fixture.child("helper-terminated"), "terminated").unwrap();
+                // The actual child answered a challenge created after this
+                // handle opened. Keep this owned handle even if membership=false.
+                process.authenticated = true;
+                process.qualify_live_member(&capture.job)?;
+                capture.containment_confirmed = true;
+                capture.write_once(
+                    "armed",
+                    serde_json::json!({
+                        "pid": acknowledgement.pid, "nonce": acknowledgement.nonce
+                    }),
+                )?;
+                armed = true;
+            }
+            if !holder_terminated && root.join("owner-killed").exists() {
+                if let Some(process) = &holder {
+                    let mut code = 0;
+                    if unsafe { GetExitCodeProcess(process.as_raw_handle(), &mut code) } == 0 {
+                        return Err(io::Error::last_os_error().to_string());
+                    }
+                    if code != STILL_ACTIVE as u32 {
+                        holder_terminated = true;
+                        fs::write(root.join("helper-terminated"), "terminated")
+                            .map_err(|error| error.to_string())?;
+                    }
                 }
             }
+            match capture
+                .helper
+                .try_wait()
+                .map_err(|error| error.to_string())?
+            {
+                Some(status) => return Ok(status),
+                None if Instant::now() >= deadline => {
+                    return Err("packing fixture timed out".into());
+                }
+                None => std::thread::sleep(Duration::from_millis(20)),
+            }
         }
-        match child.try_wait() {
-            Ok(Some(status)) => break Ok(status),
-            Err(error) => break Err(error.to_string()),
-            Ok(None) if Instant::now() >= deadline => break Err("packing fixture timed out".into()),
-            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+    })();
+    let qualification = (|| -> Result<ProcessObservation, String> {
+        if !matches!(&result, Ok(status) if status.success()) || !holder_terminated {
+            return Err("original owner/holder/live-archive scenario did not qualify".into());
         }
-    };
-    // Parent-only termination is part of the scenario. Reap every surviving
-    // descendant only after its assertions, including on test failure.
-    job.stop().expect("settle every packing fixture process");
-    let _ = child.wait();
-    let diagnostics = fs::read_to_string(output_path).unwrap();
-    println!("{diagnostics}");
-    assert!(
-        matches!(&result, Ok(status) if status.success()),
-        "{result:?}\n{diagnostics}"
+        capture.containment_confirmed = false;
+        let held = capture.identity("held")?;
+        let process = capture.postpack.as_ref().ok_or("postpack was not pinned")?;
+        if held.pid != process.pid {
+            return Err("held announcement changed the pinned process identity".into());
+        }
+        let before = process.qualify_live_member(&capture.job)?;
+        capture.containment_confirmed = true;
+        if natural_release {
+            capture.release()?;
+            let released = process.observe(10_000);
+            if !released.signaled() || released.exit != Some(0) {
+                return Err(format!(
+                    "natural-release control did not exit0: {released:?}"
+                ));
+            }
+            Ok(released)
+        } else {
+            Ok(before)
+        }
+    })();
+    let stopped = capture.stop();
+    // The first observation after the existing stop is a zero-time exact-handle
+    // wait and exit-code read. No output, rescue, or additional wait precedes it.
+    let observed = capture
+        .postpack
+        .as_ref()
+        .filter(|process| process.authenticated)
+        .map(|process| process.observe(0));
+    let helper_wait = unsafe { WaitForSingleObject(capture.helper.as_raw_handle(), 10_000) };
+    if helper_wait == WAIT_OBJECT_0 {
+        let _ = capture.helper.wait();
+    }
+    capture.settled = capture.containment_confirmed
+        && stopped.is_ok()
+        && helper_wait == WAIT_OBJECT_0
+        && observed.as_ref().is_some_and(ProcessObservation::signaled);
+    let valid = qualification.is_ok()
+        && capture.settled
+        && observed.as_ref().is_some_and(|value| value.exit.is_some());
+    if !valid {
+        capture.rescue();
+    }
+    let identity = capture
+        .postpack
+        .as_ref()
+        .map(|process| (process.pid, process.created, process.authenticated));
+    // Both passing arms close the same extra observer before ordinary retry.
+    if valid {
+        drop(capture.postpack.take());
+    }
+    let diagnostics = fs::read_to_string(&output_path).unwrap_or_else(|error| error.to_string());
+    println!(
+        "postpack capture natural_release={natural_release} identity={identity:?} nonce={:?} qualification={qualification:?} stop={stopped:?} immediate={observed:?} rescue={}\n{diagnostics}",
+        capture.nonce, capture.rescue_attempted
     );
-
-    assert!(holder_terminated, "the inert holder survived its owner");
+    assert!(
+        valid,
+        "paired capture did not qualify: result={result:?}, qualification={qualification:?}, stop={stopped:?}, immediate={observed:?}"
+    );
+    let fixture = capture.fixture.as_ref().unwrap();
 
     // The original active-child assertion ran before Job cleanup. With all
     // descendants now proven stopped, retry must reclaim its abandoned stage.
-    let mut env = ocm_env(&fixture);
+    let mut env = ocm_env(fixture);
     for key in ["WINDIR", "COMSPEC", "PATHEXT"] {
         if let Ok(value) = std::env::var(key) {
             env.insert(key.into(), value);
