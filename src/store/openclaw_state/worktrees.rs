@@ -46,7 +46,7 @@ struct CopyGraph<'a> {
     mappings: &'a [(&'a Path, &'a Path)],
     checkouts: BTreeMap<PathBuf, Checkout>,
     commons: BTreeSet<PathBuf>,
-    object_dirs: BTreeSet<PathBuf>,
+    object_dirs: BTreeSet<(PathBuf, bool)>,
     metadata_dirs: BTreeSet<(PathBuf, MetadataScope)>,
     resolved_directories: BTreeMap<PathBuf, PathBuf>,
     resolved_aliases: BTreeMap<PathBuf, PathBuf>,
@@ -96,6 +96,21 @@ pub(in crate::store) fn relocate_copied_worktrees_with_history_roots(
         graph.checkout(root)?;
     }
     let records = read_managed_registry(database.as_deref(), &mut graph)?;
+    for context in &contexts {
+        if context.checkout == context.private_dir {
+            // Native bare repositories have no .git entry. Relocate the object
+            // stores already copied, without acquiring or requiring donors that
+            // the caller's selection omitted. Ordinary/managed graphs above
+            // retain their strict dependency requirements.
+            let objects = context.common_dir.join("objects");
+            if graph
+                .resolve_copied_path(&objects, 0, false, true)?
+                .is_some()
+            {
+                graph.alternates(&objects, true)?;
+            }
+        }
+    }
     if let Some(database) = database.as_ref().filter(|_| !records.is_empty())
         && graph.owned(&database_path)? != *database
     {
@@ -543,10 +558,32 @@ impl CopyGraph<'_> {
         depth: usize,
         record: bool,
     ) -> Result<PathBuf, String> {
+        self.resolve_copied_path(path, depth, record, false)?
+            .ok_or_else(|| "required copied Git path disappeared".to_string())
+    }
+
+    // Optional bare donors may be absent from the copy. Distinguish only that
+    // absence or external storage from cycles and other filesystem errors.
+    fn resolve_copied_path(
+        &mut self,
+        path: &Path,
+        depth: usize,
+        record: bool,
+        allow_uncopied: bool,
+    ) -> Result<Option<PathBuf>, String> {
         if depth > 40 {
             return Err("cannot copy managed worktree: cyclic or excessive Git links".to_string());
         }
-        let projected = self.project(path).ok_or_else(|| format!("cannot copy managed worktree: required Git path is outside the copied environment: {}", display_path(path)))?;
+        let projected = match self.project(path) {
+            Some(path) => path,
+            None if allow_uncopied => return Ok(None),
+            None => {
+                return Err(format!(
+                    "cannot copy managed worktree: required Git path is outside the copied environment: {}",
+                    display_path(path)
+                ));
+            }
+        };
         let relative = projected
             .strip_prefix(&self.root)
             .or_else(|_| projected.strip_prefix(self.target))
@@ -560,6 +597,7 @@ impl CopyGraph<'_> {
                     continue;
                 }
                 Component::Normal(name) => current.push(name),
+                Component::ParentDir if allow_uncopied => return Ok(None),
                 _ => {
                     return Err(
                         "cannot copy managed worktree: Git path escapes the copied environment"
@@ -573,6 +611,9 @@ impl CopyGraph<'_> {
             }
             let metadata = match fs::symlink_metadata(&current) {
                 Ok(metadata) => metadata,
+                Err(error) if allow_uncopied && error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(None);
+                }
                 Err(error) => {
                     return Err(format!(
                         "cannot copy managed worktree: required Git path is unavailable: {}: {error}",
@@ -587,10 +628,23 @@ impl CopyGraph<'_> {
                 } else {
                     current.parent().unwrap().join(&original)
                 };
-                let projected = self
+                let projected = match self
                     .project_copied_value(&original, current.parent().unwrap())
-                    .ok_or_else(|| format!("cannot copy managed worktree: required Git path is outside the copied environment: {}", display_path(&value)))?;
-                let target = self.resolve_owned(&projected, depth + 1, record)?;
+                {
+                    Some(path) => path,
+                    None if allow_uncopied => return Ok(None),
+                    None => {
+                        return Err(format!(
+                            "cannot copy managed worktree: required Git path is outside the copied environment: {}",
+                            display_path(&value)
+                        ));
+                    }
+                };
+                let Some(target) =
+                    self.resolve_copied_path(&projected, depth + 1, record, allow_uncopied)?
+                else {
+                    return Ok(None);
+                };
                 if record {
                     // Retain every encountered role, including relative file
                     // aliases that need no link rewrite. Cached directories
@@ -613,7 +667,7 @@ impl CopyGraph<'_> {
                     .insert(current.clone(), current.clone());
             }
         }
-        Ok(current)
+        Ok(Some(current))
     }
 
     fn pointer(
@@ -697,7 +751,7 @@ impl CopyGraph<'_> {
         }
         if self.commons.insert(common.clone()) {
             self.inspect_metadata(&common, MetadataScope::Root)?;
-            self.alternates(&common.join("objects"))?;
+            self.alternates(&common.join("objects"), false)?;
             let slots = common.join("worktrees");
             if git_entry_exists(&slots)? {
                 let slots = self.owned(&slots)?;
@@ -792,9 +846,15 @@ impl CopyGraph<'_> {
         Ok(())
     }
 
-    fn alternates(&mut self, objects: &Path) -> Result<(), String> {
+    fn alternates(&mut self, objects: &Path, allow_uncopied: bool) -> Result<(), String> {
         let objects = self.owned(objects)?;
-        if !self.object_dirs.insert(objects.clone()) {
+        if !objects.is_dir() {
+            return Err(format!(
+                "copied Git object store is not a directory: {}",
+                display_path(&objects)
+            ));
+        }
+        if !self.object_dirs.insert((objects.clone(), allow_uncopied)) {
             return Ok(());
         }
         self.preserved.insert(objects.clone());
@@ -823,7 +883,9 @@ impl CopyGraph<'_> {
             }
             let (mut raw, consumed) = crate::openclaw_repo::unquote_git_path(remaining)
                 .unwrap_or_else(|| (remaining[..end].to_vec(), end));
-            remaining = &remaining[(consumed + 1).min(remaining.len())..];
+            let consumed = (consumed + 1).min(remaining.len());
+            let original_entry = &remaining[..consumed];
+            remaining = &remaining[consumed..];
             if let Some(end) = raw.iter().position(|byte| *byte == 0) {
                 raw.truncate(end);
             }
@@ -838,9 +900,20 @@ impl CopyGraph<'_> {
             };
             #[cfg(not(unix))]
             let path = PathBuf::from(String::from_utf8(raw).map_err(|e| e.to_string())?);
-            let projected = self.project_copied_value(&path, &objects).ok_or_else(|| format!("cannot copy managed worktree: Git alternate is outside the copied environment: {}", display_path(&path)))?;
+            let projected = self.project_copied_value(&path, &objects);
+            if allow_uncopied {
+                let present = match &projected {
+                    Some(path) => self.resolve_copied_path(path, 0, false, true)?.is_some(),
+                    None => false,
+                };
+                if !present {
+                    updated.extend_from_slice(original_entry);
+                    continue;
+                }
+            }
+            let projected = projected.ok_or_else(|| format!("cannot copy managed worktree: Git alternate is outside the copied environment: {}", display_path(&path)))?;
             let target = self.owned(&projected)?;
-            self.alternates(&target)?;
+            self.alternates(&target, allow_uncopied)?;
             updated.push(b'"');
             for byte in git_path(&target).as_os_str().as_encoded_bytes() {
                 match byte {

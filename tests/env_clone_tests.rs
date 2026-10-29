@@ -3284,6 +3284,28 @@ fn env_clone_copied_git_config_shared_repositories_read_history_without_the_sour
                 &["clone", flag, &copied_config_path(&donor), name],
             );
         }
+        for (name, flag) in [
+            ("shared.git", "--shared"),
+            ("independent.git", "--no-hardlinks"),
+            ("relative.git", "--shared"),
+        ] {
+            copied_config_git(
+                &workspace,
+                &env,
+                &["clone", "--bare", flag, &copied_config_path(&donor), name],
+            );
+            assert!(!workspace.join(name).join(".git").exists());
+        }
+        write_text(
+            &workspace.join("relative.git/objects/info/alternates"),
+            "../../nested repo/.git/objects\n",
+        );
+        for name in ["shared.git", "independent.git", "relative.git"] {
+            assert_eq!(
+                copied_config_git(&workspace.join(name), &env, &["show", "HEAD:file"]),
+                "authored content"
+            );
+        }
         let before = file_bytes(&source);
         let home = source.join(".openclaw");
         let output = match route {
@@ -3310,7 +3332,14 @@ fn env_clone_copied_git_config_shared_repositories_read_history_without_the_sour
         assert_eq!(file_bytes(&source), before, "{route} changed source bytes");
         fs::rename(&source, source.with_extension("offline")).unwrap();
         let target = source.parent().unwrap().join("target/.openclaw/workspace");
-        for name in ["nested repo", "shared", "independent"] {
+        for name in [
+            "nested repo",
+            "shared",
+            "independent",
+            "shared.git",
+            "independent.git",
+            "relative.git",
+        ] {
             assert_eq!(
                 copied_config_git(&target.join(name), &env, &["show", "HEAD:file"]),
                 "authored content",
