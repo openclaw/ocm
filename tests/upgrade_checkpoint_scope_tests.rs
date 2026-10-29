@@ -1069,6 +1069,49 @@ fn scoped_restore_keeps_exclusions_with_case_aliased_ancestors_together() {
 }
 
 #[test]
+fn scoped_restore_preserves_registered_child_through_case_renamed_independent_path() {
+    let mut fixture = Fixture::with_independent_root("projects");
+    let root = fixture.state.parent().unwrap().to_path_buf();
+    if !root.join("Projects").exists() {
+        return; // This admission case requires native lookup equivalence.
+    }
+    let owned = root.join("owned-marker");
+    write_text(&owned, "saved");
+    let snapshot = fixture.upgrade_checkpoint();
+    fixture.run_ok(&["env", "create", "child", "--protect"]);
+    let child = fixture.run_ok(&["env", "show", "child", "--json"]);
+    let child: Value = serde_json::from_slice(&child.stdout).unwrap();
+    let registered = PathBuf::from(child["root"].as_str().unwrap());
+    let relocated = root.join("projects/child");
+    // A native relocation keeps the CLI-created registration reachable through
+    // its original path. Neither registry nor checkpoint metadata is edited.
+    fs::rename(&registered, &relocated).unwrap();
+    symlink(&relocated, &registered).unwrap();
+    let marker = registered.join("current-work");
+    write_text(&marker, "independent");
+    let identity = fs::metadata(&marker).unwrap().ino();
+    let id = snapshot["id"].as_str().unwrap();
+    write_text(&owned, "current");
+    fixture.run_ok(&["env", "snapshot", "restore", "demo", id]);
+    assert_eq!(fs::read(&owned).unwrap(), b"saved");
+    write_text(&owned, "current");
+    let project_inode = fs::metadata(root.join("projects")).unwrap().ino();
+    fs::rename(root.join("projects"), root.join("Projects")).unwrap();
+    assert_eq!(
+        fs::metadata(root.join("projects")).unwrap().ino(),
+        project_inode
+    );
+    assert_eq!(
+        fs::metadata(root.join("Projects")).unwrap().ino(),
+        project_inode
+    );
+    fixture.run_ok(&["env", "snapshot", "restore", "demo", id]);
+    assert_eq!(fs::read(&owned).unwrap(), b"saved");
+    assert_eq!(fs::read(&marker).unwrap(), b"independent");
+    assert_eq!(fs::metadata(&marker).unwrap().ino(), identity);
+}
+
+#[test]
 fn full_backup_still_rewinds_declared_independent_content() {
     for independent in [
         ".openclaw/workspace/projects",

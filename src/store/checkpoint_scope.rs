@@ -78,6 +78,15 @@ fn require_directory(path: &Path) -> Result<(), String> {
     }
 }
 
+fn directory_entry_names(directory: &Path) -> Result<BTreeSet<OsString>, String> {
+    require_directory(directory)?;
+    fs::read_dir(directory)
+        .map_err(|error| error.to_string())?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<Result<_, _>>()
+        .map_err(|error| error.to_string())
+}
+
 // Resolve a scope component without following its final link or opening its
 // contents. Exact entries stay distinct even when they are hard links.
 fn scope_entry_name(
@@ -115,6 +124,45 @@ fn scope_entry_name(
     })
 }
 
+/// Whether scoped replacement preserves a relative entry or its entire contents.
+/// Match only through the exclusion boundary; its descendants remain opaque.
+pub(crate) fn preserves_path(
+    root: &Path,
+    independent: &[PathBuf],
+    relative: &Path,
+    contents: bool,
+) -> Result<bool, String> {
+    for excluded in independent {
+        let mut scope = excluded.components();
+        let mut selected = relative.components();
+        let mut directory = root.to_path_buf();
+        let preserved = loop {
+            match (scope.next(), selected.next()) {
+                (None, _) => break true,
+                (_, None) => break !contents,
+                (Some(expected), Some(actual)) => {
+                    if expected != actual {
+                        let names = directory_entry_names(&directory)?;
+                        let expected_name =
+                            scope_entry_name(&directory, &names, expected.as_os_str())?;
+                        if expected_name.is_none()
+                            || expected_name
+                                != scope_entry_name(&directory, &names, actual.as_os_str())?
+                        {
+                            break false;
+                        }
+                    }
+                    directory.push(expected);
+                }
+            }
+        };
+        if preserved {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn collect_owned_entries(
     current: &Path,
     candidate: &Path,
@@ -135,16 +183,8 @@ fn collect_owned_entries(
     ancestors.push(relative.to_path_buf());
     let current_dir = current.join(relative);
     let candidate_dir = candidate.join(relative);
-    let read_names = |dir: &Path| -> Result<BTreeSet<OsString>, String> {
-        require_directory(dir)?;
-        fs::read_dir(dir)
-            .map_err(|error| error.to_string())?
-            .map(|entry| entry.map(|entry| entry.file_name()))
-            .collect::<Result<_, _>>()
-            .map_err(|error| error.to_string())
-    };
-    let current_names = read_names(&current_dir)?;
-    let candidate_names = read_names(&candidate_dir)?;
+    let current_names = directory_entry_names(&current_dir)?;
+    let candidate_names = directory_entry_names(&candidate_dir)?;
     let mut children: BTreeMap<OsString, Vec<PathBuf>> = BTreeMap::new();
     let mut aliases = BTreeMap::new();
     for path in independent {
