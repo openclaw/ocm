@@ -216,6 +216,7 @@ struct DevSourceSwitch<'a> {
     env_name: String,
     previous: String,
     selected: String,
+    expected: EnvMeta,
     kept: bool,
 }
 
@@ -233,7 +234,7 @@ impl Drop for DevSourceSwitch<'_> {
         let env_service = self.cli.environment_service();
         let restored = env_service.rebind_dev_from(
             &self.env_name,
-            Some(&self.selected),
+            Some(&self.expected),
             Path::new(&self.previous),
         );
         let message = match restored {
@@ -243,8 +244,10 @@ impl Drop for DevSourceSwitch<'_> {
             ),
             Err(error)
                 if env_service.get(&self.env_name).is_ok_and(|meta| {
-                    meta.dev.as_ref().and_then(EnvDevMeta::borrowed_source_root)
-                        == Some(self.selected.as_str())
+                    meta.root == self.expected.root
+                        && meta.created_at == self.expected.created_at
+                        && meta.dev.as_ref().and_then(EnvDevMeta::borrowed_source_root)
+                            == Some(self.selected.as_str())
                 }) =>
             {
                 format!(
@@ -1803,13 +1806,16 @@ impl Cli {
         self.validate_existing_dev_request(&candidate, Some(&selected), root, gateway_port)?;
         let summary = self
             .environment_service()
-            .rebind_dev_from(&existing.name, Some(previous), target)
+            .rebind_dev_from(&existing.name, Some(existing), target)
             .map_err(|error| {
                 format!(
                     "cannot switch dev env {} from {previous} to {selected}: {error}",
                     existing.name
                 )
             })?;
+        candidate.dev = Some(EnvDevMeta::Borrowed {
+            source_root: summary.source_root.clone(),
+        });
         self.stderr_lines(render_dev_run_step(
             "Switch",
             format!(
@@ -1823,6 +1829,7 @@ impl Cli {
             env_name: summary.env_name,
             previous: summary.previous_source_root,
             selected: summary.source_root,
+            expected: candidate,
             kept: false,
         })
     }

@@ -1322,6 +1322,201 @@ fn dev_explicit_rebind_still_leaves_dependency_preparation_explicit() {
     assert!(!worktree.join("node_modules").exists());
 }
 
+// Hold the native switch progress write after rebind publication, before the
+// source lease is acquired. A failed assertion must still reap the old process.
+#[cfg(unix)]
+struct HeldDevSwitch {
+    child: std::process::Child,
+    stderr: Option<File>,
+    padding: usize,
+}
+
+#[cfg(unix)]
+impl HeldDevSwitch {
+    fn start(cwd: &Path, env: &std::collections::BTreeMap<String, String>, args: &[&str]) -> Self {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let reader = unsafe { File::from_raw_fd(fds[0]) };
+        let mut writer = unsafe { File::from_raw_fd(fds[1]) };
+        let flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        let mut padding = 0;
+        loop {
+            match writer.write(&[b'X'; 4096]) {
+                Ok(count) => padding += count,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => panic!("fill stderr pipe: {error}"),
+            }
+        }
+        assert_eq!(
+            unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, flags) },
+            0
+        );
+        let child = Command::new(env!("CARGO_BIN_EXE_ocm"))
+            .current_dir(cwd)
+            .env_clear()
+            .envs(env)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(writer))
+            .spawn()
+            .unwrap();
+        Self {
+            child,
+            stderr: Some(reader),
+            padding,
+        }
+    }
+
+    fn finish(mut self) -> (std::process::ExitStatus, String) {
+        let mut reader = self.stderr.take().unwrap();
+        let drain = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes).unwrap();
+            bytes
+        });
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "old switch did not finish");
+            thread::sleep(Duration::from_millis(10));
+        };
+        let bytes = drain.join().unwrap();
+        assert!(bytes[..self.padding].iter().all(|byte| *byte == b'X'));
+        (
+            status,
+            String::from_utf8(bytes[self.padding..].to_vec()).unwrap(),
+        )
+    }
+}
+
+#[cfg(unix)]
+impl Drop for HeldDevSwitch {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn dev_switch_rollback_preserves_a_recreated_environment() {
+    let _serial = INITIAL_UI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for replacement_source in ["source-b", "source-c"] {
+        let root = TestDir::new("dev-switch-recreated");
+        let mut env = ocm_env(&root);
+        env.insert(
+            "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
+            "unsupported".to_string(),
+        );
+        for name in ["source-a", "source-b", "source-c"] {
+            let path = root.child(name);
+            init_nested_openclaw_repo(&path);
+            fs::write(path.join("openclaw.mjs"), "// finite native source\n").unwrap();
+            commit_nested_openclaw_repo(&path);
+        }
+        let a = path_string(&root.child("source-a"));
+        let b = path_string(&root.child("source-b"));
+        let replacement_source = path_string(&root.child(replacement_source));
+        let old_root = path_string(&root.child("original"));
+        let new_root = path_string(&root.child("replacement"));
+        let created = run_ocm(
+            root.path(),
+            &env,
+            &dev_plain(&[
+                "demo",
+                "--repo",
+                &a,
+                "--root",
+                &old_root,
+                "--port",
+                REBIND_GATEWAY_PORT,
+            ]),
+        );
+        assert!(created.status.success(), "{}", stderr(&created));
+        let original = get_environment("demo", &env, root.path()).unwrap();
+        let mut held = HeldDevSwitch::start(
+            root.path(),
+            &env,
+            &dev_plain(&["demo", "--repo", &b, "--root", &old_root]),
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            assert!(
+                held.child.try_wait().unwrap().is_none(),
+                "switch exited before publication"
+            );
+            let current = get_environment("demo", &env, root.path()).unwrap();
+            if current
+                .dev
+                .as_ref()
+                .and_then(EnvDevMeta::borrowed_source_root)
+                == Some(b.as_str())
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "source switch was not published");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let status = run_ocm(root.path(), &env, &["dev", "status", "demo", "--json"]);
+        assert!(status.status.success(), "{}", stderr(&status));
+        assert_eq!(
+            serde_json::from_str::<Value>(&stdout(&status)).unwrap()["sourceWatch"]["state"],
+            "inactive"
+        );
+        let removed = run_ocm(root.path(), &env, &["env", "remove", "demo"]);
+        assert!(removed.status.success(), "{}", stderr(&removed));
+        let created = run_ocm(
+            root.path(),
+            &env,
+            &dev_plain(&[
+                "demo",
+                "--repo",
+                &replacement_source,
+                "--root",
+                &new_root,
+                "--port",
+                REBIND_GATEWAY_PORT,
+            ]),
+        );
+        assert!(created.status.success(), "{}", stderr(&created));
+        let replacement = get_environment("demo", &env, root.path()).unwrap();
+        assert_ne!(replacement.created_at, original.created_at);
+        assert_eq!(replacement.root, new_root);
+        let config_path = ocm::store::derive_env_paths(Path::new(&replacement.root)).config_path;
+        let config = fs::read(&config_path).unwrap();
+        let (status, error) = held.finish();
+        assert_eq!(status.code(), Some(1), "{error}");
+        assert!(
+            error.contains("was replaced; its binding was kept"),
+            "{error}"
+        );
+        assert!(!error.contains("Switched demo back"), "{error}");
+        assert!(!error.contains("prepare it with"), "{error}");
+        assert_eq!(
+            get_environment("demo", &env, root.path()).unwrap(),
+            replacement
+        );
+        assert_eq!(fs::read(&config_path).unwrap(), config);
+        let resolved = run_ocm(root.path(), &env, &["env", "resolve", "demo", "--json"]);
+        assert!(resolved.status.success(), "{}", stderr(&resolved));
+        assert_eq!(
+            serde_json::from_str::<Value>(&stdout(&resolved)).unwrap()["runDir"],
+            replacement_source
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn dev_switch_restores_the_previous_source_after_failed_or_interrupted_preparation() {

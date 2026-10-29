@@ -142,8 +142,10 @@ missing tooling with `pnpm install --frozen-lockfile`. If a switched start fails
 or is cancelled before the selected checkout is prepared, its processes are
 verified stopped and the previous checkout is still valid, OCM switches the
 environment back, so the next start from the selected checkout switches and
-prepares it again. Once the checkout is prepared the switch stays, even if the
-Gateway then fails to start; the next start there needs no preparation.
+prepares it again. Rollback applies only to the original environment generation;
+an environment removed and recreated under the same name keeps its own source
+binding. Once the checkout is prepared the switch stays, even if the Gateway then
+fails to start; the next start there needs no preparation.
 Otherwise the new binding stays and OCM says so: an installer stopped by a
 signal leaves cleanup unverified, so its session ownership is kept for recovery,
 and a missing previous checkout cannot be restored. Missing tooling in the
