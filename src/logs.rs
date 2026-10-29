@@ -73,6 +73,12 @@ impl LogSources {
             None
         } else if self.excluded_paths.is_empty() {
             modified_at(&self.service_path)
+        } else if gateway_modified.is_some_and(|gateway_time| {
+            modified_at(&self.service_path).is_some_and(|service_time| gateway_time >= service_time)
+        }) {
+            // Gateway wins ties too. An unused child file need not be opened
+            // for diagnostic ownership checks before reading Gateway output.
+            None
         } else {
             open_log_excluding(&self.service_path, &self.excluded_paths)?
                 .and_then(|(_, metadata)| modified_time(&metadata))

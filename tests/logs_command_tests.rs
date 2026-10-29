@@ -739,6 +739,44 @@ fn followers_report_initial_native_child_log_read_errors() {
                     );
                 }
             }
+            // A child read error must not block a Gateway file that wins the
+            // normal freshness comparison, including the equal-time rule.
+            let gateway = root.child(&format!(
+                "ocm-home/envs/{name}/.openclaw/logs/{}",
+                if stream == "info" {
+                    "gateway.log"
+                } else {
+                    "gateway.err.log"
+                }
+            ));
+            fs::create_dir_all(gateway.parent().unwrap()).unwrap();
+            fs::write(&gateway, "current gateway\n").unwrap();
+            let modified = fs::metadata(&path).unwrap().modified().unwrap();
+            let permissions = fs::metadata(&path).unwrap().permissions();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0)).unwrap();
+            let snapshots = [modified, modified + Duration::from_secs(1)].map(|time| {
+                fs::File::open(&gateway)
+                    .unwrap()
+                    .set_modified(time)
+                    .unwrap();
+                run_ocm(&cwd, &env, &["logs", name, "--stream", stream, "--json"])
+            });
+            let (mut child, receiver) = spawn_follow(
+                &cwd,
+                &env,
+                &["logs", name, "--stream", stream, "--follow", "--raw"],
+            );
+            let line = receiver.recv_timeout(Duration::from_secs(5));
+            let _ = child.kill();
+            let _ = child.wait();
+            fs::set_permissions(&path, permissions).unwrap();
+            for output in snapshots {
+                assert!(output.status.success(), "{}", stderr(&output));
+                let body: Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(body["sourceKind"], "gateway");
+                assert_eq!(body["content"], "current gateway\n");
+            }
+            assert_eq!(line.unwrap(), "current gateway");
         }
     }
 }
