@@ -92,7 +92,14 @@ pub fn select_snapshot_prune_candidates(
     keep: Option<usize>,
     older_than_days: Option<i64>,
     now: OffsetDateTime,
-) -> Vec<EnvSnapshotSummary> {
+) -> Result<Vec<EnvSnapshotSummary>, String> {
+    let cutoff = older_than_days
+        .map(|days| {
+            days.checked_mul(86_400)
+                .and_then(|seconds| now.checked_sub(Duration::seconds(seconds)))
+                .ok_or_else(|| "--older-than is outside the supported date range".to_string())
+        })
+        .transpose()?;
     let mut grouped = BTreeMap::<String, Vec<EnvSnapshotSummary>>::new();
     for snapshot in snapshots {
         grouped
@@ -101,7 +108,6 @@ pub fn select_snapshot_prune_candidates(
             .push(snapshot.clone());
     }
 
-    let cutoff = older_than_days.map(|days| now - Duration::days(days));
     let keep = keep.unwrap_or(0);
     let mut out = Vec::new();
 
@@ -121,7 +127,7 @@ pub fn select_snapshot_prune_candidates(
     }
 
     sort_snapshots(&mut out);
-    out
+    Ok(out)
 }
 
 fn sort_snapshots(snapshots: &mut [EnvSnapshotSummary]) {
@@ -356,12 +362,7 @@ impl<'a> EnvironmentService<'a> {
         older_than_days: Option<i64>,
     ) -> Result<Vec<EnvSnapshotSummary>, String> {
         let snapshots = self.list_snapshots(env_name)?;
-        Ok(select_snapshot_prune_candidates(
-            &snapshots,
-            keep,
-            older_than_days,
-            now_utc(),
-        ))
+        select_snapshot_prune_candidates(&snapshots, keep, older_than_days, now_utc())
     }
 
     pub fn prune_snapshots(
@@ -719,7 +720,7 @@ mod tests {
             snapshot("beta-1", "beta", now - time::Duration::days(2)),
         ];
 
-        let candidates = select_snapshot_prune_candidates(&snapshots, Some(1), None, now);
+        let candidates = select_snapshot_prune_candidates(&snapshots, Some(1), None, now).unwrap();
         let ids = candidates
             .iter()
             .map(|snapshot| snapshot.id.as_str())
@@ -737,12 +738,23 @@ mod tests {
             snapshot("beta-old", "beta", now - time::Duration::days(40)),
         ];
 
-        let candidates = select_snapshot_prune_candidates(&snapshots, Some(1), Some(7), now);
+        let candidates =
+            select_snapshot_prune_candidates(&snapshots, Some(1), Some(7), now).unwrap();
         let ids = candidates
             .iter()
             .map(|snapshot| snapshot.id.as_str())
             .collect::<Vec<_>>();
         assert_eq!(ids, vec!["alpha-old", "beta-old"]);
+    }
+
+    #[test]
+    fn snapshot_prune_selection_rejects_unrepresentable_ages() {
+        let now = parse_time("2026-03-25T22:00:00Z");
+        for days in [i64::from(u32::MAX), i64::MAX, i64::MIN] {
+            let error =
+                select_snapshot_prune_candidates(&[], Some(1), Some(days), now).unwrap_err();
+            assert_eq!(error, "--older-than is outside the supported date range");
+        }
     }
 
     fn snapshot(id: &str, env_name: &str, created_at: OffsetDateTime) -> EnvSnapshotSummary {

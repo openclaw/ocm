@@ -4426,6 +4426,79 @@ fn env_snapshot_prune_previews_candidates_without_removing_them() {
 }
 
 #[test]
+fn env_snapshot_prune_rejects_unrepresentable_ages_without_changing_data() {
+    let root = TestDir::new("env-snapshot-prune-age");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    let create = run_ocm(&cwd, &env, &["env", "create", "source"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let marker = root.child("ocm-home/envs/source/durable.txt");
+    write_text(&marker, "snapshot payload");
+    let capture = run_ocm(
+        &cwd,
+        &env,
+        &["env", "snapshot", "create", "source", "--json"],
+    );
+    assert!(capture.status.success(), "{}", stderr(&capture));
+    let snapshot: Value = serde_json::from_slice(&capture.stdout).unwrap();
+    let id = snapshot["id"].as_str().unwrap();
+    let checkpoint = PathBuf::from(snapshot["archivePath"].as_str().unwrap());
+    write_text(&marker, "current source payload");
+    let preserved = [
+        marker,
+        checkpoint.join("durable.txt"),
+        root.child(&format!("ocm-home/snapshots/source/{id}.json")),
+        env_registry_path(&env, &cwd).unwrap(),
+    ];
+    let before = preserved.map(|path| {
+        let bytes = fs::read(&path).unwrap();
+        (path, bytes)
+    });
+
+    for scope in ["source", "--all"] {
+        for apply in [false, true] {
+            for age in ["1", "30", "4294967295", "4294967296"] {
+                let mut args = vec![
+                    "env",
+                    "snapshot",
+                    "prune",
+                    scope,
+                    "--keep",
+                    "1",
+                    "--older-than",
+                    age,
+                    "--json",
+                ];
+                if apply {
+                    args.push("--yes");
+                }
+                let result = run_ocm(&cwd, &env, &args);
+                if age == "1" || age == "30" {
+                    assert!(result.status.success(), "{}", stderr(&result));
+                    let summary: Value = serde_json::from_slice(&result.stdout).unwrap();
+                    assert_eq!(summary["apply"], apply);
+                    assert_eq!(summary["count"], 0);
+                } else {
+                    assert_eq!(result.status.code(), Some(1), "{}", stderr(&result));
+                    assert!(result.stdout.is_empty());
+                    let expected = if age == "4294967295" {
+                        "ocm: --older-than is outside the supported date range"
+                    } else {
+                        "ocm: --older-than must be a positive integer"
+                    };
+                    assert!(stderr(&result).contains(expected), "{}", stderr(&result));
+                    assert!(!stderr(&result).contains("panicked"));
+                }
+                for (path, bytes) in &before {
+                    assert_eq!(&fs::read(path).unwrap(), bytes, "{}", path.display());
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn env_snapshot_prune_yes_removes_selected_snapshots() {
     let root = TestDir::new("env-snapshot-prune-apply");
     let cwd = root.child("workspace");
