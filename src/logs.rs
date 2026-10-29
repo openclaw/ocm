@@ -67,22 +67,22 @@ impl LogSources {
     }
 
     /// Picks the newer existing file, or the Gateway path when neither exists.
-    fn select(&self) -> LogTarget {
-        let modified = |path: &Path| {
-            if self.excluded_paths.is_empty() {
-                modified_at(path)
-            } else {
-                open_log_excluding(path, &self.excluded_paths)
-                    .ok()
-                    .flatten()
-                    .and_then(|(_, metadata)| modified_time(&metadata))
-            }
-        };
+    fn select(&self) -> Result<LogTarget, String> {
         let gateway_modified = modified_at(&self.gateway_path);
-        let service_modified = self
-            .service_available
-            .then(|| modified(&self.service_path))
-            .flatten();
+        let service_modified = if !self.service_available {
+            None
+        } else if self.excluded_paths.is_empty() {
+            modified_at(&self.service_path)
+        } else if gateway_modified.is_some_and(|gateway_time| {
+            modified_at(&self.service_path).is_some_and(|service_time| gateway_time >= service_time)
+        }) {
+            // Gateway wins ties too. An unused child file need not be opened
+            // for diagnostic ownership checks before reading Gateway output.
+            None
+        } else {
+            open_log_excluding(&self.service_path, &self.excluded_paths)?
+                .and_then(|(_, metadata)| modified_time(&metadata))
+        };
         let (source_kind, path) = match (gateway_modified, service_modified) {
             (Some(gateway_time), Some(service_time)) => {
                 if service_time > gateway_time {
@@ -96,12 +96,12 @@ impl LogSources {
             (None, None) => ("gateway", &self.gateway_path),
         };
 
-        LogTarget {
+        Ok(LogTarget {
             env_name: self.env_name.clone(),
             stream: self.stream.clone(),
             source_kind: source_kind.to_string(),
             path: path.clone(),
-        }
+        })
     }
 }
 
@@ -122,7 +122,10 @@ impl<'a> LogService<'a> {
         tail_lines: Option<usize>,
     ) -> Result<LogSummary, String> {
         let sources = self.stream_sources(name, stream)?;
-        let targets = sources.iter().map(LogSources::select).collect::<Vec<_>>();
+        let targets = sources
+            .iter()
+            .map(LogSources::select)
+            .collect::<Result<Vec<_>, _>>()?;
         if targets.len() == 1 {
             let target = &targets[0];
             if !target.path.exists() {
@@ -207,7 +210,7 @@ impl<'a> LogService<'a> {
     }
 
     pub fn target(&self, name: &str, stream: &str) -> Result<LogTarget, String> {
-        Ok(self.sources(name, stream)?.select())
+        self.sources(name, stream)?.select()
     }
 
     fn sources(&self, name: &str, stream: &str) -> Result<LogSources, String> {
@@ -260,11 +263,10 @@ impl<'a> LogService<'a> {
     }
 
     pub fn targets(&self, name: &str, stream: &str) -> Result<Vec<LogTarget>, String> {
-        Ok(self
-            .stream_sources(name, stream)?
+        self.stream_sources(name, stream)?
             .iter()
             .map(LogSources::select)
-            .collect())
+            .collect()
     }
 
     /// Describes the sources a follow starts on. A stream with no log file yet is
@@ -275,12 +277,11 @@ impl<'a> LogService<'a> {
         name: &str,
         stream: &str,
     ) -> Result<Vec<LogComponentSummary>, String> {
-        Ok(self
-            .stream_sources(name, stream)?
+        self.stream_sources(name, stream)?
             .iter()
             .map(|sources| {
-                let target = sources.select();
-                if target.path.exists() {
+                let target = sources.select()?;
+                Ok(if target.path.exists() {
                     LogComponentSummary {
                         stream: target.stream,
                         source_kind: target.source_kind,
@@ -296,9 +297,9 @@ impl<'a> LogService<'a> {
                             display_path(&sources.service_path)
                         ),
                     }
-                }
+                })
             })
-            .collect())
+            .collect()
     }
 
     pub fn follow<W: std::io::Write>(
@@ -335,7 +336,7 @@ impl<'a> LogService<'a> {
         let mut cursors = sources
             .into_iter()
             .map(FollowCursor::for_sources)
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
         let mut snapshots = Vec::with_capacity(cursors.len());
         for cursor in &mut cursors {
             snapshots.push(cursor.snapshot(tail_lines, merge_streams)?);
@@ -507,12 +508,12 @@ impl FollowCursor {
         }
     }
 
-    fn for_sources(sources: LogSources) -> Self {
-        let mut cursor = Self::new(sources.select());
+    fn for_sources(sources: LogSources) -> Result<Self, String> {
+        let mut cursor = Self::new(sources.select()?);
         cursor.excluded_paths = sources.excluded_paths.clone();
         cursor.service_available = sources.service_available;
         cursor.sources = Some(sources);
-        cursor
+        Ok(cursor)
     }
 
     fn open_target_log(&self) -> Result<Option<(File, fs::Metadata)>, String> {
@@ -555,7 +556,7 @@ impl FollowCursor {
         hold_partial_record: bool,
     ) -> Result<Option<LogSnapshot>, String> {
         if let Some(sources) = &self.sources {
-            self.target = sources.select();
+            self.target = sources.select()?;
         }
         let Some((mut file, metadata)) = self.open_target_log()? else {
             return Ok(None);
@@ -2497,7 +2498,8 @@ mod tests {
         let root = test_root("follow-pending-service");
         let gateway_path = root.join("gateway.err.log");
         let service_path = root.join("demo.stderr.log");
-        let mut cursor = FollowCursor::for_sources(stderr_sources(&gateway_path, &service_path));
+        let mut cursor =
+            FollowCursor::for_sources(stderr_sources(&gateway_path, &service_path)).unwrap();
         assert!(cursor.snapshot(Some(50), false).unwrap().is_none());
 
         fs::write(&service_path, b"service error\n").unwrap();
@@ -2522,7 +2524,8 @@ mod tests {
         let root = test_root("follow-pending-gateway");
         let gateway_path = root.join("gateway.err.log");
         let service_path = root.join("demo.stderr.log");
-        let mut cursor = FollowCursor::for_sources(stderr_sources(&gateway_path, &service_path));
+        let mut cursor =
+            FollowCursor::for_sources(stderr_sources(&gateway_path, &service_path)).unwrap();
         assert!(cursor.snapshot(Some(50), false).unwrap().is_none());
 
         fs::write(&gateway_path, b"gateway error\n").unwrap();
@@ -2544,7 +2547,7 @@ mod tests {
         let mut sources = stderr_sources(&gateway, &service);
         sources.excluded_paths.push(diagnostic.clone());
         std::os::unix::fs::symlink(&diagnostic, &service).unwrap();
-        let mut cursor = FollowCursor::for_sources(sources);
+        let mut cursor = FollowCursor::for_sources(sources).unwrap();
         assert!(cursor.snapshot(None, false).unwrap().is_none());
         fs::write(&diagnostic, b"shared diagnostic\n").unwrap();
         assert!(cursor.snapshot(None, false).unwrap().is_none());
@@ -2599,7 +2602,7 @@ mod tests {
         sources.excluded_paths = crate::supervisor::SupervisorService::new(&env, &root)
             .daemon_log_paths()
             .unwrap();
-        let mut cursors = vec![FollowCursor::for_sources(sources)];
+        let mut cursors = vec![FollowCursor::for_sources(sources).unwrap()];
         assert!(cursors[0].snapshot(None, true).unwrap().is_none());
         fs::write(&diagnostic, b"diagnostic\n").unwrap();
         fs::hard_link(&diagnostic, &child).unwrap();
@@ -2645,7 +2648,8 @@ mod tests {
         assert_eq!(update_bytes(&update), b"safe delayed\n");
 
         fs::write(&gateway, b"gateway\n").unwrap();
-        let mut gateway_cursor = FollowCursor::for_sources(stderr_sources(&gateway, &child));
+        let mut gateway_cursor =
+            FollowCursor::for_sources(stderr_sources(&gateway, &child)).unwrap();
         gateway_cursor.snapshot(None, false).unwrap().unwrap();
         cursors.push(gateway_cursor);
         fs::write(&config, "invalid json").unwrap();
@@ -2683,7 +2687,7 @@ mod tests {
                 b"2026-10-27T12:00:00Z first child record\n2026-10-27T12:00:01Z child partial",
             )
             .unwrap();
-            let mut cursors = vec![FollowCursor::for_sources(sources)];
+            let mut cursors = vec![FollowCursor::for_sources(sources).unwrap()];
             let snapshots = vec![cursors[0].snapshot(None, true).unwrap()];
             assert!(!snapshots[0].as_ref().unwrap().bytes.is_empty());
             assert!(!cursors[0].pending.is_empty());

@@ -738,6 +738,34 @@ fn daemon_named_children_separate_output_without_rewriting_legacy_launch_identit
             let body = json_output(&output);
             assert_eq!(body["content"], expected, "{mode}: {body}");
             assert_eq!(body["sourceKind"], "service");
+            if mode == "new" || mode == "case" {
+                let path = Path::new(body["path"].as_str().unwrap());
+                let permissions = fs::metadata(path).unwrap().permissions();
+                fs::set_permissions(path, fs::Permissions::from_mode(0)).unwrap();
+                let denied = fs::File::open(path);
+                // Privileged users can bypass mode bits; do not claim denial.
+                if let Err(error) = denied {
+                    let selected =
+                        run_ocm(&cwd, &env, &["logs", name, "--stream", stream, "--json"]);
+                    let merged = run_ocm(&cwd, &env, &["logs", name, "--json"]);
+                    fs::set_permissions(path, permissions).unwrap();
+                    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+                    for output in [selected, merged] {
+                        assert!(!output.status.success());
+                        assert!(
+                            stderr(&output).contains("Permission denied"),
+                            "{}",
+                            stderr(&output)
+                        );
+                        assert!(output.stdout.is_empty());
+                    }
+                } else {
+                    fs::set_permissions(path, permissions).unwrap();
+                }
+                let restored = run_ocm(&cwd, &env, &["logs", name, "--stream", stream, "--json"]);
+                assert!(restored.status.success(), "{}", stderr(&restored));
+                assert_eq!(json_output(&restored)["content"], expected);
+            }
         }
         let status = run_ocm(&cwd, &env, &["service", "status", name, "--json"]);
         assert!(status.status.success(), "{}", stderr(&status));
