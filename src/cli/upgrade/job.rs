@@ -13,9 +13,10 @@ use super::{Cli, UpgradeOptions, UpgradeTarget, is_failed_upgrade_outcome};
 use crate::infra::process_identity::{
     ProcessIdentity, current_process_identity, observe_process, process_scope_id,
 };
+use crate::store::dev_sources::path_identity;
 use crate::store::{
-    lock_file, now_utc, read_json, try_lock_file, upgrade_history_env_dir, validate_name,
-    write_json,
+    load_json_files, lock_file, now_utc, read_json, try_lock_file, upgrade_history_env_dir,
+    validate_name, write_json,
 };
 
 thread_local! {
@@ -149,6 +150,19 @@ fn save_job(path: &Path, record: &StoredJob) -> Result<(), String> {
     Ok(())
 }
 
+fn read_job_record(path: &Path, id: &str) -> Result<StoredJob, String> {
+    let record: StoredJob = read_json(path)?;
+    let expected_schema = if record.expected_binding.is_some() {
+        2
+    } else {
+        1
+    };
+    if record.schema != expected_schema || record.job.id != id {
+        return Err("unsupported or mismatched upgrade job record".into());
+    }
+    Ok(record)
+}
+
 impl Cli {
     fn upgrade_jobs_dir(&self, name: &str) -> Result<PathBuf, String> {
         let name = validate_name(name, "Environment name")?;
@@ -164,16 +178,70 @@ impl Cli {
     }
 
     fn read_upgrade_job(&self, name: &str, id: &str) -> Result<StoredJob, String> {
-        let record: StoredJob = read_json(&self.upgrade_job_path(name, id)?)?;
-        let expected_schema = if record.expected_binding.is_some() {
-            2
-        } else {
-            1
-        };
-        if record.schema != expected_schema || record.job.id != id || record.job.env_name != name {
+        let record = read_job_record(&self.upgrade_job_path(name, id)?, id)?;
+        if record.job.env_name != name {
             return Err("unsupported or mismatched upgrade job record".into());
         }
         Ok(record)
+    }
+
+    fn read_directory_upgrade_job(&self, name: &str, id: &str) -> Result<StoredJob, String> {
+        let record = read_job_record(&self.upgrade_job_path(name, id)?, id)?;
+        // Case-equivalent names may share native storage, but a misplaced record
+        // must still fail closed. Exact-ID callers never use this inventory read.
+        if record.job.env_name != name
+            && (!record.job.env_name.eq_ignore_ascii_case(name)
+                || path_identity(&self.upgrade_jobs_dir(&record.job.env_name)?)?
+                    != path_identity(&self.upgrade_jobs_dir(name)?)?)
+        {
+            return Err("unsupported or mismatched upgrade job record".into());
+        }
+        Ok(record)
+    }
+
+    fn latest_upgrade_job(&self, name: &str, admitting: bool) -> Result<Option<StoredJob>, String> {
+        let root = self.upgrade_jobs_dir(name)?;
+        let latest = root.join("latest");
+        if !latest.try_exists().map_err(|error| error.to_string())? {
+            return Ok(None);
+        }
+        let id: String = read_json(&latest)?;
+        let record = self.read_directory_upgrade_job(name, &id)?;
+        if record.job.env_name == name {
+            return Ok(Some(record));
+        }
+        // Running is published before the worker acquires admission.lock. A
+        // submitter can win that handoff, so the lock alone cannot exclude an
+        // active peer. Status may still select its own job without mutating it.
+        if admitting && !record.job.state.terminal() {
+            return Err(format!(
+                "upgrade job {} for {} is {:?}; inspect `ocm upgrade job status {} --request-id {}` before further changes",
+                record.job.id,
+                record.job.env_name,
+                record.job.state,
+                record.job.env_name,
+                record.job.id,
+            ));
+        }
+        // A peer's later submission replaced the shared pointer. Recover this
+        // exact owner's newest submission without observing or changing peers.
+        let mut latest: Option<StoredJob> = None;
+        for path in load_json_files(&root)? {
+            let id = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .ok_or("upgrade job path has an invalid id")?;
+            let record = self.read_directory_upgrade_job(name, id)?;
+            if record.job.env_name == name
+                && latest.as_ref().is_none_or(|previous| {
+                    (record.job.created_at, &record.job.id)
+                        > (previous.job.created_at, &previous.job.id)
+                })
+            {
+                latest = Some(record);
+            }
+        }
+        Ok(latest)
     }
 
     fn observe_upgrade_job(&self, name: &str, id: &str) -> Result<Job, String> {
@@ -263,13 +331,11 @@ impl Cli {
                     Some(id) => id,
                     None => {
                         let environment = self.environment_service().get(name)?;
-                        let latest = self.upgrade_jobs_dir(name)?.join("latest");
-                        if !latest.try_exists().map_err(|error| error.to_string())? {
+                        let Some(record) = self.latest_upgrade_job(name, false)? else {
                             self.print_json(&Option::<Job>::None)?;
                             return Ok(0);
-                        }
-                        let id: String = read_json(&latest)?;
-                        let record = self.read_upgrade_job(name, &id)?;
+                        };
+                        let id = record.job.id.clone();
                         if !record.matches_environment(&environment) {
                             if !self.observe_upgrade_job(name, &id)?.state.terminal() {
                                 return Err(format!(
@@ -347,9 +413,8 @@ impl Cli {
         if let Some(binding) = &expected_binding {
             binding.validate(&environment)?;
         }
-        if root.join("latest").exists() {
-            let id: String = read_json(&root.join("latest"))?;
-            let previous = self.observe_upgrade_job(name, &id)?;
+        if let Some(record) = self.latest_upgrade_job(name, true)? {
+            let previous = self.observe_upgrade_job(name, &record.job.id)?;
             if !previous.state.terminal() {
                 return Err(format!(
                     "upgrade job {} is {:?}; inspect `ocm upgrade job status {name} --request-id {}` before further changes",
