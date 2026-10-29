@@ -949,7 +949,7 @@ pub(super) fn relocate_copied_databases(
     };
     if let Some(database) = global {
         if is_sqlite_database(&database)? {
-            selection.read_agent_registry(&database, true)?;
+            selection.read_agent_registry(&database, true, &paths.state_dir)?;
         }
     }
     // Default archives omit the global registry but retain configured agent
@@ -3318,12 +3318,17 @@ impl<'a> OpenClawSqliteCopy<'a> {
             return Ok(selection);
         };
         if is_sqlite_database(database)? {
-            selection.read_agent_registry(database, false)?;
+            selection.read_agent_registry(database, false, owned_root)?;
         }
         Ok(selection)
     }
 
-    fn read_agent_registry(&mut self, database: &Path, archived: bool) -> Result<(), String> {
+    fn read_agent_registry(
+        &mut self,
+        database: &Path,
+        archived: bool,
+        copy_root: &Path,
+    ) -> Result<(), String> {
         let db = if archived {
             open_copied_database_readonly(database)
         } else {
@@ -3336,6 +3341,7 @@ impl<'a> OpenClawSqliteCopy<'a> {
             [], |row| row.get(0),
         ).map_err(|error| format!("failed to inspect OpenClaw SQLite owners: {error}"))?;
         if has_registry {
+            let canonical_root = fs::canonicalize(copy_root).ok();
             let mut statement = db
                 .prepare("SELECT path FROM agent_databases")
                 .map_err(|error| format!("failed to inspect OpenClaw SQLite owners: {error}"))?;
@@ -3349,9 +3355,10 @@ impl<'a> OpenClawSqliteCopy<'a> {
                 } else {
                     self.state_root.join(path)
                 };
-                // Workspace admission can canonicalize an alias (for example
-                // /var on macOS). Match that spelling without expanding the
-                // copy footprint or following links during traversal.
+                // Match the walker's root spelling even when a registered agent
+                // is outside the state directory but inside the admitted copy.
+                // This selects existing paths without following traversal links
+                // or expanding the copy footprint.
                 let canonical = fs::canonicalize(&path).or_else(|error| {
                     if error.kind() != std::io::ErrorKind::NotFound {
                         return Err(error);
@@ -3362,11 +3369,10 @@ impl<'a> OpenClawSqliteCopy<'a> {
                     fs::canonicalize(parent).map(|parent| parent.join(name))
                 });
                 if let Ok(canonical) = canonical {
-                    if let Ok(root) = fs::canonicalize(self.state_root)
+                    if let Some(root) = &canonical_root
                         && let Ok(relative) = canonical.strip_prefix(root)
                     {
-                        self.registered_agents
-                            .insert(self.state_root.join(relative));
+                        self.registered_agents.insert(copy_root.join(relative));
                     }
                     self.registered_agents.insert(canonical);
                 }
