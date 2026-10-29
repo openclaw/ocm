@@ -1399,6 +1399,11 @@ and deletions in place. Shared ancestor directories stay in place, but their
 metadata can change when owned siblings are replaced. Existing service-log and
 socket rules and SQLite validation still apply to the captured state.
 
+If a case-only rename still lets the saved path select the same directory entry,
+scoped restore preserves that entry and its current spelling, including shared
+ancestors. This follows the filesystem's actual lookup behavior; it does not
+track independent directories moved to paths that the saved path no longer finds.
+
 Captured read-only ancestor modes do not prevent scoped restore: OCM temporarily
 allows owner writes only to staging parents while moving owned entries, then
 restores their permissions. Current shared ancestors keep their permissions and

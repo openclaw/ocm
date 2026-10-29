@@ -127,6 +127,29 @@ esac
         run_ocm(self.root.path(), &self.env, args)
     }
 
+    fn upgrade_checkpoint(&mut self) -> Value {
+        let release = self.root.child("release");
+        write_text(&release, "continue");
+        self.env.insert(
+            "OCM_PROOF_READY".into(),
+            self.root.child("ready").to_str().unwrap().into(),
+        );
+        self.env
+            .insert("OCM_PROOF_RELEASE".into(), release.to_str().unwrap().into());
+        let upgraded = self.run_ok(&["upgrade", "demo", "--runtime", "new", "--json"]);
+        let receipt: Value = serde_json::from_slice(&upgraded.stdout).unwrap();
+        assert_eq!(receipt["outcome"], "switched");
+        let snapshot = self.run_ok(&[
+            "env",
+            "snapshot",
+            "show",
+            "demo",
+            receipt["snapshotId"].as_str().unwrap(),
+            "--json",
+        ]);
+        serde_json::from_slice(&snapshot.stdout).unwrap()
+    }
+
     fn edit_project(&self) -> fs::Metadata {
         write_text(&self.project.join("code"), "current developer work\n");
         fs::set_permissions(self.project.join("code"), fs::Permissions::from_mode(0o600)).unwrap();
@@ -900,6 +923,149 @@ fn frozen_scope_preserves_independent_root(independent: &str) {
     let restore = fixture.run(&["env", "snapshot", "restore", "demo", id]);
     assert!(restore.status.success(), "{}", stderr(&restore));
     fixture.assert_project(&expected);
+}
+
+#[test]
+fn scoped_restore_preserves_case_renames_that_keep_native_path_identity() {
+    for (independent, from, to) in [
+        ("projects", "projects", "Projects"),
+        ("development/projects", "development", "Development"),
+        (
+            "development/projects",
+            "development/projects",
+            "development/Projects",
+        ),
+    ] {
+        let mut fixture = Fixture::with_independent_root(independent);
+        let root = fixture.state.parent().unwrap().to_path_buf();
+        let owned = root
+            .join(independent)
+            .parent()
+            .unwrap()
+            .join("owned-marker");
+        write_text(&owned, "saved");
+        let snapshot = fixture.upgrade_checkpoint();
+        assert_eq!(
+            snapshot["upgradeScope"]["independentPaths"],
+            serde_json::json!([independent])
+        );
+        let archive = PathBuf::from(snapshot["archivePath"].as_str().unwrap());
+        assert!(fs::symlink_metadata(archive.join(independent)).is_err());
+        let expected = fixture.edit_project();
+        write_text(&owned, "current");
+        let original = fs::metadata(root.join(from)).unwrap();
+        fs::rename(root.join(from), root.join(to)).unwrap();
+        let renamed = fs::metadata(root.join(to)).unwrap();
+        assert_eq!(
+            (original.dev(), original.ino()),
+            (renamed.dev(), renamed.ino())
+        );
+        let same_lookup = fs::symlink_metadata(root.join(from))
+            .is_ok_and(|meta| (meta.dev(), meta.ino()) == (renamed.dev(), renamed.ino()));
+        if !same_lookup && from != independent {
+            // On a case-sensitive volume a missing ancestor must refuse before
+            // replacing anything. A moved boundary itself remains ordinary owned state.
+            let restore = fixture.run(&[
+                "env",
+                "snapshot",
+                "restore",
+                "demo",
+                snapshot["id"].as_str().unwrap(),
+            ]);
+            assert!(!restore.status.success());
+            assert_eq!(fs::metadata(root.join(to)).unwrap().ino(), renamed.ino());
+            continue;
+        }
+        fixture.run_ok(&[
+            "env",
+            "snapshot",
+            "restore",
+            "demo",
+            snapshot["id"].as_str().unwrap(),
+        ]);
+        assert_eq!(fs::read(&owned).unwrap(), b"saved");
+        if same_lookup {
+            fixture.assert_project(&expected);
+            let after = fs::metadata(root.join(to)).unwrap();
+            assert_eq!((after.dev(), after.ino()), (renamed.dev(), renamed.ino()));
+            if from == independent {
+                assert_eq!(
+                    (after.mode(), after.mtime(), after.mtime_nsec()),
+                    (renamed.mode(), renamed.mtime(), renamed.mtime_nsec())
+                );
+            }
+            let names = fs::read_dir(root.join(to).parent().unwrap())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            assert!(names.contains(&root.join(to).file_name().unwrap().to_os_string()));
+            assert!(!names.contains(&root.join(from).file_name().unwrap().to_os_string()));
+        } else {
+            assert!(!root.join(from).exists());
+            assert!(!root.join(to).exists());
+        }
+    }
+}
+
+#[test]
+fn scoped_restore_does_not_recreate_missing_or_deleted_independent_directories() {
+    for absent_at_capture in [true, false] {
+        let mut fixture = Fixture::with_independent_root("development/projects");
+        let independent = fixture.project.parent().unwrap().to_path_buf();
+        if absent_at_capture {
+            fs::remove_dir_all(&independent).unwrap();
+        }
+        let snapshot = fixture.upgrade_checkpoint();
+        if !absent_at_capture {
+            fs::remove_dir_all(&independent).unwrap();
+        }
+        write_text(&fixture.state.join("credentials/synthetic"), "current");
+        fixture.run_ok(&[
+            "env",
+            "snapshot",
+            "restore",
+            "demo",
+            snapshot["id"].as_str().unwrap(),
+        ]);
+        assert!(fs::symlink_metadata(independent).is_err());
+        assert_eq!(
+            fs::read(fixture.state.join("credentials/synthetic")).unwrap(),
+            b"fixture-only\n"
+        );
+    }
+}
+
+#[test]
+fn scoped_restore_keeps_exclusions_with_case_aliased_ancestors_together() {
+    let mut fixture = Fixture::with_independent_root("development/projects");
+    let root = fixture.state.parent().unwrap().to_path_buf();
+    if !root.join("Development").exists() {
+        return; // Requires two spellings that select one native ancestor.
+    }
+    fixture.run_ok(&[
+        "env",
+        "set-independent-paths",
+        "demo",
+        "development/projects",
+        "Development/extra",
+    ]);
+    let snapshot = fixture.upgrade_checkpoint();
+    let expected = fixture.edit_project();
+    write_text(&root.join("development/extra/new"), "new independent work");
+    write_text(&root.join("development/owned"), "new owned work");
+    fixture.run_ok(&[
+        "env",
+        "snapshot",
+        "restore",
+        "demo",
+        snapshot["id"].as_str().unwrap(),
+    ]);
+    fixture.assert_project(&expected);
+    assert_eq!(
+        fs::read(root.join("development/extra/new")).unwrap(),
+        b"new independent work"
+    );
+    assert!(!root.join("development/owned").exists());
 }
 
 #[test]
