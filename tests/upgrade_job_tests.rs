@@ -79,12 +79,21 @@ fn wait_for(path: &Path) {
 }
 
 fn wait_for_result(root: &TestDir, env: &BTreeMap<String, String>, id: &str) -> Value {
+    wait_for_environment_result(root, env, "demo", id)
+}
+
+fn wait_for_environment_result(
+    root: &TestDir,
+    env: &BTreeMap<String, String>,
+    name: &str,
+    id: &str,
+) -> Value {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let status = command(
             root,
             env,
-            &["upgrade", "job", "status", "demo", "--request-id", id],
+            &["upgrade", "job", "status", name, "--request-id", id],
         );
         if matches!(
             status["state"].as_str(),
@@ -95,6 +104,284 @@ fn wait_for_result(root: &TestDir, env: &BTreeMap<String, String>, id: &str) -> 
         assert!(Instant::now() < deadline, "job did not finish: {status}");
         sleep(Duration::from_millis(25));
     }
+}
+
+#[test]
+fn case_distinct_environments_select_their_own_jobs() {
+    use std::os::unix::fs::MetadataExt;
+
+    let root = TestDir::new("upgrade-case-distinct-jobs");
+    let env = setup(&root);
+    command(
+        &root,
+        &env,
+        &[
+            "env",
+            "create",
+            "Demo",
+            "--runtime",
+            "old",
+            "--root",
+            &path_string(&root.child("upper")),
+            "--json",
+        ],
+    );
+    fs::write(root.child("release"), "").unwrap();
+    let job_dir = |name| {
+        ocm::store::upgrade_history_env_dir(name, &env, root.path())
+            .unwrap()
+            .join("jobs")
+    };
+    let mut latest = BTreeMap::new();
+    let mut historical = Vec::new();
+    // Reverse lexical order: latest is submission time, not the request ID.
+    for (name, id, target, binding) in [
+        ("Demo", "z-upper-first", "new", "runtime:old"),
+        ("demo", "z-lower-first", "new", "runtime:old"),
+        ("Demo", "a-upper-next", "new", "runtime:new"),
+        ("demo", "a-lower-next", "new", "runtime:new"),
+    ] {
+        command(
+            &root,
+            &env,
+            &[
+                "upgrade",
+                "job",
+                "start",
+                name,
+                "--runtime",
+                target,
+                "--request-id",
+                id,
+                "--if-binding",
+                binding,
+            ],
+        );
+        let result = wait_for_environment_result(&root, &env, name, id);
+        assert_eq!(result["state"], "succeeded", "{result}");
+        latest.insert(name, result.clone());
+        historical.push((name, id, target, binding, result));
+        for owner in ["Demo", "demo"] {
+            let status = command(&root, &env, &["upgrade", "job", "status", owner]);
+            assert_eq!(status, latest.get(owner).cloned().unwrap_or(Value::Null));
+        }
+        for (owner, request, target, binding, result) in &historical {
+            assert_eq!(
+                command(
+                    &root,
+                    &env,
+                    &["upgrade", "job", "status", owner, "--request-id", request]
+                ),
+                *result,
+            );
+            assert_eq!(
+                command(
+                    &root,
+                    &env,
+                    &[
+                        "upgrade",
+                        "job",
+                        "start",
+                        owner,
+                        "--runtime",
+                        target,
+                        "--request-id",
+                        request,
+                        "--if-binding",
+                        binding
+                    ]
+                ),
+                *result,
+            );
+        }
+    }
+    let upper = fs::metadata(job_dir("Demo")).unwrap();
+    let lower = fs::metadata(job_dir("demo")).unwrap();
+    let shared = (upper.dev(), upper.ino()) == (lower.dev(), lower.ino());
+    eprintln!("case-distinct job directories share native identity: {shared}");
+    let peer_path = job_dir("demo").join("a-lower-next.json");
+    let peer_before = fs::read(&peer_path).unwrap();
+    for args in [
+        vec![
+            "upgrade",
+            "job",
+            "status",
+            "Demo",
+            "--request-id",
+            "a-lower-next",
+        ],
+        vec![
+            "upgrade",
+            "job",
+            "start",
+            "Demo",
+            "--runtime",
+            "old",
+            "--request-id",
+            "a-upper-next",
+            "--if-binding",
+            "runtime:new",
+        ],
+        vec![
+            "upgrade",
+            "job",
+            "start",
+            "Demo",
+            "--runtime",
+            "new",
+            "--request-id",
+            "a-upper-next",
+        ],
+    ] {
+        let output = run_ocm(root.path(), &env, &args);
+        assert!(!output.status.success(), "{args:?}");
+    }
+    if shared {
+        let collision = run_ocm(
+            root.path(),
+            &env,
+            &[
+                "upgrade",
+                "job",
+                "start",
+                "Demo",
+                "--runtime",
+                "new",
+                "--request-id",
+                "a-lower-next",
+                "--if-binding",
+                "runtime:new",
+            ],
+        );
+        assert!(!collision.status.success());
+        assert!(stderr(&collision).contains("mismatched upgrade job record"));
+
+        // Inventory must validate records even when another owner is filtered out.
+        // The pointer is the lower owner's, so querying Demo takes the fallback.
+        let corrupt_path = job_dir("demo").join("z-lower-first.json");
+        let original = fs::read(&corrupt_path).unwrap();
+        for (field, invalid) in [
+            ("schema", serde_json::json!(1)),
+            ("id", serde_json::json!("different-id")),
+            ("envName", serde_json::json!("unrelated")),
+        ] {
+            let mut record: Value = serde_json::from_slice(&original).unwrap();
+            if field == "schema" {
+                record[field] = invalid;
+            } else {
+                record["job"][field] = invalid;
+            }
+            fs::write(&corrupt_path, serde_json::to_vec(&record).unwrap()).unwrap();
+            for args in [
+                vec!["upgrade", "job", "status", "Demo"],
+                vec![
+                    "upgrade",
+                    "job",
+                    "start",
+                    "Demo",
+                    "--runtime",
+                    "new",
+                    "--request-id",
+                    "must-not-start",
+                ],
+            ] {
+                let output = run_ocm(root.path(), &env, &args);
+                assert!(!output.status.success(), "{field}: {args:?}");
+                assert!(
+                    stderr(&output).contains("mismatched upgrade job record"),
+                    "{}",
+                    stderr(&output)
+                );
+            }
+            assert!(!job_dir("Demo").join("must-not-start.json").exists());
+            fs::write(&corrupt_path, &original).unwrap();
+        }
+    }
+    assert_eq!(fs::read(&peer_path).unwrap(), peer_before);
+    assert_eq!(
+        command(&root, &env, &["upgrade", "job", "status", "Demo"]),
+        latest["Demo"],
+    );
+}
+
+#[test]
+fn shared_job_status_does_not_observe_or_mutate_an_active_peer() {
+    use std::os::unix::fs::MetadataExt;
+
+    let root = TestDir::new("upgrade-case-distinct-active");
+    let env = setup(&root);
+    command(
+        &root,
+        &env,
+        &[
+            "env",
+            "create",
+            "Demo",
+            "--runtime",
+            "old",
+            "--root",
+            &path_string(&root.child("upper")),
+            "--json",
+        ],
+    );
+    let accepted = command(
+        &root,
+        &env,
+        &[
+            "upgrade",
+            "job",
+            "start",
+            "demo",
+            "--runtime",
+            "new",
+            "--request-id",
+            "active-peer",
+        ],
+    );
+    wait_for(&root.child("started"));
+    let directory = ocm::store::upgrade_history_env_dir("demo", &env, root.path())
+        .unwrap()
+        .join("jobs");
+    let peer = directory.join("active-peer.json");
+    let before = fs::read(&peer).unwrap();
+    assert!(command(&root, &env, &["upgrade", "job", "status", "Demo"]).is_null());
+    let upper = ocm::store::upgrade_history_env_dir("Demo", &env, root.path())
+        .unwrap()
+        .join("jobs");
+    if let Ok(meta) = fs::metadata(&upper)
+        && (meta.dev(), meta.ino()) == {
+            let meta = fs::metadata(&directory).unwrap();
+            (meta.dev(), meta.ino())
+        }
+    {
+        let refused = run_ocm(
+            root.path(),
+            &env,
+            &[
+                "upgrade",
+                "job",
+                "start",
+                "Demo",
+                "--runtime",
+                "new",
+                "--request-id",
+                "blocked-peer",
+            ],
+        );
+        assert!(!refused.status.success());
+        assert!(
+            stderr(&refused).contains("upgrade job is active"),
+            "{}",
+            stderr(&refused)
+        );
+        assert!(!upper.join("blocked-peer.json").exists());
+    }
+    assert_eq!(fs::read(&peer).unwrap(), before);
+    fs::write(root.child("release"), "").unwrap();
+    assert_eq!(
+        wait_for_result(&root, &env, accepted["id"].as_str().unwrap())["state"],
+        "succeeded"
+    );
 }
 
 #[test]
@@ -510,6 +797,25 @@ fn admitted_job_cannot_upgrade_a_replacement_environment() {
     assert!(recreated.status.success(), "{}", stderr(&recreated));
     let original_calls = ["old", "new"]
         .map(|name| fs::read(root.child(format!("{name}-calls"))).unwrap_or_default());
+    let prior = run_ocm(root.path(), &env, &["upgrade", "job", "status", "demo"]);
+    assert!(!prior.status.success());
+    assert!(stderr(&prior).contains("prior environment instance still has active upgrade job"));
+    let fresh = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "upgrade",
+            "job",
+            "start",
+            "demo",
+            "--runtime",
+            "new",
+            "--request-id",
+            "replacement-job",
+        ],
+    );
+    assert!(!fresh.status.success());
+    assert!(stderr(&fresh).contains("upgrade job is active"));
     transaction.unlock().unwrap();
     let result = wait_for_result(&root, &env, accepted["id"].as_str().unwrap());
     assert_eq!(result["state"], "failed", "{result}");
