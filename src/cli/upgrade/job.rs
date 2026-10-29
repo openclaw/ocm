@@ -199,7 +199,7 @@ impl Cli {
         Ok(record)
     }
 
-    fn latest_upgrade_job(&self, name: &str) -> Result<Option<StoredJob>, String> {
+    fn latest_upgrade_job(&self, name: &str, admitting: bool) -> Result<Option<StoredJob>, String> {
         let root = self.upgrade_jobs_dir(name)?;
         let latest = root.join("latest");
         if !latest.try_exists().map_err(|error| error.to_string())? {
@@ -209,6 +209,19 @@ impl Cli {
         let record = self.read_directory_upgrade_job(name, &id)?;
         if record.job.env_name == name {
             return Ok(Some(record));
+        }
+        // Running is published before the worker acquires admission.lock. A
+        // submitter can win that handoff, so the lock alone cannot exclude an
+        // active peer. Status may still select its own job without mutating it.
+        if admitting && !record.job.state.terminal() {
+            return Err(format!(
+                "upgrade job {} for {} is {:?}; inspect `ocm upgrade job status {} --request-id {}` before further changes",
+                record.job.id,
+                record.job.env_name,
+                record.job.state,
+                record.job.env_name,
+                record.job.id,
+            ));
         }
         // A peer's later submission replaced the shared pointer. Recover this
         // exact owner's newest submission without observing or changing peers.
@@ -318,7 +331,7 @@ impl Cli {
                     Some(id) => id,
                     None => {
                         let environment = self.environment_service().get(name)?;
-                        let Some(record) = self.latest_upgrade_job(name)? else {
+                        let Some(record) = self.latest_upgrade_job(name, false)? else {
                             self.print_json(&Option::<Job>::None)?;
                             return Ok(0);
                         };
@@ -400,7 +413,7 @@ impl Cli {
         if let Some(binding) = &expected_binding {
             binding.validate(&environment)?;
         }
-        if let Some(record) = self.latest_upgrade_job(name)? {
+        if let Some(record) = self.latest_upgrade_job(name, true)? {
             let previous = self.observe_upgrade_job(name, &record.job.id)?;
             if !previous.state.terminal() {
                 return Err(format!(

@@ -384,6 +384,153 @@ fn shared_job_status_does_not_observe_or_mutate_an_active_peer() {
     );
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn shared_admission_excludes_peer_during_worker_handoff() {
+    use std::process::Command;
+
+    let root = TestDir::new("upgrade-job-handoff");
+    fs::write(root.child("NativeCaseProbe"), "").unwrap();
+    if !root.child("nativecaseprobe").exists() {
+        eprintln!("native case-sensitive volume: shared admission does not apply");
+        return;
+    }
+    let mut env = setup(&root);
+    command(
+        &root,
+        &env,
+        &[
+            "env",
+            "create",
+            "Demo",
+            "--runtime",
+            "old",
+            "--root",
+            &path_string(&root.child("upper")),
+            "--json",
+        ],
+    );
+    // Pause before the real blocking flock, after Running has been published.
+    // This controls scheduling only: all metadata and lock outcomes remain native.
+    // cc is already required for Cargo's bundled SQLite dependency.
+    let source = root.child("pause-admission.c");
+    let library = root.child("pause-admission.dylib");
+    fs::write(
+        &source,
+        r#"
+#include <sys/file.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+static int paused_flock(int fd, int operation) {
+    char path[1024], released[1024];
+    const char *marker = getenv("OCM_TEST_ADMISSION_PAUSE");
+    if (marker && operation == LOCK_EX && fcntl(fd, F_GETPATH, path) == 0) {
+        const char *leaf = strrchr(path, '/');
+        if (leaf && strcmp(leaf + 1, "admission.lock") == 0) {
+            int output = open(marker, O_CREAT | O_EXCL | O_WRONLY, 0600);
+            if (output >= 0) {
+                close(output);
+                snprintf(released, sizeof(released), "%s.release", marker);
+                for (int i = 0; i < 300 && access(released, F_OK) != 0; ++i)
+                    usleep(50000);
+            }
+        }
+    }
+    return flock(fd, operation);
+}
+__attribute__((used)) static struct { const void *replacement; const void *original; }
+interpose[] __attribute__((section("__DATA,__interpose"))) = {
+    { (const void *)paused_flock, (const void *)flock }
+};
+"#,
+    )
+    .unwrap();
+    let built = Command::new("cc")
+        .arg("-dynamiclib")
+        .arg(&source)
+        .arg("-o")
+        .arg(&library)
+        .env("TMPDIR", root.path())
+        .output()
+        .unwrap();
+    assert!(built.status.success(), "{}", stderr(&built));
+    env.insert("DYLD_INSERT_LIBRARIES".into(), path_string(&library));
+    env.insert(
+        "OCM_TEST_ADMISSION_PAUSE".into(),
+        path_string(&root.child("paused")),
+    );
+    command(
+        &root,
+        &env,
+        &[
+            "upgrade",
+            "job",
+            "start",
+            "demo",
+            "--runtime",
+            "new",
+            "--request-id",
+            "handoff",
+        ],
+    );
+    wait_for(&root.child("paused"));
+    let path = ocm::store::upgrade_history_env_dir("demo", &env, root.path())
+        .unwrap()
+        .join("jobs/handoff.json");
+    let before = fs::read(&path).unwrap();
+    let record: Value = serde_json::from_slice(&before).unwrap();
+    assert_eq!(record["job"]["state"], "running");
+    assert_eq!(record["admitted"], true);
+    let peer_status = run_ocm(root.path(), &env, &["upgrade", "job", "status", "Demo"]);
+    let peer = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "upgrade",
+            "job",
+            "start",
+            "Demo",
+            "--runtime",
+            "new",
+            "--request-id",
+            "peer",
+        ],
+    );
+    let unchanged = fs::read(&path).unwrap() == before;
+    // Settle both workers before asserting the refusal, even on the broken base.
+    fs::write(root.child("paused.release"), "").unwrap();
+    fs::write(root.child("release"), "").unwrap();
+    assert_eq!(
+        wait_for_result(&root, &env, "handoff")["state"],
+        "succeeded"
+    );
+    if peer.status.success() {
+        wait_for_environment_result(&root, &env, "Demo", "peer");
+    }
+    assert!(peer_status.status.success(), "{}", stderr(&peer_status));
+    assert_eq!(
+        serde_json::from_str::<Value>(&stdout(&peer_status)).unwrap(),
+        Value::Null
+    );
+    assert!(
+        unchanged,
+        "peer query or admission changed the waiting worker"
+    );
+    assert!(
+        !peer.status.success(),
+        "peer admitted during the worker handoff"
+    );
+    assert!(
+        stderr(&peer).contains("upgrade job handoff for demo is Running"),
+        "{}",
+        stderr(&peer)
+    );
+    eprintln!("native shared admission handoff rejected without peer mutation");
+}
+
 #[test]
 fn detached_upgrade_preserves_exclusion_and_each_requests_result() {
     let root = TestDir::new("upgrade-job-results");
