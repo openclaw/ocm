@@ -8,6 +8,7 @@ use super::common::{
     ExclusiveFileLock, SharedFileLock, load_json_files, lock_file, lock_file_shared, path_exists,
     read_json, remove_owned_tree, write_json,
 };
+use super::dev_sources::path_identity;
 use super::layout::{
     display_path, runtime_install_root, upgrade_history_env_dir, upgrade_history_meta_path,
     upgrade_history_recovery_dir, validate_name,
@@ -151,6 +152,23 @@ pub fn list_upgrade_history(
                     display_path(&file)
                 )
             })?;
+        // Case-equivalent names can share this directory on the native filesystem.
+        // Validate a peer's record before filtering it, and prove it is stored in
+        // that peer's expected directory rather than hiding misplaced metadata.
+        if record.env_name != env_name
+            && record.env_name.eq_ignore_ascii_case(&env_name)
+            && path_identity(&upgrade_history_env_dir(&record.env_name, env, cwd)?)?
+                == path_identity(&dir)?
+            && path_identity(&upgrade_history_meta_path(
+                &record.env_name,
+                transaction_id,
+                env,
+                cwd,
+            )?)? == path_identity(&file)?
+        {
+            validate_upgrade_history_identity(&record, &record.env_name, transaction_id)?;
+            continue;
+        }
         validate_upgrade_history_identity(&record, &env_name, transaction_id)?;
         records.push(record);
     }
@@ -625,6 +643,66 @@ mod tests {
             "{error}"
         );
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn upgrade_history_validates_case_equivalent_records_before_filtering() {
+        let (root, env) = test_env("case-equivalent-validation");
+        let cwd = root.as_path();
+        let started_at = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let own = record("1700000000-000000001", started_at);
+        let mut peer = record("1700000000-000000002", started_at);
+        peer.env_name = "Demo".into();
+        save_upgrade_history_record(&own, &env, cwd).unwrap();
+        save_upgrade_history_record(&peer, &env, cwd).unwrap();
+        let peer_path = super::upgrade_history_meta_path("Demo", &peer.id, &env, cwd).unwrap();
+        let listed_path = super::upgrade_history_meta_path("demo", &peer.id, &env, cwd).unwrap();
+        let aliased = super::path_identity(peer_path.parent().unwrap()).unwrap()
+            == super::path_identity(listed_path.parent().unwrap()).unwrap();
+        assert_eq!(list_upgrade_history("demo", &env, cwd).unwrap().len(), 1);
+        assert_eq!(list_upgrade_history("Demo", &env, cwd).unwrap().len(), 1);
+        if !aliased {
+            // Even the same physical record is misplaced if its directory is not
+            // the expected owner's directory on a case-sensitive filesystem.
+            std::fs::hard_link(&peer_path, &listed_path).unwrap();
+            let error = list_upgrade_history("demo", &env, cwd).unwrap_err();
+            assert!(error.contains("belongs to environment"), "{error}");
+        }
+        assert!(get_upgrade_history_record("demo", &peer.id, &env, cwd).is_err());
+
+        let valid = serde_json::to_value(&peer).unwrap();
+        for (field, value, expected) in [
+            (
+                "kind",
+                serde_json::json!("unexpected"),
+                "unsupported upgrade history kind",
+            ),
+            (
+                "formatVersion",
+                serde_json::json!(2),
+                "unsupported upgrade history format version",
+            ),
+            (
+                "id",
+                serde_json::json!("wrong-id"),
+                "contains transaction id",
+            ),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[field] = value;
+            write_json(&listed_path, &invalid).unwrap();
+            let error = list_upgrade_history("demo", &env, cwd).unwrap_err();
+            // A misplaced record on a case-sensitive filesystem still fails
+            // exact-owner validation before transaction-ID validation.
+            assert!(
+                error.contains(expected)
+                    || (!aliased && field == "id" && error.contains("belongs to environment")),
+                "{error}"
+            );
+        }
+        std::fs::write(&listed_path, "{invalid-json").unwrap();
+        assert!(list_upgrade_history("demo", &env, cwd).is_err());
         let _ = std::fs::remove_dir_all(root);
     }
 

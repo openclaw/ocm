@@ -379,6 +379,10 @@ Launcher bindings retain their existing version and readiness checks.
 `ocm upgrade history <env>` lists completed upgrade transactions newest first,
 including source and target bindings and versions, the pre-upgrade snapshot,
 migration/finalization status, service state, and rollback outcome. History is
+scoped to the exact environment name, including when case-equivalent names share
+a history directory on a case-insensitive filesystem. Malformed or misplaced
+records still fail validation, and explicit rollback IDs must belong to the
+selected environment. History is
 stored as atomic JSON metadata under `OCM_HOME`; it does not copy config
 contents, command output, or credentials. A successful in-place update of a
 managed runtime retains the previous runtime files beside its transaction
