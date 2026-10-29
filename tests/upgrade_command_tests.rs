@@ -9501,6 +9501,161 @@ fn upgrade_dry_runs_accept_an_environment_named_batch() {
 }
 
 #[test]
+fn upgrade_batch_accepts_case_distinct_names_and_preserves_rollback() {
+    for policy in ["continue", "rollback"] {
+        let root = TestDir::new(&format!("upgrade-case-distinct-{policy}"));
+        let mut env = ocm_env(&root);
+        let old = root.child("old-openclaw");
+        let new = root.child("new-openclaw");
+        write_executable_script(&old, &recording_openclaw_script("2026.8.1"));
+        let new_script = recording_openclaw_script("2026.8.2").replacen(
+            "#!/bin/sh",
+            r#"#!/bin/sh
+if [ "$1" = update ] && [ "$2" = finalize ] && [ -n "${OCM_TEST_SERIAL_DIR:-}" ]; then
+  mkdir "$OCM_TEST_SERIAL_DIR" || { echo 'aliased workers overlapped' >&2; exit 27; }
+  trap 'rmdir "$OCM_TEST_SERIAL_DIR"' EXIT
+  sleep 0.15
+fi"#,
+            1,
+        );
+        write_executable_script(&new, &new_script);
+        for (name, path) in [("old", &old), ("new", &new)] {
+            let output = run_ocm(
+                root.path(),
+                &env,
+                &["runtime", "add", name, "--path", &path_string(path)],
+            );
+            assert!(output.status.success(), "{}", stderr(&output));
+        }
+        for (name, directory) in [("Demo", "upper"), ("demo", "lower")] {
+            let output = run_ocm(
+                root.path(),
+                &env,
+                &[
+                    "env",
+                    "create",
+                    name,
+                    "--root",
+                    &path_string(&root.child(directory)),
+                    "--runtime",
+                    "old",
+                ],
+            );
+            assert!(output.status.success(), "{}", stderr(&output));
+            fs::write(root.child(directory).join("keep"), name).unwrap();
+        }
+        let bounded_batch = |env: &std::collections::BTreeMap<String, String>, extra: &[&str]| {
+            let mut child = Command::new(support::ocm_test_binary_path())
+                .current_dir(root.path())
+                .env_clear()
+                .envs(env)
+                .args([
+                    "upgrade",
+                    "batch",
+                    "--runtime",
+                    "new",
+                    "--envs",
+                    "Demo,demo",
+                    "--parallel",
+                    "2",
+                    "--json",
+                ])
+                .args(extra)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while child.try_wait().unwrap().is_none() {
+                if Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    let output = child.wait_with_output().unwrap();
+                    panic!("case-distinct batch timed out: {}", stderr(&output));
+                }
+                sleep(Duration::from_millis(10));
+            }
+            child.wait_with_output().unwrap()
+        };
+        let preview = bounded_batch(&env, &["--dry-run"]);
+        assert!(preview.status.success(), "{}", stderr(&preview));
+        let preview: Value = serde_json::from_str(&stdout(&preview)).unwrap();
+        assert_eq!(preview["results"].as_array().unwrap().len(), 2);
+        let locks = root.child("ocm-home/locks/environments");
+        if fs::canonicalize(locks.join("Demo.lock")).unwrap()
+            == fs::canonicalize(locks.join("demo.lock")).unwrap()
+        {
+            env.insert(
+                "OCM_TEST_SERIAL_DIR".into(),
+                path_string(&root.child("serial-active")),
+            );
+        }
+        if policy == "rollback" {
+            env.insert("OCM_TEST_FAIL_UPDATE_FINALIZE_ENV".into(), "Demo".into());
+        }
+        let output = bounded_batch(&env, &["--accept-fleet-outage", "--failure-policy", policy]);
+        assert_eq!(
+            output.status.code(),
+            Some(if policy == "rollback" { 1 } else { 0 }),
+            "{}\n{}",
+            stdout(&output),
+            stderr(&output)
+        );
+        let result: Value = serde_json::from_str(&stdout(&output)).unwrap();
+        assert_eq!(result["checkpoints"].as_array().unwrap().len(), 2);
+        assert!(result["errors"].as_array().unwrap().is_empty(), "{result}");
+        for (name, directory) in [("Demo", "upper"), ("demo", "lower")] {
+            let item = batch_result(&result, name);
+            let rolled_back = name == "Demo" && policy == "rollback";
+            assert_eq!(
+                item["outcome"],
+                if rolled_back {
+                    "rolled-back"
+                } else {
+                    "switched"
+                },
+                "{item}"
+            );
+            assert_eq!(
+                fs::read_to_string(root.child(directory).join("keep")).unwrap(),
+                name
+            );
+            let shown = run_ocm(root.path(), &env, &["env", "show", name, "--json"]);
+            assert!(shown.status.success(), "{}", stderr(&shown));
+            assert_eq!(
+                serde_json::from_str::<Value>(&stdout(&shown)).unwrap()["defaultRuntime"],
+                if rolled_back { "old" } else { "new" }
+            );
+            let checkpoint = result["checkpoints"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["envName"] == name)
+                .unwrap();
+            let snapshot = run_ocm(
+                root.path(),
+                &env,
+                &[
+                    "env",
+                    "snapshot",
+                    "show",
+                    name,
+                    checkpoint["snapshotId"].as_str().unwrap(),
+                    "--json",
+                ],
+            );
+            assert!(snapshot.status.success(), "{}", stderr(&snapshot));
+            assert_eq!(
+                serde_json::from_str::<Value>(&stdout(&snapshot)).unwrap()["envName"],
+                name
+            );
+        }
+        // A subsequent command must acquire both physical guard families again.
+        let retry = bounded_batch(&env, &["--dry-run"]);
+        assert!(retry.status.success(), "{}", stderr(&retry));
+    }
+}
+
+#[test]
 fn upgrade_batch_dry_run_creates_no_journal_snapshot_or_runtime_change() {
     let root = TestDir::new("upgrade-fast-batch-dry-run");
     let cwd = root.child("workspace");

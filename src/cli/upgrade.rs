@@ -45,18 +45,20 @@ use crate::runtime::{
 };
 use crate::service::{ServiceSummary, wait_for_gateway_readiness};
 use crate::store::{
-    EnvironmentOperationLock, InstallContext, RuntimeBindingGuard, RuntimeMutationGuard,
-    RuntimeReleaseDetails, UpgradeHistoryBinding, UpgradeHistoryPhaseTiming, UpgradeHistoryRecord,
-    UpgradeHistoryRuntimeRecovery, UpgradeHistoryServiceState, UpgradeHistoryStage,
-    UpgradeRuntimeRecovery, clean_path, copy_dir_preserving_modes, derive_env_paths, display_path,
-    ensure_minimum_local_openclaw_config, ensure_store, get_runtime, get_upgrade_history_record,
-    get_upgrade_runtime_recovery, install_runtime_from_selected_official_openclaw_release,
-    list_upgrade_history, lock_env_registry, lock_upgrade_batch, lock_upgrade_participant,
-    lock_upgrade_transaction, remove_owned_tree, remove_runtime_with_guard,
-    remove_upgrade_recovery, resolve_absolute_path, runtime_install_root, runtime_integrity_issue,
-    runtime_meta_path, save_environment_with_dev_registration, save_upgrade_history_record,
-    try_lock_runtime_binding, try_lock_runtime_mutation, upgrade_history_recovery_dir,
-    upgrade_history_runtime_recovery_dir, with_prepared_dev_source, write_json,
+    EnvironmentOperationLock, ExclusiveFileLock, ExclusiveFileLockSet, InstallContext,
+    RuntimeBindingGuard, RuntimeMutationGuard, RuntimeReleaseDetails, UpgradeHistoryBinding,
+    UpgradeHistoryPhaseTiming, UpgradeHistoryRecord, UpgradeHistoryRuntimeRecovery,
+    UpgradeHistoryServiceState, UpgradeHistoryStage, UpgradeRuntimeRecovery, clean_path,
+    copy_dir_preserving_modes, derive_env_paths, display_path,
+    ensure_minimum_local_openclaw_config, ensure_store, environment_operation_lock_path,
+    get_runtime, get_upgrade_history_record, get_upgrade_runtime_recovery,
+    install_runtime_from_selected_official_openclaw_release, list_upgrade_history,
+    lock_env_registry, lock_upgrade_batch, lock_upgrade_participant, lock_upgrade_transaction,
+    remove_owned_tree, remove_runtime_with_guard, remove_upgrade_recovery, resolve_absolute_path,
+    runtime_install_root, runtime_integrity_issue, runtime_meta_path,
+    save_environment_with_dev_registration, save_upgrade_history_record, try_lock_runtime_binding,
+    try_lock_runtime_mutation, upgrade_history_recovery_dir, upgrade_history_runtime_recovery_dir,
+    upgrade_transaction_lock_path, with_prepared_dev_source, write_json,
 };
 
 pub(super) const UPGRADE_DRY_RUN_NOTES: [&str; 4] = [
@@ -65,6 +67,47 @@ pub(super) const UPGRADE_DRY_RUN_NOTES: [&str; 4] = [
     "config migration not run",
     "use ocm upgrade simulate for isolated checks",
 ];
+
+struct UpgradeBatchLocks {
+    transaction: Arc<ExclusiveFileLock>,
+    operation: Arc<EnvironmentOperationLock>,
+}
+
+impl UpgradeBatchLocks {
+    fn shares_lock(&self, other: &Self) -> bool {
+        [&self.transaction, &self.operation].iter().any(|left| {
+            [&other.transaction, &other.operation]
+                .iter()
+                .any(|right| Arc::ptr_eq(left, right))
+        })
+    }
+}
+
+fn batch_work_groups(
+    env_names: &[String],
+    locks: &BTreeMap<String, UpgradeBatchLocks>,
+) -> Vec<Vec<String>> {
+    let mut groups: Vec<Vec<String>> = Vec::new();
+    for name in env_names {
+        // Join every group touching either lock. This also handles a chain of
+        // aliases across the two lock families without conflating env identities.
+        let mut group = Vec::new();
+        let mut index = 0;
+        while index < groups.len() {
+            if groups[index]
+                .iter()
+                .any(|peer| locks[name].shares_lock(&locks[peer]))
+            {
+                group.extend(groups.remove(index));
+            } else {
+                index += 1;
+            }
+        }
+        group.push(name.clone());
+        groups.push(group);
+    }
+    groups
+}
 
 #[derive(Clone)]
 struct UpgradeCommandLocks<'a> {
@@ -779,19 +822,30 @@ impl Cli {
         let _batch_lock = lock_upgrade_batch(&self.env, &self.cwd)?;
         let mut lock_names = options.env_names.clone();
         lock_names.sort();
-        let mut transaction_locks = Vec::with_capacity(lock_names.len());
-        let mut operation_locks = BTreeMap::new();
+        let mut lock_set = ExclusiveFileLockSet::default();
+        let mut locks = BTreeMap::new();
         for env_name in &lock_names {
-            transaction_locks.push(lock_upgrade_transaction(env_name, &self.env, &self.cwd)?);
-            operation_locks.insert(
+            let transaction = lock_set.acquire(
+                &upgrade_transaction_lock_path(env_name, &self.env, &self.cwd)?,
+                "upgrade transaction",
+            )?;
+            let operation = lock_set.acquire(
+                &environment_operation_lock_path(env_name, &self.env, &self.cwd)?,
+                "environment operation",
+            )?;
+            locks.insert(
                 env_name.clone(),
-                self.environment_service().lock_operation(env_name)?,
+                UpgradeBatchLocks {
+                    transaction,
+                    operation,
+                },
             );
             if !options.dry_run {
                 self.environment_service()
                     .ensure_source_watch_allows_state_mutation_locked(env_name)?;
             }
         }
+        let work_groups = batch_work_groups(&options.env_names, &locks);
         let target = UpgradeTarget {
             version: None,
             channel: None,
@@ -807,7 +861,7 @@ impl Cli {
                 env_name,
                 &target,
                 preflight_options,
-                &operation_locks[env_name],
+                &locks[env_name].operation,
             )?;
             if is_failed_upgrade_outcome(&result.outcome) {
                 return Err(format!(
@@ -856,17 +910,14 @@ impl Cli {
 
         let checkpoint_label = format!("fast-batch-{batch_id}");
         let rollback_enabled = options.failure_policy == UpgradeFleetFailurePolicy::Rollback;
-        let checkpoint_results = self.run_parallel_batch_work(
-            &options.env_names,
-            options.parallel,
-            move |cli, env_name| {
+        let checkpoint_results =
+            self.run_parallel_batch_work(&work_groups, options.parallel, move |cli, env_name| {
                 cli.create_upgrade_batch_checkpoint_locked(
                     env_name,
                     &checkpoint_label,
                     rollback_enabled,
                 )
-            },
-        );
+            });
         for (env_name, result) in checkpoint_results {
             match result {
                 Ok(snapshot) => summary.checkpoints.push(UpgradeFleetCheckpoint {
@@ -907,14 +958,11 @@ impl Cli {
         summary.outcome = "snapshotted".to_string();
         self.save_upgrade_batch_journal(&journal_path, &summary)?;
 
-        let operation_locks = Arc::new(operation_locks);
-        let worker_operation_locks = Arc::clone(&operation_locks);
+        let worker_locks = Arc::new(locks);
         let target_for_workers = target.clone();
         let failure_policy = options.failure_policy;
-        let upgrade_results = self.run_parallel_batch_work(
-            &options.env_names,
-            options.parallel,
-            move |cli, env_name| {
+        let upgrade_results =
+            self.run_parallel_batch_work(&work_groups, options.parallel, move |cli, env_name| {
                 let result = cli.upgrade_env_locked(
                     env_name,
                     &target_for_workers,
@@ -922,7 +970,7 @@ impl Cli {
                         dry_run: false,
                         rollback_enabled: failure_policy == UpgradeFleetFailurePolicy::Rollback,
                     },
-                    &worker_operation_locks[env_name],
+                    &worker_locks[env_name].operation,
                 );
                 match result {
                     Ok(mut result)
@@ -947,8 +995,7 @@ impl Cli {
                     }
                     other => other,
                 }
-            },
-        );
+            });
         for (env_name, result) in upgrade_results {
             match result {
                 Ok(result) => summary.results.push(result),
@@ -1095,7 +1142,7 @@ impl Cli {
 
     fn run_parallel_batch_work<T, F>(
         &self,
-        env_names: &[String],
+        work_groups: &[Vec<String>],
         parallel: usize,
         work: F,
     ) -> Vec<(String, Result<T, String>)>
@@ -1103,12 +1150,13 @@ impl Cli {
         T: Send + 'static,
         F: Fn(&Cli, &str) -> Result<T, String> + Send + Sync + 'static,
     {
-        let queue = Arc::new(Mutex::new(VecDeque::from(env_names.to_vec())));
+        let queue = Arc::new(Mutex::new(VecDeque::from(work_groups.to_vec())));
         let work = Arc::new(work);
         let (sender, receiver) = mpsc::channel();
-        let mut workers = Vec::with_capacity(parallel);
+        let worker_count = parallel.min(work_groups.len());
+        let mut workers = Vec::with_capacity(worker_count);
 
-        for _ in 0..parallel {
+        for _ in 0..worker_count {
             let queue = Arc::clone(&queue);
             let work = Arc::clone(&work);
             let sender = sender.clone();
@@ -1116,19 +1164,21 @@ impl Cli {
             let cwd = self.cwd.clone();
             workers.push(thread::spawn(move || {
                 loop {
-                    let env_name = match queue.lock() {
+                    let group = match queue.lock() {
                         Ok(mut queue) => queue.pop_front(),
                         Err(_) => None,
                     };
-                    let Some(env_name) = env_name else {
+                    let Some(group) = group else {
                         break;
                     };
                     let cli = Cli {
                         env: env.clone(),
                         cwd: cwd.clone(),
                     };
-                    let result = work(&cli, &env_name);
-                    let _ = sender.send((env_name, result));
+                    for env_name in group {
+                        let result = work(&cli, &env_name);
+                        let _ = sender.send((env_name, result));
+                    }
                 }
             }));
         }
@@ -6953,6 +7003,102 @@ mod tests {
         release_version_from_output, simulation_requires_attention, summarize_command_failure_text,
         verify_gateway_build_id, verify_gateway_status_readiness, version_output_matches_expected,
     };
+
+    #[test]
+    fn batch_groups_serialize_both_lock_families_without_stalling_independent_work() {
+        use std::collections::BTreeMap;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+        let root = tempfile::tempdir().unwrap();
+        let mut set = super::ExclusiveFileLockSet::default();
+        let mut guard = |name: &str| set.acquire(&root.path().join(name), "test").unwrap();
+        let (a, b, c, d, e, f) = (
+            guard("a"),
+            guard("b"),
+            guard("c"),
+            guard("d"),
+            guard("e"),
+            guard("f"),
+        );
+        let locks = BTreeMap::from([
+            (
+                "first".into(),
+                super::UpgradeBatchLocks {
+                    transaction: a,
+                    operation: Arc::clone(&b),
+                },
+            ),
+            (
+                "second".into(),
+                super::UpgradeBatchLocks {
+                    transaction: Arc::clone(&c),
+                    operation: d,
+                },
+            ),
+            (
+                "bridge".into(),
+                super::UpgradeBatchLocks {
+                    transaction: c,
+                    operation: b,
+                },
+            ),
+            (
+                "other".into(),
+                super::UpgradeBatchLocks {
+                    transaction: e,
+                    operation: f,
+                },
+            ),
+        ]);
+        let names = ["first", "second", "bridge", "other"].map(String::from);
+        let groups = super::batch_work_groups(&names, &locks);
+        assert_eq!(
+            groups,
+            vec![vec!["first", "second", "bridge"], vec!["other"]]
+        );
+        let ready = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&order);
+        let cli = super::Cli {
+            env: BTreeMap::new(),
+            cwd: root.path().into(),
+        };
+        let results = cli.run_parallel_batch_work(&groups, 2, move |_, name| {
+            let aliased = name != "other";
+            if aliased {
+                assert_eq!(active.fetch_add(1, Ordering::SeqCst), 0);
+                order.lock().unwrap().push(name.to_string());
+            }
+            if name == "first" || name == "other" {
+                ready.fetch_add(1, Ordering::SeqCst);
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while ready.load(Ordering::SeqCst) < 2 {
+                    assert!(
+                        Instant::now() < deadline,
+                        "independent group was not scheduled"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            if aliased {
+                active.fetch_sub(1, Ordering::SeqCst);
+            }
+            if name == "second" {
+                Err("controlled failure".into())
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(results.len(), 4);
+        assert_eq!(
+            results.iter().filter(|(_, result)| result.is_err()).count(),
+            1
+        );
+        assert_eq!(*observed.lock().unwrap(), ["first", "second", "bridge"]);
+    }
 
     #[cfg(unix)]
     #[test]

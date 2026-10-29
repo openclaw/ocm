@@ -168,6 +168,17 @@ pub(crate) fn lock_upgrade_transaction(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<ExclusiveFileLock, String> {
+    lock_file(
+        &upgrade_transaction_lock_path(env_name, env, cwd)?,
+        "upgrade transaction",
+    )
+}
+
+pub(crate) fn upgrade_transaction_lock_path(
+    env_name: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<PathBuf, String> {
     let env_name = validate_name(env_name, "Environment name")?;
     // Keep existing lock identities for running older processes, except the name
     // that aliases the global lock (including on case-insensitive filesystems).
@@ -177,12 +188,11 @@ pub(crate) fn lock_upgrade_transaction(
     } else {
         format!("{env_name}.lock")
     };
-    let path = super::ensure_store(env, cwd)?
+    Ok(super::ensure_store(env, cwd)?
         .home
         .join("locks")
         .join("upgrades")
-        .join(lock_name);
-    lock_file(&path, "upgrade transaction")
+        .join(lock_name))
 }
 
 fn upgrade_batch_lock_path(env: &BTreeMap<String, String>, cwd: &Path) -> Result<PathBuf, String> {
