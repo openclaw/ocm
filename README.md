@@ -166,7 +166,9 @@ Required Git metadata includes linked `objects/pack` directories and pack files,
 referenced by `objects/info/alternates`,
 including shared clones, transitive references, and initialized submodules declared
 in `.gitmodules` (including nested submodules). Removing a containing environment
-refuses while another registered source depends on that storage. Independent clones
+refuses while another registered source depends on that storage or a directory
+needed to resolve its stored alternate path, including a directory before `..`.
+The route is retained even when the objects are outside that environment. Independent clones
 with their own objects remain removable. Active Git configuration files, including
 user/system includes and enabled per-worktree configuration, are protected with
 their access symlinks and traversed directories as well, including directories before

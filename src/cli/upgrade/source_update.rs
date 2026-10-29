@@ -101,12 +101,12 @@ fn source_footprints_overlap(
             }
         }
     }
-    // Config entries include access aliases and their ancestor targets, not
+    // Read dependencies include access aliases and their ancestor targets, not
     // ownership of those directories' contents. Only a mutable content root
-    // containing a required config entry creates a read/write overlap.
+    // containing a required entry creates a read/write overlap.
     for (mutable, reader) in [(footprint, &other), (&other, footprint)] {
         for root in &mutable.content_roots {
-            for entry in &reader.config_entries {
+            for entry in &reader.read_entries {
                 if crate::store::dev_sources::contains_existing(root, entry)? {
                     return Ok(true);
                 }
