@@ -629,6 +629,122 @@ fn daemon_child_log_aliases_do_not_expose_supervisor_diagnostics() {
 
 #[cfg(unix)]
 #[test]
+fn followers_report_initial_native_child_log_read_errors() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Instant;
+
+    use crate::support::{install_fake_systemd_tools, write_executable_script};
+
+    for name in ["ordinary", "daemon", "Daemon"] {
+        let root = TestDir::new("logs-follow-child-read-error");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut env = ocm_env(&root);
+        install_fake_systemd_tools(&root, &mut env);
+        let launcher = root.child("child");
+        write_executable_script(
+            &launcher,
+            "#!/bin/sh\nprintf 'child stdout\\n'\nprintf 'child stderr\\n' >&2\n",
+        );
+        for args in [
+            vec![
+                "launcher",
+                "add",
+                "fixture",
+                "--command",
+                launcher.to_str().unwrap(),
+            ],
+            vec!["env", "create", name, "--launcher", "fixture"],
+            vec!["service", "start", name],
+        ] {
+            let output = run_ocm(&cwd, &env, &args);
+            assert!(output.status.success(), "{}", stderr(&output));
+        }
+        let logs = root.child("ocm-home/supervisor/logs");
+        let diagnostic = fs::File::create(logs.join("daemon.stderr.log")).unwrap();
+        let produced = Command::new(env!("CARGO_BIN_EXE_ocm"))
+            .current_dir(&cwd)
+            .env_clear()
+            .envs(&env)
+            .args(["__daemon", "run", "--once"])
+            .stderr(diagnostic)
+            .output()
+            .unwrap();
+        assert!(produced.status.success());
+        for (stream, file_stream) in [("info", "stdout"), ("error", "stderr")] {
+            let prefix = if name.eq_ignore_ascii_case("daemon") {
+                "."
+            } else {
+                ""
+            };
+            let path = logs.join(format!("{prefix}{name}.{file_stream}.log"));
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                format!("child {file_stream}\n")
+            );
+            for merged in [false, true] {
+                for pretty in [false, true] {
+                    let permissions = fs::metadata(&path).unwrap().permissions();
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0)).unwrap();
+                    let denied = fs::File::open(&path);
+                    if denied.is_ok() {
+                        fs::set_permissions(&path, permissions).unwrap();
+                        continue; // Mode bits cannot stage denial for a privileged user.
+                    }
+                    let mut args = vec!["logs", name, "--follow"];
+                    if !merged {
+                        args.extend(["--stream", stream]);
+                    }
+                    if pretty {
+                        args.extend(["--color", "always"]);
+                    } else {
+                        args.push("--raw");
+                    }
+                    let mut child = Command::new(env!("CARGO_BIN_EXE_ocm"))
+                        .current_dir(&cwd)
+                        .env_clear()
+                        .envs(&env)
+                        .args(&args)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .spawn()
+                        .unwrap();
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let mut timed_out = false;
+                    while child.try_wait().unwrap().is_none() {
+                        if Instant::now() >= deadline {
+                            timed_out = true;
+                            let _ = child.kill();
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    let output = child.wait_with_output().unwrap();
+                    fs::set_permissions(&path, permissions).unwrap();
+                    assert_eq!(
+                        denied.unwrap_err().kind(),
+                        std::io::ErrorKind::PermissionDenied
+                    );
+                    assert!(!timed_out, "reader stayed pending: {args:?}");
+                    assert!(!output.status.success(), "{args:?}");
+                    assert!(
+                        stderr(&output).contains("Permission denied"),
+                        "{args:?}: {}",
+                        stderr(&output)
+                    );
+                    assert!(
+                        output.stdout.is_empty(),
+                        "must fail before header/output: {args:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn existing_followers_exclude_native_diagnostics_after_directory_refresh() {
     use crate::support::{install_fake_launchctl, write_executable_script};
 
