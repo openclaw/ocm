@@ -695,7 +695,10 @@ links are retained.
 Owned file and directory links use relative targets in the archive; external
 and dangling links retain their targets without copying external contents.
 Import relocates selected Git repositories and linked worktrees to the destination before registering the environment.
-Their required Git storage must be present inside the copied archive; an incomplete graph or unresolved copied lock fails import and removes the incomplete target without modifying the archive or source.
+For native bare shared repositories, object alternates relocate to donor storage
+already present in the archive. External or omitted bare donor entries stay
+unchanged; default export does not acquire additional bare donor storage.
+For checkouts and managed worktrees, required Git storage must be present inside the copied archive; an incomplete graph or unresolved copied lock fails import and removes the incomplete target without modifying the archive or source.
 Git indexes, branches, snapshot refs, authored files, and protected history retain their contents.
 Use `--include-state` when managed-session registry continuity is needed: ordinary archives still omit `.openclaw/state/openclaw.sqlite` and only retain their existing selected files.
 
@@ -738,6 +741,10 @@ OpenClaw worktree registry. Their repositories and required Git storage must all
 be inside the copied footprint. Staging in the destination then uses its own
 index; the source checkout and registrations remain unchanged. An incomplete or
 external Git graph fails the copy and removes the provisional target.
+Native bare shared repositories also relocate object alternates to donors already
+inside the copied footprint during clone, `migrate`, and `adopt import`, keeping
+history readable without the source when all required donor storage is included.
+External or omitted bare donors retain their existing paths.
 Clone refuses an active database that resolves to protected history, including through directory aliases, and removes the partial clone before registration.
 
 For clone, migration, and adoption, OCM does not classify a package or project

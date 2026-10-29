@@ -2816,8 +2816,8 @@ fn default_export_keeps_every_alternate_object_store_import_requires() {
 
 #[test]
 fn default_export_omits_storage_of_a_standalone_bare_repository() {
-    // Import keeps a standalone bare repository and its configuration but not
-    // the stores its alternates name, so export leaves those stores out.
+    // Bare relocation uses only stores already selected for the archive;
+    // export does not acquire omitted legacy stores named by alternates.
     let fixture = TestDir::new("export-legacy-store-bare-alternates");
     let root = fs::canonicalize(fixture.path()).unwrap();
     let env = ocm_env(&fixture);
@@ -2880,6 +2880,10 @@ fn default_export_omits_storage_of_a_standalone_bare_repository() {
     assert!(imported.status.success(), "{}", stderr(&imported));
     assert!(target.join("projects/mirror.git/HEAD").is_file());
     assert!(!target.join(".openclaw/cron").exists());
+    assert_eq!(
+        fs::read(target.join("projects/mirror.git/objects/info/alternates")).unwrap(),
+        fs::read(mirror.join("objects/info/alternates")).unwrap()
+    );
 }
 
 #[cfg(unix)]

@@ -1264,6 +1264,11 @@ Ordinary shared Git checkouts created with `git clone --shared` also relocate
 their object-alternate paths during clone, `migrate`, and `adopt import`. The
 donor object storage must be inside the copied footprint. The copied checkout
 can then read its history after the original environment is moved or removed.
+Native bare shared repositories (`git clone --bare --shared`) also relocate
+object alternates whose donor storage is already inside the copied footprint.
+Their copied history remains usable without the source when all required donors
+are included. External or omitted bare donor paths retain their existing values;
+these operations do not acquire additional donor storage.
 Clone refuses an active database that resolves to protected history, including through directory aliases, and removes the partial clone before registration.
 The same active-state ownership check applies to migration and its existing import rollback.
 
@@ -1684,7 +1689,11 @@ Owned file and directory links use relative targets in the archive; external
 and dangling links retain their targets without copying external contents.
 Import relocates selected Git repositories and linked worktrees to the destination before registering the environment.
 This includes native bare repositories (`git init --bare`): source-local configuration includes resolve to their retained destination files in both archive modes.
-Their required Git storage must be present inside the copied archive; an incomplete graph or unresolved copied lock fails import and removes the incomplete target without modifying the archive or source.
+Native bare shared repositories also relocate alternates to donor storage already
+present in either archive mode. Default export does not expand its selection to
+include otherwise omitted bare donor stores; import leaves those absent or
+external donor entries unchanged.
+For checkouts and managed worktrees, required Git storage must be present inside the copied archive; an incomplete graph or unresolved copied lock fails import and removes the incomplete target without modifying the archive or source.
 Git indexes, branches, snapshot refs, authored files, and protected history retain their contents.
 Ordinary-import cleanup retains the selected configuration files and links required by those Git repositories.
 Use `--include-state` when managed-session registry continuity is needed: ordinary archives still omit `.openclaw/state/openclaw.sqlite` and only retain their existing selected files.

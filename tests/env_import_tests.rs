@@ -1559,6 +1559,131 @@ fn env_import_relocates_native_bare_and_ordinary_git_includes() {
 }
 
 #[test]
+fn env_import_relocates_native_bare_shared_history_without_the_source() {
+    for include_state in [false, true] {
+        let fixture = TestDir::new("import-bare-shared-history");
+        let root = fs::canonicalize(fixture.path()).unwrap();
+        let env = ocm_env(&fixture);
+        let source = root.join("source");
+        let target = root.join("target");
+        let created = run_ocm(
+            &root,
+            &env,
+            &[
+                "env",
+                "create",
+                "source",
+                "--root",
+                source.to_str().unwrap(),
+            ],
+        );
+        assert!(created.status.success(), "{}", stderr(&created));
+        let workspace = source.join(".openclaw/workspace");
+        let donor = workspace.join("donor");
+        fs::create_dir_all(&donor).unwrap();
+        import_git(&donor, &env, &["init", "-q", "-b", "fixture"]);
+        write_text(&donor.join("sentinel"), "retained history\n");
+        import_git(&donor, &env, &["add", "sentinel"]);
+        import_git(
+            &donor,
+            &env,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+        );
+        for (name, flag) in [
+            ("shared.git", "--shared"),
+            ("independent.git", "--no-hardlinks"),
+            ("relative.git", "--shared"),
+        ] {
+            import_git(
+                &workspace,
+                &env,
+                &["clone", "--bare", flag, donor.to_str().unwrap(), name],
+            );
+            assert!(!workspace.join(name).join(".git").exists());
+        }
+        import_git(
+            &workspace,
+            &env,
+            &["clone", "--shared", donor.to_str().unwrap(), "ordinary"],
+        );
+        write_text(
+            &workspace.join("relative.git/objects/info/alternates"),
+            "../../donor/.git/objects\n",
+        );
+        let alternate = workspace.join("shared.git/objects/info/alternates");
+        let original_alternate = fs::read(&alternate).unwrap();
+        let head = import_git(&donor, &env, &["rev-parse", "HEAD"]);
+        for name in ["shared.git", "relative.git"] {
+            assert_eq!(
+                import_git(&workspace.join(name), &env, &["show", "HEAD:sentinel"]),
+                "retained history"
+            );
+        }
+        let archive = root.join("source.tar");
+        let mut args = vec![
+            "env",
+            "export",
+            "source",
+            "--output",
+            archive.to_str().unwrap(),
+        ];
+        if include_state {
+            args.push("--include-state");
+        }
+        let exported = run_ocm(&root, &env, &args);
+        assert!(exported.status.success(), "{}", stderr(&exported));
+        let archive_before = fs::read(&archive).unwrap();
+        let offline = root.join("offline");
+        fs::rename(&source, &offline).unwrap();
+        let imported = run_ocm(
+            &root,
+            &env,
+            &[
+                "env",
+                "import",
+                archive.to_str().unwrap(),
+                "--name",
+                "target",
+                "--root",
+                target.to_str().unwrap(),
+            ],
+        );
+        assert!(imported.status.success(), "{}", stderr(&imported));
+        assert_eq!(fs::read(&archive).unwrap(), archive_before);
+        assert_eq!(
+            fs::read(offline.join(".openclaw/workspace/shared.git/objects/info/alternates"))
+                .unwrap(),
+            original_alternate
+        );
+        for name in [
+            "donor",
+            "ordinary",
+            "shared.git",
+            "independent.git",
+            "relative.git",
+        ] {
+            let repo = target.join(".openclaw/workspace").join(name);
+            assert_eq!(
+                import_git(&repo, &env, &["show", "HEAD:sentinel"]),
+                "retained history",
+                "include_state={include_state}, {name}"
+            );
+            assert_eq!(import_git(&repo, &env, &["rev-parse", "HEAD"]), head);
+        }
+    }
+}
+
+#[test]
 fn env_import_relocates_config_includes_after_source_removal() {
     for include_state in [false, true] {
         let root = TestDir::new("import-config-includes");

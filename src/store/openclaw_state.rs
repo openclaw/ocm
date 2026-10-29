@@ -370,8 +370,9 @@ fn archived_git_paths_in_import_removed_roots(
                 archive_relative(relative);
             }
         }
-        // Import keeps a standalone bare repository's directory and selected
-        // configuration only; it inspects the storage of checkouts.
+        // Bare alternates relocate only storage already in the selection.
+        // Keep the existing export footprint: only checkouts acquire their
+        // required stores from otherwise omitted legacy state.
         let mut storage = vec![context.checkout.clone()];
         if !*bare {
             storage.extend(checkout_storage_paths(context, &canonical_root));
