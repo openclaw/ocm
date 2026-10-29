@@ -9,7 +9,8 @@ use crate::openclaw_repo::{
 
 use super::dev_sources::{
     DevSourceRemoval, SourceFootprint, ensure_dev_worktree_removal_preserves_dev_sources,
-    existing_source_path_entries, inspect_dev_source_identity_footprints, path_identity,
+    existing_source_path_entries_with_routes, inspect_dev_source_identity_footprints,
+    path_identity,
 };
 use super::envs::{environment_operation_lock_path, try_lock_environment_operation};
 use super::{
@@ -47,7 +48,14 @@ pub(super) fn is_symlink_loop(error: &std::io::Error) -> bool {
 }
 
 pub(super) fn registration_path(path: &Path) -> Result<(PathBuf, BTreeSet<PathBuf>), String> {
-    let observed = inspect_registration_path_inner(path, false)?;
+    registration_path_with_routes(path, None)
+}
+
+pub(super) fn registration_path_with_routes(
+    path: &Path,
+    directories: Option<&mut BTreeSet<PathBuf>>,
+) -> Result<(PathBuf, BTreeSet<PathBuf>), String> {
+    let observed = inspect_registration_path_inner(path, false, directories)?;
     let location = observed
         .location
         .ok_or("dev source contains a symlink cycle")?;
@@ -55,12 +63,13 @@ pub(super) fn registration_path(path: &Path) -> Result<(PathBuf, BTreeSet<PathBu
 }
 
 pub(super) fn inspect_registration_path(path: &Path) -> Result<RegistrationPath, String> {
-    inspect_registration_path_inner(path, true)
+    inspect_registration_path_inner(path, true, None)
 }
 
 fn inspect_registration_path_inner(
     path: &Path,
     observe_cycles: bool,
+    mut directories: Option<&mut BTreeSet<PathBuf>>,
 ) -> Result<RegistrationPath, String> {
     let mut pending = path.to_path_buf();
     let mut entries = BTreeSet::new();
@@ -79,7 +88,10 @@ fn inspect_registration_path_inner(
         loop {
             match fs::canonicalize(existing) {
                 Ok(resolved) => {
-                    entries.extend(existing_source_path_entries(existing)?);
+                    entries.extend(existing_source_path_entries_with_routes(
+                        existing,
+                        directories.as_deref_mut(),
+                    )?);
                     let suffix = pending
                         .strip_prefix(existing)
                         .map_err(|error| error.to_string())?;
@@ -120,7 +132,10 @@ fn inspect_registration_path_inner(
             match fs::read_link(existing) {
                 Ok(target) => {
                     let parent = existing.parent().ok_or("source link has no parent")?;
-                    entries.extend(existing_source_path_entries(parent)?);
+                    entries.extend(existing_source_path_entries_with_routes(
+                        parent,
+                        directories.as_deref_mut(),
+                    )?);
                     let parent = fs::canonicalize(parent).map_err(|error| error.to_string())?;
                     let entry = parent.join(existing.file_name().ok_or("source link has no name")?);
                     entries.insert(entry.clone());
@@ -167,7 +182,7 @@ fn source_identity(dev: &EnvDevMeta) -> Result<SourceIdentity, String> {
     let (repo, mut footprint) = inspect_dev_source_identity_footprints(dev)?;
     let mut preparation_paths = repo.entries.clone();
     preparation_paths.extend(repo.content_roots.iter().cloned());
-    preparation_paths.extend(repo.config_entries.iter().cloned());
+    preparation_paths.extend(repo.read_entries.iter().cloned());
     let mut locations = Vec::new();
     // Before worktree creation, retain the existing path through .worktrees,
     // including symlinks into another environment. This reserves no new paths.
@@ -181,7 +196,7 @@ fn source_identity(dev: &EnvDevMeta) -> Result<SourceIdentity, String> {
         .entries
         .iter()
         .chain(&footprint.content_roots)
-        .chain(&footprint.config_entries)
+        .chain(&footprint.read_entries)
         .map(|path| Ok((path.clone(), path_identity(path)?)))
         .collect::<Result<_, String>>()?;
     Ok(SourceIdentity {

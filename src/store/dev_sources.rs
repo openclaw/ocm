@@ -249,9 +249,9 @@ pub(crate) struct SourceFootprint {
     pub(crate) content_roots: BTreeSet<PathBuf>,
     // Required read dependencies and access-route directories, which may be
     // shared by independent sources.
-    // Preserve them during deletion without treating shared settings as shared
-    // mutable checkout or Git storage.
-    pub(crate) config_entries: BTreeSet<PathBuf>,
+    // Preserve them during deletion without treating their ancestor directories
+    // as shared mutable checkout or Git storage.
+    pub(crate) read_entries: BTreeSet<PathBuf>,
     // In-memory locations only. Existing-path identity checks must not stat an
     // absent borrowed checkout, and legacy Owned paths remain unreserved.
     pub(crate) reserved_roots: BTreeSet<PathBuf>,
@@ -262,8 +262,7 @@ impl SourceFootprint {
         self.entries.extend(other.entries.iter().cloned());
         self.content_roots
             .extend(other.content_roots.iter().cloned());
-        self.config_entries
-            .extend(other.config_entries.iter().cloned());
+        self.read_entries.extend(other.read_entries.iter().cloned());
         self.reserved_roots
             .extend(other.reserved_roots.iter().cloned());
     }
@@ -280,7 +279,7 @@ fn record_path_entries(
     path: &Path,
     entries: &mut BTreeSet<PathBuf>,
     links: &mut BTreeSet<PathBuf>,
-    include_directories: bool,
+    mut directories: Option<&mut BTreeSet<PathBuf>>,
 ) -> Result<PathBuf, String> {
     let resolved = fs::canonicalize(path).map_err(|error| {
         format!(
@@ -291,8 +290,10 @@ fn record_path_entries(
     entries.insert(resolved.clone());
     for ancestor in path.ancestors() {
         let metadata = fs::symlink_metadata(ancestor).map_err(|error| error.to_string())?;
-        if include_directories && metadata.is_dir() {
-            entries.insert(fs::canonicalize(ancestor).map_err(|error| error.to_string())?);
+        if metadata.is_dir()
+            && let Some(directories) = directories.as_deref_mut()
+        {
+            directories.insert(fs::canonicalize(ancestor).map_err(|error| error.to_string())?);
         }
         if !metadata.is_symlink() {
             continue;
@@ -309,15 +310,22 @@ fn record_path_entries(
             } else {
                 parent.join(target)
             };
-            record_path_entries(&target, entries, links, include_directories)?;
+            record_path_entries(&target, entries, links, directories.as_deref_mut())?;
         }
     }
     Ok(resolved)
 }
 
 pub(crate) fn existing_source_path_entries(path: &Path) -> Result<BTreeSet<PathBuf>, String> {
+    existing_source_path_entries_with_routes(path, None)
+}
+
+pub(super) fn existing_source_path_entries_with_routes(
+    path: &Path,
+    directories: Option<&mut BTreeSet<PathBuf>>,
+) -> Result<BTreeSet<PathBuf>, String> {
     let mut entries = BTreeSet::new();
-    record_path_entries(path, &mut entries, &mut BTreeSet::new(), false)?;
+    record_path_entries(path, &mut entries, &mut BTreeSet::new(), directories)?;
     Ok(entries)
 }
 
@@ -325,12 +333,26 @@ pub(crate) fn existing_source_path_entries(path: &Path) -> Result<BTreeSet<PathB
 // component, even when they contain none of the final target's bytes.
 pub(crate) fn existing_source_path_route_entries(path: &Path) -> Result<BTreeSet<PathBuf>, String> {
     let mut entries = BTreeSet::new();
-    record_path_entries(path, &mut entries, &mut BTreeSet::new(), true)?;
+    let mut directories = BTreeSet::new();
+    record_path_entries(
+        path,
+        &mut entries,
+        &mut BTreeSet::new(),
+        Some(&mut directories),
+    )?;
+    entries.extend(directories);
     Ok(entries)
 }
 
-fn reserve_path(path: &Path, footprint: &mut SourceFootprint) -> Result<(), String> {
-    let (reserved, entries) = super::dev_registration::registration_path(path)?;
+fn reserve_path(
+    path: &Path,
+    footprint: &mut SourceFootprint,
+    include_routes: bool,
+) -> Result<(), String> {
+    let (reserved, entries) = super::dev_registration::registration_path_with_routes(
+        path,
+        include_routes.then_some(&mut footprint.read_entries),
+    )?;
     footprint.entries.extend(entries);
     footprint.reserved_roots.insert(reserved);
     Ok(())
@@ -344,10 +366,18 @@ fn record_git_path(
     links: &mut BTreeSet<PathBuf>,
 ) -> Result<Option<PathBuf>, String> {
     if reserve_missing && existing_cleanup_path(path)?.is_none() {
-        reserve_path(path, footprint)?;
+        reserve_path(path, footprint, false)?;
         return Ok(None);
     }
-    record_path_entries(path, &mut footprint.entries, links, include_directories).map(Some)
+    let mut directories = BTreeSet::new();
+    let resolved = record_path_entries(
+        path,
+        &mut footprint.entries,
+        links,
+        include_directories.then_some(&mut directories),
+    )?;
+    footprint.entries.extend(directories);
+    Ok(Some(resolved))
 }
 
 fn append_git_footprint(
@@ -396,7 +426,7 @@ fn append_git_footprint(
             )?;
         }
     }
-    footprint.config_entries.extend(configuration.entries);
+    footprint.read_entries.extend(configuration.entries);
     footprint
         .reserved_roots
         .extend(configuration.reserved_roots);
@@ -516,6 +546,7 @@ fn append_git_object_footprint(
 ) -> Result<(), String> {
     let mut pending = vec![objects];
     let mut visited = BTreeSet::new();
+    let mut route_links = BTreeSet::new();
     // Bound dependency edges, not ordinary object counts. Uninspectable graphs
     // refuse the operation.
     while let Some(objects) = pending.pop() {
@@ -525,11 +556,19 @@ fn append_git_object_footprint(
         *paths_left -= 1;
         if existing_cleanup_path(&objects)?.is_none() {
             if reserve_missing {
-                reserve_path(&objects, footprint)?;
+                reserve_path(&objects, footprint, true)?;
             }
             continue;
         }
-        let resolved = record_path_entries(&objects, &mut footprint.entries, links, false)?;
+        // Git resolves each stored alternate spelling again on its next read.
+        // Keep ordinary route directories (including those before `..`) as
+        // read dependencies; only the resolved object store owns contents.
+        let resolved = record_path_entries(
+            &objects,
+            &mut footprint.entries,
+            &mut route_links,
+            Some(&mut footprint.read_entries),
+        )?;
         footprint.content_roots.insert(resolved.clone());
         if !visited.insert(resolved.clone()) {
             continue;
@@ -630,7 +669,7 @@ fn inspect_source_footprint_paths(
         // for execution, including initialized submodules' surviving aliases.
         let git_entry = root.join(".git");
         if reserve_missing && existing_cleanup_path(&git_entry)?.is_none() {
-            reserve_path(&git_entry, &mut footprint)?;
+            reserve_path(&git_entry, &mut footprint, false)?;
             continue;
         }
         if let Some(git) = crate::openclaw_repo::git_identity_paths(&root)? {
@@ -755,7 +794,7 @@ fn inspect_dev_source_footprint_observed(
         inspect_source_footprint_paths(Path::new(dev.source_root()), false, observation)?;
     footprint.entries.extend(worktree.entries);
     footprint.content_roots.extend(worktree.content_roots);
-    footprint.config_entries.extend(worktree.config_entries);
+    footprint.read_entries.extend(worktree.read_entries);
     if let Some(source) = existing_cleanup_path(Path::new(dev.source_root()))? {
         footprint.content_roots.insert(source);
     }
@@ -832,7 +871,7 @@ fn borrowed_source_footprint_observed(
     if let Some(source) = existing_cleanup_path(source)? {
         footprint.content_roots.insert(source);
     }
-    reserve_path(source, &mut footprint)?;
+    reserve_path(source, &mut footprint, false)?;
     Ok(footprint)
 }
 
@@ -1082,7 +1121,7 @@ impl DevSourceRemoval {
         for (path, contents) in footprint
             .entries
             .iter()
-            .chain(&footprint.config_entries)
+            .chain(&footprint.read_entries)
             .map(|path| (path, false))
             .chain(footprint.content_roots.iter().map(|path| (path, true)))
         {
@@ -1203,7 +1242,7 @@ pub(super) fn ensure_root_outside_borrowed_source(
     for (path, contents) in footprint
         .entries
         .iter()
-        .chain(&footprint.config_entries)
+        .chain(&footprint.read_entries)
         .map(|path| (path, false))
         .chain(footprint.content_roots.iter().map(|path| (path, true)))
         .chain(footprint.reserved_roots.iter().map(|path| (path, true)))

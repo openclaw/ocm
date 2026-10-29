@@ -591,7 +591,7 @@ pub(crate) fn ensure_restore_preserves_ownership(
             for (path, contents) in footprint
                 .entries
                 .iter()
-                .chain(&footprint.config_entries)
+                .chain(&footprint.read_entries)
                 .map(|path| (path, false))
                 .chain(footprint.content_roots.iter().map(|path| (path, true)))
             {

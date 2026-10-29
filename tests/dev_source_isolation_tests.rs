@@ -1022,6 +1022,200 @@ fn public_dev_preserves_combined_packed_and_late_loose_storage() {
 
 #[cfg(unix)]
 #[test]
+fn public_dev_preserves_native_git_object_access_routes() {
+    use std::os::unix::fs::symlink;
+
+    for mode in [
+        "parent",
+        "symlink",
+        "direct",
+        "reference",
+        "independent",
+        "late",
+        "missing",
+        "missing-alias",
+        "missing-direct",
+    ] {
+        let fixture = TestDir::new(&format!("git-object-route-{mode}"));
+        let cwd = fixture.path();
+        let env = ocm_env(&fixture);
+        let git = |repo: &Path, args: &[&str]| git_with_env(repo, args, &env);
+        let owner = fixture.child("owner");
+        let created = run_ocm(
+            cwd,
+            &env,
+            &["env", "create", "owner", "--root", &path_string(&owner)],
+        );
+        assert!(created.status.success(), "{}", stderr(&created));
+        let donor = fixture.child("outside-donor");
+        write_text(&donor.join("openclaw.mjs"), "// finite source command\n");
+        if mode.starts_with("missing") {
+            // Keep submodule discovery independent of the unavailable objects.
+            write_text(&donor.join(".gitmodules"), "");
+        }
+        let donor = init_checkout(&donor);
+        let source = fixture.child("borrowed-source");
+        let route = owner.join("../outside-donor");
+        let alias = if mode == "symlink" {
+            owner.join("donor-alias")
+        } else {
+            fixture.child("donor-alias")
+        };
+        if matches!(mode, "symlink" | "late" | "missing-alias") {
+            symlink(
+                if mode == "missing-alias" {
+                    &route
+                } else {
+                    &donor
+                },
+                &alias,
+            )
+            .unwrap();
+        }
+        let selected = match mode {
+            "parent" | "independent" | "missing" => &route,
+            "symlink" | "late" | "missing-alias" => &alias,
+            _ => &donor,
+        };
+        let selected = path_string(selected);
+        let source_arg = path_string(&source);
+        if mode == "reference" {
+            git(
+                cwd,
+                &[
+                    "clone",
+                    "--reference",
+                    &path_string(&route),
+                    "--no-local",
+                    &selected,
+                    &source_arg,
+                ],
+            );
+        } else {
+            git(
+                cwd,
+                &[
+                    "clone",
+                    if mode == "independent" {
+                        "--no-hardlinks"
+                    } else {
+                        "--shared"
+                    },
+                    &selected,
+                    &source_arg,
+                ],
+            );
+        }
+        let alternates = source.join(".git/objects/info/alternates");
+        let before_alternates = fs::read_to_string(&alternates).ok();
+        if mode == "independent" {
+            assert!(before_alternates.is_none());
+        } else {
+            let alternate = before_alternates.as_ref().unwrap();
+            assert_eq!(
+                alternate.contains(&path_string(&owner)),
+                matches!(mode, "parent" | "symlink" | "missing"),
+                "{mode}: {alternate}"
+            );
+            let counts = git(&source, &["count-objects", "-v"]);
+            assert!(counts.lines().any(|line| line == "count: 0"), "{counts}");
+            assert!(counts.lines().any(|line| line == "in-pack: 0"), "{counts}");
+        }
+        assert_eq!(git(&source, &["cat-file", "-t", "HEAD"]), "commit");
+        git(&source, &["fsck", "--full", "--no-dangling"]);
+
+        let dependent = matches!(mode, "parent" | "symlink" | "missing" | "missing-alias");
+        let register = || {
+            run_ocm(
+                cwd,
+                &env,
+                &[
+                    "dev",
+                    "borrower",
+                    "--repo",
+                    &source_arg,
+                    "--no-watch",
+                    "--no-ui",
+                ],
+            )
+        };
+        let lock = support::hold_environment_operation(&fixture, "owner");
+        let attempted = register();
+        assert_eq!(
+            attempted.status.success(),
+            !dependent,
+            "{mode}: {}",
+            stderr(&attempted)
+        );
+        if dependent {
+            assert!(stderr(&attempted).contains("owner has an operation in progress"));
+        }
+        drop(lock);
+        if dependent {
+            let admitted = register();
+            assert!(admitted.status.success(), "{mode}: {}", stderr(&admitted));
+        }
+        // Change only an access alias after admission. Each removal observation
+        // must inspect its current route, even though the object store is unchanged.
+        if mode == "late" {
+            fs::remove_file(&alias).unwrap();
+            symlink(&route, &alias).unwrap();
+        }
+        let displaced = if mode.starts_with("missing") {
+            let storage = if mode == "missing-alias" {
+                donor.clone()
+            } else {
+                donor.join(".git/objects")
+            };
+            let held = fixture.child("held-storage");
+            fs::rename(&storage, &held).unwrap();
+            Some((storage, held))
+        } else {
+            None
+        };
+        let registry = env_registry_path(&env, cwd).unwrap();
+        let before_registry = fs::read(&registry).unwrap();
+        let removed = run_ocm(cwd, &env, &["env", "remove", "owner"]);
+        let protected = dependent || mode == "late";
+        assert_eq!(
+            removed.status.success(),
+            !protected,
+            "{mode}: {}",
+            stderr(&removed)
+        );
+        if protected {
+            assert!(stderr(&removed).contains("registered dev source"));
+            assert!(owner.exists());
+            assert_eq!(fs::read(&registry).unwrap(), before_registry);
+        } else {
+            assert!(!owner.exists());
+        }
+        if let Some((storage, held)) = displaced {
+            // Returning the donor must suffice; removal must not add a second
+            // repair requirement by deleting its stored access route meanwhile.
+            fs::rename(held, storage).unwrap();
+        }
+        assert_eq!(fs::read_to_string(&alternates).ok(), before_alternates);
+        assert_eq!(git(&source, &["cat-file", "-t", "HEAD"]), "commit");
+        assert_eq!(
+            git(&source, &["show", "HEAD:package.json"]),
+            r#"{"name":"openclaw"}"#
+        );
+        git(&source, &["fsck", "--full", "--no-dangling"]);
+        assert_eq!(git(&donor, &["cat-file", "-t", "HEAD"]), "commit");
+        if mode == "late" {
+            fs::remove_file(&alias).unwrap();
+            symlink(&donor, &alias).unwrap();
+            let removed = run_ocm(cwd, &env, &["env", "remove", "owner"]);
+            assert!(removed.status.success(), "{}", stderr(&removed));
+            assert!(!owner.exists());
+            git(&source, &["fsck", "--full", "--no-dangling"]);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn public_dev_preserves_required_git_configuration() {
     use std::os::unix::fs::symlink;
 
