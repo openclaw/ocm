@@ -148,6 +148,14 @@ coverage from one machine.
 | npm packaging, launcher, installation, or recovery | Python 3.13 and npm 11.19.1: `python3 -B -m unittest discover -s scripts/tests -p 'test_npm_*.py'`. CI covers its declared Node.js and Linux/macOS architecture matrix. |
 | Signed npm binary installation | CI's `python3 -B scripts/tests/test_npm_install.py --published-binary-fixture` on its Node.js 24 jobs, with the required GitHub access and macOS signing identity. Do not supply signing credentials to an ordinary development checkout. |
 
+The native Windows packing-custody fixture checks the selected `npm.cmd` contents
+against one audited stock bootstrap, normalizing CRLF to LF. Its startup gate
+depends on that bootstrap to capture every process that can retain packing
+resources. A changed or custom launcher fails this prerequisite explicitly and
+requires source requalification; it is never skipped or counted as passing.
+The fixture still executes the installed launcher. This proof prerequisite does
+not change OCM's supported Node.js/npm versions or product compatibility.
+
 The npm packaging suite uses a private local fixture registry, cache, prefix,
 and home. It does not publish packages or change installed services. The signed
 fixture installs the existing signed v0.2.39 binaries on the three release
