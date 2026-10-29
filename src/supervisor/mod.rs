@@ -3529,6 +3529,16 @@ fn admit_supervisor_child_start(
             spec.env_name
         ));
     }
+    // Removal and recreation share admission but can complete while a probe
+    // runs outside it. Recheck the effective selection, including config-backed
+    // ports, before allowing the captured plan to spawn.
+    let (current_port, _) = service.resolve_effective_gateway_port(&meta)?;
+    if current_port != spec.child_port {
+        return Err(format!(
+            "refusing to start env \"{}\": its saved Gateway port {} no longer matches the selected port {}; restart the service to refresh its plan",
+            spec.env_name, spec.child_port, current_port
+        ));
+    }
     // A capability probe runs outside admission. Its saved binding may have
     // been cleared or replaced while the probe was in flight. Binding clears
     // share this lock, which stays held through spawn and publication.

@@ -2242,6 +2242,9 @@ if (args[1] === 'restart-handoff') {{
   process.on('SIGTERM', () => process.exit(0));
   process.on('SIGINT', () => process.exit(0));
   fs.writeFileSync(`${{root}}/${{name}}.cwd`, process.cwd());
+  fs.appendFileSync(`${{root}}/${{name}}.starts.jsonl`, JSON.stringify({{
+    pid: process.pid, args, port: process.env.OPENCLAW_GATEWAY_PORT,
+  }}) + '\n');
   mark('started');
   setTimeout(() => process.exit(0), 20000);
 }}
@@ -2724,6 +2727,238 @@ fn daemon_revalidates_binding_after_capability_probe() {
                     !process_exists(raw.trim().parse().unwrap()),
                     "owned peer survived: {marker}"
                 );
+            }
+        }
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn daemon_revalidates_recreated_environment_port_after_capability_probe() {
+    let _guard = daemon_runtime_test_lock();
+    struct Daemon(Child, std::path::PathBuf);
+    impl Drop for Daemon {
+        fn drop(&mut self) {
+            let _ = fs::write(self.1.join("alpha.allow"), "teardown");
+            let _ = fs::write(self.1.join("beta.allow"), "teardown");
+            if self.0.try_wait().ok().flatten().is_none() {
+                stop_process(&mut self.0);
+            }
+        }
+    }
+    for (binding, scenario) in [
+        ("runtime", "new-port"),
+        ("launcher", "new-port"),
+        ("launcher", "recreated-equivalent"),
+        ("launcher", "config-port"),
+        ("launcher", "recreated-stopped"),
+        ("runtime", "different-root"),
+    ] {
+        let root = TestDir::new("daemon-recreated-env-port");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut env = ocm_env(&root);
+        install_fake_service_manager(&root, &mut env);
+        let peer = root.child("peer/openclaw.mjs");
+        write_gated_handoff_peer(&root, &peer);
+        let selector = if binding == "runtime" {
+            "--runtime"
+        } else {
+            "--launcher"
+        };
+        let location = if binding == "runtime" {
+            "--path"
+        } else {
+            "--command"
+        };
+        let command = path_string(&peer);
+        let ok = |args: &[&str]| {
+            let result = run_ocm(&cwd, &env, args);
+            assert!(result.status.success(), "{args:?}: {}", stderr(&result));
+        };
+        ok(&[binding, "add", "peer", location, &command]);
+        for name in ["alpha", "beta"] {
+            ok(&["env", "create", name, selector, "peer"]);
+            ok(&["service", "start", name]);
+        }
+        let service = EnvironmentService::new(&env, &cwd);
+        let before = service.get("alpha").unwrap();
+        let old_port = before.gateway_port.unwrap();
+        // Let the supported allocator choose a second unused port family while
+        // alpha and beta remain registered. Remove this stopped reservation.
+        ok(&["env", "create", "port-reservation"]);
+        let new_port = service
+            .get("port-reservation")
+            .unwrap()
+            .gateway_port
+            .unwrap();
+        assert_ne!(new_port, old_port);
+        ok(&["env", "remove", "port-reservation"]);
+        if scenario == "config-port" {
+            // Auto-assigned metadata remains old_port; the plan uses config.
+            assert!(before.gateway_port_auto_assigned);
+            fs::write(
+                Path::new(&before.root).join(".openclaw/openclaw.json"),
+                serde_json::json!({"gateway": {"port": new_port}}).to_string(),
+            )
+            .unwrap();
+            ok(&["service", "start", "alpha"]);
+        }
+        let runtime_path = root.child("ocm-home/supervisor/runtime.json");
+        let mut daemon = Daemon(spawn_daemon_process(&cwd, &env), root.path().to_path_buf());
+        assert!(wait_for_file(
+            &root.child("alpha.probe"),
+            Duration::from_secs(5)
+        ));
+        let held_at = Instant::now();
+        let unchanged = matches!(scenario, "recreated-equivalent" | "config-port");
+        let expected_port = if scenario == "recreated-equivalent" {
+            old_port
+        } else {
+            new_port
+        };
+        if scenario != "config-port" {
+            ok(&["env", "remove", "alpha"]);
+            assert!(!Path::new(&before.root).exists());
+            let selected_root = if scenario == "different-root" {
+                path_string(&root.child("replacement-root"))
+            } else {
+                before.root.clone()
+            };
+            let port = expected_port.to_string();
+            ok(&[
+                "env",
+                "create",
+                "alpha",
+                selector,
+                "peer",
+                "--root",
+                &selected_root,
+                "--port",
+                &port,
+            ]);
+            let recreated = service.get("alpha").unwrap();
+            assert_ne!(recreated.created_at, before.created_at);
+            assert_eq!(recreated.gateway_port, Some(expected_port));
+            assert!(!recreated.service_running);
+            if scenario != "recreated-stopped" {
+                ok(&["service", "start", "alpha"]);
+                assert!(service.get("alpha").unwrap().service_running);
+            }
+        }
+        // Fixture timeout must not substitute for the intended release edge.
+        assert!(held_at.elapsed() < Duration::from_secs(10));
+        let plan: Value = serde_json::from_slice(
+            &fs::read(root.child("ocm-home/supervisor/state.json")).unwrap(),
+        )
+        .unwrap();
+        let planned = plan["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["envName"] == "alpha");
+        if scenario == "recreated-stopped" {
+            assert!(planned.is_none());
+        } else {
+            assert_eq!(planned.unwrap()["childPort"], expected_port);
+        }
+        fs::write(root.child("alpha.allow"), "release").unwrap();
+        assert!(wait_for_file(
+            &root.child("beta.probe"),
+            Duration::from_secs(5)
+        ));
+        // Any admitted alpha PID is published before beta's synchronous probe.
+        // The second probe postpones normal reconciliation.
+        let runtime: Value = serde_json::from_slice(&fs::read(&runtime_path).unwrap()).unwrap();
+        let observed_pid = runtime_child_pid(&runtime, "alpha");
+        if let Some(pid) = observed_pid {
+            wait_for_started_pid(&root.child("alpha.started"), pid);
+        }
+        let first_start = fs::read_to_string(root.child("alpha.starts.jsonl"))
+            .ok()
+            .and_then(|text| text.lines().next().map(str::to_owned))
+            .map(|line| serde_json::from_str::<Value>(&line).unwrap());
+        assert_eq!(
+            observed_pid.is_some(),
+            unchanged,
+            "{binding}/{scenario}: stale start: {runtime}"
+        );
+        if unchanged {
+            assert_eq!(
+                first_start.as_ref().unwrap()["port"],
+                expected_port.to_string()
+            );
+        } else {
+            assert!(
+                first_start.is_none(),
+                "{binding}/{scenario}: {first_start:?}"
+            );
+        }
+        fs::write(root.child("beta.allow"), "release").unwrap();
+        let expected_children = if scenario == "recreated-stopped" {
+            1
+        } else {
+            2
+        };
+        assert!(
+            wait_for_runtime_children(
+                &runtime_path,
+                expected_children,
+                Some("beta"),
+                Duration::from_secs(5)
+            )
+            .is_some()
+        );
+        if scenario != "recreated-stopped" {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let settled: Value =
+                    serde_json::from_slice(&fs::read(&runtime_path).unwrap()).unwrap();
+                if settled["children"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["envName"] == "alpha" && row["childPort"] == expected_port)
+                {
+                    let pid = runtime_child_pid(&settled, "alpha").unwrap();
+                    wait_for_started_pid(&root.child("alpha.started"), pid);
+                    if unchanged {
+                        assert_eq!(Some(pid), observed_pid, "unchanged plan restarted");
+                    }
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "current port did not reconcile: {settled}"
+                );
+                sleep(Duration::from_millis(25));
+            }
+        }
+        stop_process(&mut daemon.0);
+        assert!(daemon.0.try_wait().unwrap().unwrap().success());
+        let final_runtime: Value =
+            serde_json::from_slice(&fs::read(&runtime_path).unwrap()).unwrap();
+        assert_eq!(final_runtime["children"], serde_json::json!([]));
+        for name in ["alpha", "beta"] {
+            let probe_pid = fs::read_to_string(root.child(format!("{name}.probe"))).unwrap();
+            assert!(!process_exists(probe_pid.trim().parse().unwrap()));
+            if let Ok(events) = fs::read_to_string(root.child(format!("{name}.starts.jsonl"))) {
+                for line in events.lines() {
+                    let event: Value = serde_json::from_str(line).unwrap();
+                    assert!(!process_exists(event["pid"].as_u64().unwrap() as u32));
+                    if name == "alpha" {
+                        assert_eq!(event["port"], expected_port.to_string());
+                        assert_eq!(
+                            event["args"],
+                            serde_json::json!([
+                                "gateway",
+                                "run",
+                                "--port",
+                                expected_port.to_string()
+                            ])
+                        );
+                    }
+                }
             }
         }
     }
