@@ -556,10 +556,12 @@ pub(crate) fn ensure_restore_preserves_ownership(
                 .chain(registered.location.iter().map(|path| (path, true)))
             {
                 if let Some(relative) = projected_path_relative(&root, path)?
-                    && !independent.iter().any(|excluded| {
-                        relative.starts_with(excluded)
-                            || (!contents && excluded.starts_with(&relative))
-                    })
+                    && !super::checkpoint_scope::preserves_path(
+                        target_root,
+                        independent,
+                        &relative,
+                        contents,
+                    )?
                 {
                     return Err(format!(
                         "restoring env {} would replace registered environment {} root {} or a link needed to reach it; choose a checkpoint that preserves the complete environment root and its access paths",
@@ -594,10 +596,12 @@ pub(crate) fn ensure_restore_preserves_ownership(
                 .chain(footprint.content_roots.iter().map(|path| (path, true)))
             {
                 let affected = if let Some(relative) = relative_to_root(path)? {
-                    !independent.iter().any(|excluded| {
-                        relative.starts_with(excluded)
-                            || (!contents && excluded.starts_with(&relative))
-                    })
+                    !super::checkpoint_scope::preserves_path(
+                        target_root,
+                        independent,
+                        &relative,
+                        contents,
+                    )?
                 } else {
                     contents
                         && contains_existing(
@@ -615,9 +619,12 @@ pub(crate) fn ensure_restore_preserves_ownership(
             }
             for path in &footprint.reserved_roots {
                 let affected = if let Some(relative) = projected_path_relative(&root, path)? {
-                    !independent
-                        .iter()
-                        .any(|excluded| relative.starts_with(excluded))
+                    !super::checkpoint_scope::preserves_path(
+                        target_root,
+                        independent,
+                        &relative,
+                        true,
+                    )?
                 } else {
                     projected_path_contains(path, &root)?
                 };

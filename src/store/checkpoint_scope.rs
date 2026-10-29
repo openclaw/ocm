@@ -1,7 +1,9 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+use super::dev_sources::path_identity;
 use super::layout::display_path;
 use super::openclaw_state::with_owner_write_permission;
 
@@ -76,6 +78,91 @@ fn require_directory(path: &Path) -> Result<(), String> {
     }
 }
 
+fn directory_entry_names(directory: &Path) -> Result<BTreeSet<OsString>, String> {
+    require_directory(directory)?;
+    fs::read_dir(directory)
+        .map_err(|error| error.to_string())?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<Result<_, _>>()
+        .map_err(|error| error.to_string())
+}
+
+// Resolve a scope component without following its final link or opening its
+// contents. Exact entries stay distinct even when they are hard links.
+fn scope_entry_name(
+    directory: &Path,
+    names: &BTreeSet<OsString>,
+    name: &OsStr,
+) -> Result<Option<OsString>, String> {
+    if let Some(actual) = names.get(name) {
+        return Ok(Some(actual.clone()));
+    }
+    let selected = directory.join(name);
+    if !entry_exists(&selected)? {
+        return Ok(None);
+    }
+    let identity = path_identity(&selected)?;
+    let mut alias = None;
+    for actual in names {
+        if path_identity(&directory.join(actual))? == identity {
+            // The spelling selects an entry, but several hard links can share
+            // its identity. Refuse before moving anything if it is ambiguous.
+            if alias.is_some() {
+                return Err(format!(
+                    "independent path has ambiguous directory entries: {}",
+                    display_path(&selected)
+                ));
+            }
+            alias = Some(actual.clone());
+        }
+    }
+    alias.map(Some).ok_or_else(|| {
+        format!(
+            "independent path changed while inspecting directory entries: {}",
+            display_path(&selected)
+        )
+    })
+}
+
+/// Whether scoped replacement preserves a relative entry or its entire contents.
+/// Match only through the exclusion boundary; its descendants remain opaque.
+pub(crate) fn preserves_path(
+    root: &Path,
+    independent: &[PathBuf],
+    relative: &Path,
+    contents: bool,
+) -> Result<bool, String> {
+    for excluded in independent {
+        let mut scope = excluded.components();
+        let mut selected = relative.components();
+        let mut directory = root.to_path_buf();
+        let preserved = loop {
+            match (scope.next(), selected.next()) {
+                (None, _) => break true,
+                (_, None) => break !contents,
+                (Some(expected), Some(actual)) => {
+                    if expected != actual {
+                        let names = directory_entry_names(&directory)?;
+                        let expected_name =
+                            scope_entry_name(&directory, &names, expected.as_os_str())?;
+                        if expected_name.is_none()
+                            || expected_name
+                                != scope_entry_name(&directory, &names, actual.as_os_str())?
+                        {
+                            break false;
+                        }
+                    }
+                    directory.push(expected);
+                }
+            }
+        };
+        if preserved {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn collect_owned_entries(
     current: &Path,
     candidate: &Path,
@@ -84,28 +171,48 @@ fn collect_owned_entries(
     entries: &mut Vec<PathBuf>,
     ancestors: &mut Vec<PathBuf>,
 ) -> Result<(), String> {
-    if independent.iter().any(|path| path == relative) {
+    // Exclusions are relative to this level, so case-equivalent ancestor
+    // spellings can contribute their children to the same preserved directory.
+    if independent.iter().any(|path| path.as_os_str().is_empty()) {
         return Ok(());
     }
-    if !independent.iter().any(|path| path.starts_with(relative)) {
+    if independent.is_empty() {
         entries.push(relative.to_path_buf());
         return Ok(());
     }
     ancestors.push(relative.to_path_buf());
-    let mut names = BTreeSet::new();
-    for root in [current, candidate] {
-        let dir = root.join(relative);
-        require_directory(&dir)?;
-        for entry in fs::read_dir(dir).map_err(|error| error.to_string())? {
-            names.insert(entry.map_err(|error| error.to_string())?.file_name());
+    let current_dir = current.join(relative);
+    let candidate_dir = candidate.join(relative);
+    let current_names = directory_entry_names(&current_dir)?;
+    let candidate_names = directory_entry_names(&candidate_dir)?;
+    let mut children: BTreeMap<OsString, Vec<PathBuf>> = BTreeMap::new();
+    let mut aliases = BTreeMap::new();
+    for path in independent {
+        let mut parts = path.components();
+        let name = parts.next().expect("nonempty exclusion").as_os_str();
+        let live = scope_entry_name(&current_dir, &current_names, name)?;
+        let staged = scope_entry_name(&candidate_dir, &candidate_names, name)?;
+        let selected = live
+            .as_ref()
+            .or(staged.as_ref())
+            .cloned()
+            .unwrap_or_else(|| name.to_os_string());
+        for actual in [live, staged].into_iter().flatten() {
+            aliases.insert(actual, selected.clone());
         }
+        children.entry(selected).or_default().push(parts.collect());
     }
+    let names = current_names
+        .into_iter()
+        .chain(candidate_names)
+        .map(|name| aliases.get(&name).cloned().unwrap_or(name))
+        .collect::<BTreeSet<_>>();
     for name in names {
         collect_owned_entries(
             current,
             candidate,
-            &relative.join(name),
-            independent,
+            &relative.join(&name),
+            children.get(&name).map(Vec::as_slice).unwrap_or_default(),
             entries,
             ancestors,
         )?;
@@ -226,6 +333,37 @@ pub(crate) fn replace_owned_entries(
 mod tests {
     use super::*;
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+
+    #[test]
+    fn independent_and_owned_hardlinks_remain_distinct_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let current = temp.path().join("current");
+        let candidate = temp.path().join("candidate");
+        let backup = temp.path().join("backup");
+        for root in [&current, &candidate] {
+            fs::create_dir(root).unwrap();
+        }
+        fs::write(current.join("project"), "independent").unwrap();
+        fs::hard_link(current.join("project"), current.join("owned")).unwrap();
+        fs::write(candidate.join("owned"), "saved").unwrap();
+        let identity = path_identity(&current.join("project")).unwrap();
+        let paths = [PathBuf::from("project")];
+        replace_owned_entries(&current, &candidate, &backup, &paths).unwrap();
+        assert_eq!(fs::read(current.join("project")).unwrap(), b"independent");
+        assert_eq!(path_identity(&current.join("project")).unwrap(), identity);
+        assert_eq!(fs::read(current.join("owned")).unwrap(), b"saved");
+
+        fs::rename(current.join("project"), current.join("Project")).unwrap();
+        if !current.join("project").exists() {
+            return; // The ambiguous native lookup needs a case-insensitive volume.
+        }
+        fs::hard_link(current.join("Project"), current.join("second-link")).unwrap();
+        let error = replace_owned_entries(&current, &backup, &candidate, &paths).unwrap_err();
+        assert!(error.prior_state_restored);
+        assert!(error.message.contains("ambiguous directory entries"));
+        assert_eq!(fs::read(current.join("owned")).unwrap(), b"saved");
+        assert_eq!(path_identity(&current.join("Project")).unwrap(), identity);
+    }
 
     #[test]
     fn partial_publication_failure_reinstates_owned_entries_and_leaves_project_in_place() {
