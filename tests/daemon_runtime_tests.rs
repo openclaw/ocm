@@ -2241,6 +2241,7 @@ if (args[1] === 'restart-handoff') {{
 }} else {{
   process.on('SIGTERM', () => process.exit(0));
   process.on('SIGINT', () => process.exit(0));
+  fs.writeFileSync(`${{root}}/${{name}}.cwd`, process.cwd());
   mark('started');
   setTimeout(() => process.exit(0), 20000);
 }}
@@ -2386,6 +2387,10 @@ fn daemon_revalidates_binding_after_capability_probe() {
         ("launcher", "launcher", false),
         ("launcher", "launcher", true),
         ("launcher", "unchanged", false),
+        ("launcher", "reuse-command", false),
+        ("launcher", "reuse-command", true),
+        ("launcher", "reuse-cwd", false),
+        ("launcher", "reuse-equivalent", false),
         ("launcher", "runtime", false),
         ("launcher", "runtime", true),
     ] {
@@ -2412,9 +2417,28 @@ fn daemon_revalidates_binding_after_capability_probe() {
             &[binding, "add", "peer", location, &path_string(&peer)],
         );
         assert!(added.status.success(), "{}", stderr(&added));
+        if binding == "launcher" {
+            let sibling = run_ocm(
+                &cwd,
+                &env,
+                &[
+                    "launcher",
+                    "add",
+                    "sibling",
+                    "--command",
+                    &path_string(&peer),
+                ],
+            );
+            assert!(sibling.status.success(), "{}", stderr(&sibling));
+        }
         for name in ["alpha", "beta"] {
+            let binding_name = if binding == "launcher" && name == "beta" {
+                "sibling"
+            } else {
+                "peer"
+            };
             for args in [
-                vec!["env", "create", name, selector, "peer"],
+                vec!["env", "create", name, selector, binding_name],
                 vec!["service", "start", name],
             ] {
                 let result = run_ocm(&cwd, &env, &args);
@@ -2441,7 +2465,7 @@ fn daemon_revalidates_binding_after_capability_probe() {
             Duration::from_secs(5)
         ));
         let replacement = root.child("replacement");
-        if matches!(change, "launcher" | "runtime") {
+        if matches!(change, "launcher" | "runtime" | "reuse-command") {
             write_executable_script(
                 &replacement,
                 &format!(
@@ -2449,6 +2473,8 @@ fn daemon_revalidates_binding_after_capability_probe() {
                     path_string(&root.child("replacement.started")),
                 ),
             );
+        }
+        if matches!(change, "launcher" | "runtime") {
             let added = run_ocm(
                 &cwd,
                 &env,
@@ -2559,6 +2585,40 @@ fn daemon_revalidates_binding_after_capability_probe() {
                 sleep(Duration::from_millis(10));
             }
         }
+        if change.starts_with("reuse-") {
+            for args in [
+                vec!["env", "set-launcher", "alpha", "none"],
+                vec!["launcher", "remove", "peer"],
+            ] {
+                let result = run_ocm(&cwd, &env, &args);
+                assert!(result.status.success(), "{}", stderr(&result));
+            }
+            let command = path_string(if change == "reuse-command" {
+                &replacement
+            } else {
+                &peer
+            });
+            let replacement_cwd = root.child("replacement-cwd");
+            fs::create_dir_all(&replacement_cwd).unwrap();
+            let replacement_cwd = path_string(&replacement_cwd);
+            let mut add = vec![
+                "launcher",
+                "add",
+                "peer",
+                "--command",
+                &command,
+                "--description",
+                "re-registered definition",
+            ];
+            if change == "reuse-cwd" {
+                add.extend(["--cwd", &replacement_cwd]);
+            }
+            let result = run_ocm(&cwd, &env, &add);
+            assert!(result.status.success(), "{}", stderr(&result));
+            let result = run_ocm(&cwd, &env, &["env", "set-launcher", "alpha", "peer"]);
+            assert!(result.status.success(), "{}", stderr(&result));
+        }
+        let unchanged = matches!(change, "unchanged" | "reuse-equivalent");
         let plan: Value = serde_json::from_slice(
             &fs::read(root.child("ocm-home/supervisor/state.json")).unwrap(),
         )
@@ -2583,17 +2643,20 @@ fn daemon_revalidates_binding_after_capability_probe() {
         let runtime: Value = serde_json::from_slice(&fs::read(&runtime_path).unwrap()).unwrap();
         assert_eq!(
             runtime_child_pid(&runtime, "alpha").is_some(),
-            change == "unchanged",
+            unchanged,
             "{binding}/{change}/{reconciled}: stale binding admitted: {runtime}"
         );
-        if change == "unchanged" {
+        if unchanged {
             assert!(wait_for_file(
                 &root.child("alpha.started"),
                 Duration::from_secs(5)
             ));
         }
         fs::write(root.child("beta.allow"), "release").unwrap();
-        let expected = if matches!(change, "unchanged" | "launcher" | "runtime") {
+        let expected = if unchanged
+            || change.starts_with("reuse-")
+            || matches!(change, "launcher" | "runtime")
+        {
             2
         } else {
             1
@@ -2619,15 +2682,25 @@ fn daemon_revalidates_binding_after_capability_probe() {
                 vec!["beta"]
             }
         );
-        if matches!(change, "launcher" | "runtime") {
+        if matches!(change, "launcher" | "runtime" | "reuse-command") {
             assert!(wait_for_file(
                 &root.child("replacement.started"),
                 Duration::from_secs(5)
             ));
         }
+        if change == "reuse-cwd" {
+            assert!(wait_for_file(
+                &root.child("alpha.started"),
+                Duration::from_secs(5)
+            ));
+            assert_eq!(
+                fs::read_to_string(root.child("alpha.cwd")).unwrap(),
+                path_string(&fs::canonicalize(root.child("replacement-cwd")).unwrap()),
+            );
+        }
         assert_eq!(
             root.child("alpha.started").exists(),
-            change == "unchanged",
+            unchanged || change == "reuse-cwd",
             "{binding}/{change}/{reconciled}: removed binding executed"
         );
         assert_eq!(

@@ -3554,6 +3554,25 @@ fn admit_supervisor_child_start(
             spec.env_name
         ));
     }
+    if spec.binding_kind == "launcher" {
+        // A cleared launcher can be removed and registered again under the same
+        // name while its probe runs. Read its current definition, not the saved
+        // desired plan. Keep the captured port and execution environment: this
+        // checks the recipe without re-running configuration or tool preparation.
+        let mut launch_meta = meta.clone();
+        launch_meta.gateway_port = Some(spec.child_port);
+        let current = crate::env::resolve_gateway_process_spec(&launch_meta, env, cwd, false)?;
+        if current.command != spec.command
+            || current.binary_path != spec.binary_path
+            || current.args != spec.args
+            || current.run_dir != Path::new(&spec.run_dir)
+        {
+            return Err(format!(
+                "refusing to start env \"{}\": its saved launcher plan no longer matches the registered definition; restart the service to refresh its plan",
+                spec.env_name
+            ));
+        }
+    }
     if spec.binding_kind == "dev" {
         if spec.binding_name != "dev"
             || !matches!(

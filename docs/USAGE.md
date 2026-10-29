@@ -854,6 +854,10 @@ probe from starting the removed binding. This also covers selecting a runtime
 with `ocm start <env> --runtime <runtime> --no-service`. This preserves service-running
 intent; normal reconciliation applies the updated plan and any remaining binding.
 Changing a binding does not instantly terminate an already-running Gateway.
+Launcher admission also checks the current command and working directory, so
+clearing, removing, and re-registering a launcher under the same name cannot start
+its retired command. Re-registering the same command and working directory remains
+compatible; description and timestamp changes alone do not invalidate a pending start.
 
 Normal restart is gateway-aware while the Gateway is running and
 `ocm service status mira` reports restart handoff `protocol v1`: OpenClaw records
