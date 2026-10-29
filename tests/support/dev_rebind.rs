@@ -1425,11 +1425,14 @@ fn dev_switch_rollback_preserves_a_recreated_environment() {
             fs::write(path.join("openclaw.mjs"), "// finite native source\n").unwrap();
             commit_nested_openclaw_repo(&path);
         }
-        let a = path_string(&root.child("source-a"));
-        let b = path_string(&root.child("source-b"));
-        let replacement_source = path_string(&root.child(replacement_source));
-        let old_root = path_string(&root.child("original"));
-        let new_root = path_string(&root.child("replacement"));
+        // OCM records canonical sources; temporary directories can contain
+        // aliases (for example /var -> /private/var on macOS).
+        let canonical_root = fs::canonicalize(root.path()).unwrap();
+        let a = path_string(&canonical_root.join("source-a"));
+        let b = path_string(&canonical_root.join("source-b"));
+        let replacement_source = path_string(&canonical_root.join(replacement_source));
+        let old_root = path_string(&canonical_root.join("original"));
+        let new_root = path_string(&canonical_root.join("replacement"));
         let created = run_ocm(
             root.path(),
             &env,
