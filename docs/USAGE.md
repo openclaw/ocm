@@ -855,6 +855,10 @@ Retry after restoring manager access; `ocm service status` remains available for
 
 Saved dev service plans must still match the env's current binding and recorded
 worktree. If OCM refuses a stale plan, use `ocm service restart <env>` to refresh it.
+Pending starts recheck the current effective Gateway port after capability
+probing. Removing and recreating an environment with a different selected port
+cannot start the removed environment's old-port plan; normal reconciliation
+starts the replacement plan. Equivalent recreation does not force a restart.
 Pending runtime and launcher starts also recheck the selected binding after
 capability probing. Clearing a binding with `ocm env set-runtime <env> none` or
 `ocm env set-launcher <env> none`, or replacing a launcher, prevents a pending
