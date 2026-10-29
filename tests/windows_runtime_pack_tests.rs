@@ -193,35 +193,57 @@ fn native_windows_pack_preserves_live_child_archive() {
         "--json",
     ];
     let retry = run_ocm(fixture.path(), &env, &args);
-    println!("runtime retry diagnostics: {}", stderr(&retry));
     assert!(retry.status.success(), "{}", stderr(&retry));
     let runtimes = fixture.child("ocm-home/runtimes");
     let no_stages = || {
-        fs::read_dir(&runtimes)
+        let mut first_remaining_stage = None;
+        let clear = fs::read_dir(&runtimes)
             .unwrap()
             .filter_map(Result::ok)
             .all(|entry| {
-                !entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(".stable.stage-")
-            })
+                let name = entry.file_name();
+                let clear = !name.to_string_lossy().starts_with(".stable.stage-");
+                if !clear {
+                    first_remaining_stage = Some(name);
+                }
+                clear
+            });
+        (clear, first_remaining_stage)
     };
-    for entry in fs::read_dir(&runtimes).unwrap().flatten() {
-        if entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with(".stable.stage-")
-        {
-            println!("remaining runtime stage {:?}", entry.path());
-            if let Ok(children) = fs::read_dir(entry.path()) {
-                for child in children.flatten() {
-                    println!("remaining stage child {:?}", child.path());
+    // Latch the original predicate before any added output or filesystem read.
+    let (clear, first_remaining_stage) = no_stages();
+    if let Some(name) = &first_remaining_stage {
+        eprintln!("first cleanup observation: clear={clear}, remaining={name:?}");
+        eprintln!(
+            "original owner PID: {:?}",
+            fs::read_to_string(fixture.child("owner-pid"))
+        );
+        eprintln!("retry stderr: {}", stderr(&retry));
+        let remaining = runtimes.join(name);
+        eprintln!(
+            "later residue kind (directory, file, symlink): {:?}",
+            fs::symlink_metadata(&remaining).map(|meta| (
+                meta.is_dir(),
+                meta.is_file(),
+                meta.file_type().is_symlink(),
+            ))
+        );
+        match fs::read_dir(&remaining) {
+            Ok(entries) => {
+                for entry in entries.take(16) {
+                    eprintln!(
+                        "later residue child: {:?}",
+                        entry.map(|entry| entry.file_name())
+                    );
                 }
             }
+            Err(error) => eprintln!("later residue enumeration: {error:?}"),
         }
     }
-    assert!(no_stages());
+    assert!(
+        clear,
+        "first cleanup observation retained {first_remaining_stage:?}"
+    );
     assert!(!runtimes.join("stable/pack").exists());
     let verify = run_ocm(
         fixture.path(),
@@ -233,7 +255,7 @@ fn native_windows_pack_preserves_live_child_archive() {
     let failure = run_ocm(fixture.path(), &env, &args);
     assert!(!failure.status.success());
     assert!(stderr(&failure).contains("failed to pack local OpenClaw build"));
-    assert!(no_stages());
+    assert!(no_stages().0);
     let verify = run_ocm(
         fixture.path(),
         &env,
@@ -246,6 +268,6 @@ fn native_windows_pack_preserves_live_child_archive() {
         &["runtime", "remove", "stable", "--json"],
     );
     assert!(remove.status.success(), "{}", stderr(&remove));
-    assert!(no_stages());
+    assert!(no_stages().0);
     println!("native Windows retry, publication, error preservation and removal passed");
 }

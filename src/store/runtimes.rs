@@ -3265,20 +3265,12 @@ fn reclaim_abandoned_runtime_stages(
         }
         if name == held {
             #[cfg(windows)]
-            {
-                let custody = crate::infra::windows_runtime_stage::has_custody(&path);
-                if !matches!(custody, Ok(false)) {
-                    eprintln!(
-                        "runtime stage reclamation preserved path={path:?} custody={custody:?}"
-                    );
-                    continue;
-                }
-                let removed = fs::remove_dir_all(&path);
-                eprintln!(
-                    "runtime stage reclamation removal path={path:?} custody=absent result={removed:?}"
-                );
+            if !matches!(
+                crate::infra::windows_runtime_stage::has_custody(&path),
+                Ok(false)
+            ) {
+                continue;
             }
-            #[cfg(not(windows))]
             let _ = fs::remove_dir_all(&path);
             continue;
         }
