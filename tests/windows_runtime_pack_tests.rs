@@ -193,6 +193,7 @@ fn native_windows_pack_preserves_live_child_archive() {
         "--json",
     ];
     let retry = run_ocm(fixture.path(), &env, &args);
+    println!("runtime retry diagnostics: {}", stderr(&retry));
     assert!(retry.status.success(), "{}", stderr(&retry));
     let runtimes = fixture.child("ocm-home/runtimes");
     let no_stages = || {
@@ -206,6 +207,20 @@ fn native_windows_pack_preserves_live_child_archive() {
                     .starts_with(".stable.stage-")
             })
     };
+    for entry in fs::read_dir(&runtimes).unwrap().flatten() {
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".stable.stage-")
+        {
+            println!("remaining runtime stage {:?}", entry.path());
+            if let Ok(children) = fs::read_dir(entry.path()) {
+                for child in children.flatten() {
+                    println!("remaining stage child {:?}", child.path());
+                }
+            }
+        }
+    }
     assert!(no_stages());
     assert!(!runtimes.join("stable/pack").exists());
     let verify = run_ocm(
