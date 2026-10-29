@@ -4,9 +4,38 @@ All notable changes to OCM are documented here.
 
 ## Unreleased
 
+## 0.3.8 - 2026-10-29
+
+**Highlights:** Safer environment copies and recovery, stronger runtime ownership, and reliable Windows runtime installation and launch.
+
+### Fixed
+
+- Preserve committed SQLite state when environment roots, internal shared-state directories, or registered agent paths use aliases. Capture closed WAL databases in read-only directories, and preserve user attributes when snapshotting read-only files on Unix. ([#750](https://github.com/openclaw/ocm/pull/750), [#780](https://github.com/openclaw/ocm/pull/780), [#767](https://github.com/openclaw/ocm/pull/767), [#748](https://github.com/openclaw/ocm/pull/748))
+- Keep copied Git worktrees, shared checkouts, and bare repositories usable after the source is removed when their required Git data is included in the copy. Relocate copied metadata and object-storage links without pulling external bare-repository donors into an export. ([#749](https://github.com/openclaw/ocm/pull/749), [#773](https://github.com/openclaw/ocm/pull/773), [#793](https://github.com/openclaw/ocm/pull/793))
+- Preserve directory routes needed to reach registered development sources' Git configuration and alternate object storage during environment removal. Keep scoped restore compatible with those protected dependencies. ([#766](https://github.com/openclaw/ocm/pull/766), [#799](https://github.com/openclaw/ocm/pull/799))
+- Preserve independent directories renamed only by case during scoped restore, and list snapshots for the correct environment when names share a case-insensitive storage directory. ([#802](https://github.com/openclaw/ocm/pull/802), [#778](https://github.com/openclaw/ocm/pull/778))
+- Refuse export-output collisions without replacing independently created files, and keep parent-directory replacements from introducing external bytes into exports. ([#752](https://github.com/openclaw/ocm/pull/752), [#769](https://github.com/openclaw/ocm/pull/769))
+- Reject environment and snapshot prune ages outside the supported date range before removing data. ([#775](https://github.com/openclaw/ocm/pull/775), [#783](https://github.com/openclaw/ocm/pull/783))
+- Build linked runtimes and companion packages through aliased OCM roots, preserving native dependency versions, private bindings, shared package identity, and host dependencies. ([#737](https://github.com/openclaw/ocm/pull/737), [#751](https://github.com/openclaw/ocm/pull/751), [#762](https://github.com/openclaw/ocm/pull/762))
+- Reclaim packing scratch after interrupted local builds while preserving files still held by live packing processes. ([#717](https://github.com/openclaw/ocm/pull/717))
+- Avoid Windows stack overflow when hashing runtime trees, launch installed package entrypoints through Node.js, and verify native companion entrypoint paths correctly. ([#729](https://github.com/openclaw/ocm/pull/729), [#734](https://github.com/openclaw/ocm/pull/734), [#757](https://github.com/openclaw/ocm/pull/757))
+- Preserve Windows package junctions through runtime publication and recovery, and create private directories correctly on long ordinary Windows paths. ([#759](https://github.com/openclaw/ocm/pull/759), [#761](https://github.com/openclaw/ocm/pull/761))
+- Reject stale service starts after runtime removal, binding changes, launcher replacement, or environment recreation with a different port. ([#755](https://github.com/openclaw/ocm/pull/755), [#772](https://github.com/openclaw/ocm/pull/772), [#785](https://github.com/openclaw/ocm/pull/785), [#803](https://github.com/openclaw/ocm/pull/803))
+- Retain managed runtimes while foreground commands use them. Preserve recreated environments during dev-switch rollback and independently reinstalled runtimes during simulation cleanup. ([#787](https://github.com/openclaw/ocm/pull/787), [#784](https://github.com/openclaw/ocm/pull/784), [#753](https://github.com/openclaw/ocm/pull/753))
+- Prevent batch upgrades from blocking on aliased locks, and keep asynchronous jobs and upgrade history associated with their own environments when names share case-insensitive storage. ([#782](https://github.com/openclaw/ocm/pull/782), [#798](https://github.com/openclaw/ocm/pull/798), [#800](https://github.com/openclaw/ocm/pull/800))
+- Exit quietly when log-pipeline readers close while still reporting real output-flush failures and unreadable selected logs, including environments named like daemon logs. ([#754](https://github.com/openclaw/ocm/pull/754), [#765](https://github.com/openclaw/ocm/pull/765), [#801](https://github.com/openclaw/ocm/pull/801))
+- Handle Linux process observations for exited tasks without treating them as running or authorizing signals against them. ([#704](https://github.com/openclaw/ocm/pull/704))
+
 ### Changed
 
 - Refresh Git configuration support to gix-config 0.62.1 while retaining Rust 1.88 support, and update the pinned Rust cache and Python setup actions. Thanks @dependabot (#706, #707).
+  ([#738](https://github.com/openclaw/ocm/pull/738))
+- Update the embedded certificate roots to webpki-roots 1.0.11, removing emSign C1/C3 authorities from OCM downloads. Connections whose only authority is a retired root now fail verification. Thanks @joshavant. ([#704](https://github.com/openclaw/ocm/pull/704))
+- Isolate upgrade test fixtures from host launcher tools and wait for native packing fixture processes to finish before cleanup. ([#788](https://github.com/openclaw/ocm/pull/788), [#789](https://github.com/openclaw/ocm/pull/789))
+
+### Upgrade notes
+
+Install the updated OCM executable to receive these fixes and the revised certificate roots. Existing OpenClaw environments are not automatically upgraded. Supported native downloads remain Linux x64 and macOS ARM64/x64; the Windows fixes apply to Windows source builds. See [usage guidance](docs/USAGE.md) for the preserved scope of copies, exports, snapshots, and cold upgrade finalization.
 
 ## 0.3.7 - 2026-10-27
 
