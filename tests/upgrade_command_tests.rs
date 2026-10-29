@@ -5989,6 +5989,8 @@ fn upgrade_can_switch_a_local_launcher_env_to_a_published_runtime() {
     let cwd = root.child("workspace");
     let project_dir = cwd.join("openclaw");
     fs::create_dir_all(&project_dir).unwrap();
+    let launcher_binary = root.child("launcher-openclaw");
+    write_executable_script(&launcher_binary, &recording_openclaw_script("2026.3.23"));
 
     let tarball = openclaw_package_tarball(&recording_openclaw_script("2026.3.24"), "2026.3.24");
     let integrity = sha512_integrity(&tarball);
@@ -6027,13 +6029,16 @@ fn upgrade_can_switch_a_local_launcher_env_to_a_published_runtime() {
             "start",
             "hacking",
             "--command",
-            "pnpm openclaw",
+            &path_string(&launcher_binary),
             "--cwd",
             &project_dir.display().to_string(),
             "--no-service",
         ],
     );
     assert!(start.status.success(), "{}", stderr(&start));
+    let version = run_ocm(&cwd, &env, &["@hacking", "--", "--version"]);
+    assert!(version.status.success(), "{}", stderr(&version));
+    assert_eq!(stdout(&version).trim(), "2026.3.23");
     let env_root = root.child("ocm-home/envs/hacking");
     enable_migratable_target_config(&env_root, &mut env);
     let config_path = env_root.join(".openclaw/openclaw.json");
@@ -9364,6 +9369,8 @@ fn upgrade_keeps_a_stopped_installed_service_stopped() {
     let cwd = root.child("workspace");
     let project_dir = cwd.join("openclaw");
     fs::create_dir_all(&project_dir).unwrap();
+    let launcher_binary = root.child("launcher-openclaw");
+    write_executable_script(&launcher_binary, &recording_openclaw_script("2026.3.23"));
 
     let tarball = openclaw_package_tarball(&recording_openclaw_script("2026.3.24"), "2026.3.24");
     let integrity = sha512_integrity(&tarball);
@@ -9398,15 +9405,21 @@ fn upgrade_keeps_a_stopped_installed_service_stopped() {
             "start",
             "hacking",
             "--command",
-            "pnpm openclaw",
+            &path_string(&launcher_binary),
             "--cwd",
             &project_dir.display().to_string(),
         ],
     );
     assert!(start.status.success(), "{}", stderr(&start));
+    let version = run_ocm(&cwd, &env, &["@hacking", "--", "--version"]);
+    assert!(version.status.success(), "{}", stderr(&version));
+    assert_eq!(stdout(&version).trim(), "2026.3.23");
 
     let stop = run_ocm(&cwd, &env, &["service", "stop", "hacking"]);
     assert!(stop.status.success(), "{}", stderr(&stop));
+    let before = ocm::store::get_environment("hacking", &env, &cwd).unwrap();
+    assert!(before.service_enabled);
+    assert!(!before.service_running);
 
     let upgrade = run_ocm(&cwd, &env, &["upgrade", "hacking", "--channel", "stable"]);
     assert!(upgrade.status.success(), "{}", stderr(&upgrade));
@@ -9414,6 +9427,11 @@ fn upgrade_keeps_a_stopped_installed_service_stopped() {
     assert!(output.contains("from=launcher:hacking.local"), "{output}");
     assert!(output.contains("to=runtime:stable"), "{output}");
     assert!(!output.contains("service="), "{output}");
+    let after = ocm::store::get_environment("hacking", &env, &cwd).unwrap();
+    assert_eq!(after.default_runtime.as_deref(), Some("stable"));
+    assert!(after.default_launcher.is_none());
+    assert!(after.service_enabled);
+    assert!(!after.service_running);
 }
 
 #[test]
