@@ -466,6 +466,12 @@ Per-environment upgrades and rollbacks apply the same dependency check to siblin
 Use an isolated release for an independent upgrade, or clear dependent bindings before intentionally replacing an unused runtime.
 An idle unbound alias does not prevent mutation, and unrelated runtimes remain usable even when another registered executable is missing.
 
+Foreground `ocm env run` and `ocm @<env>` commands retain their selected runtime
+and its managed backing files until the command finishes, including a one-off
+`--runtime` override. Direct removal waits for that active use to finish, then
+checks the persistent bindings again. Concurrent commands may share the same
+runtime; unrelated runtime operations remain available.
+
 Runtime registrations and managed directories share a namespace: the registration for `old` occupies the install directory of `old.json`.
 OCM refuses an installation that would replace another runtime's registration or payload, including with `--force`; choose another name when these paths conflict.
 Names ending in `.json` remain supported when their destinations are available, and `--force` still replaces an unbound runtime of the same name.

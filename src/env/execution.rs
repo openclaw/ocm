@@ -438,6 +438,34 @@ impl<'a> EnvironmentService<'a> {
         self.resolve_execution(self.touch(name)?, runtime_override, launcher_override, args)
     }
 
+    pub(crate) fn with_resolved_run<T>(
+        &self,
+        name: &str,
+        runtime_override: Option<String>,
+        launcher_override: Option<String>,
+        args: &[String],
+        run: impl FnOnce(ResolvedExecution) -> Result<T, String>,
+    ) -> Result<T, String> {
+        // Retain only the selected runtime's custody, from resolution through
+        // foreground completion. touch releases environment admission first.
+        let mut runtime_guard = None;
+        let resolved = self.resolve_execution_with_runtime_custody(
+            self.touch(name)?,
+            runtime_override,
+            launcher_override,
+            args,
+            |name| {
+                runtime_guard = Some(crate::store::try_lock_runtime_binding(
+                    name, self.env, self.cwd,
+                )?);
+                Ok(())
+            },
+        )?;
+        let result = run(resolved);
+        drop(runtime_guard);
+        result
+    }
+
     pub fn resolve_gateway_process(
         &self,
         name: &str,
@@ -479,6 +507,23 @@ impl<'a> EnvironmentService<'a> {
         runtime_override: Option<String>,
         launcher_override: Option<String>,
         args: &[String],
+    ) -> Result<ResolvedExecution, String> {
+        self.resolve_execution_with_runtime_custody(
+            env,
+            runtime_override,
+            launcher_override,
+            args,
+            |_| Ok(()),
+        )
+    }
+
+    fn resolve_execution_with_runtime_custody(
+        &self,
+        env: EnvMeta,
+        runtime_override: Option<String>,
+        launcher_override: Option<String>,
+        args: &[String],
+        retain_runtime: impl FnOnce(&str) -> Result<(), String>,
     ) -> Result<ResolvedExecution, String> {
         let args = normalize_openclaw_args_for_env(args)?;
         let has_runtime_override = runtime_override
@@ -523,6 +568,7 @@ impl<'a> EnvironmentService<'a> {
                 })
             }
             ExecutionBinding::Runtime(runtime_name) => {
+                retain_runtime(&runtime_name)?;
                 let runtime = get_runtime_verified(&runtime_name, self.env, self.cwd)?;
                 let launch = resolve_runtime_launch(&runtime, &args, self.env, self.cwd, true)?;
                 Ok(ResolvedExecution::Runtime {

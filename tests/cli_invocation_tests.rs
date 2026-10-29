@@ -768,11 +768,27 @@ fn assert_command_receives_signal(
         .spawn()
         .unwrap();
     let command_pid = ready_pid(&marker);
+    let runtime_lock = matches!(label, "runtime" | "interrupt" | "hangup").then(|| {
+        use fs2::FileExt;
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(fixture.root.child("ocm-home/runtimes/.fake.lock"))
+            .unwrap();
+        assert_eq!(
+            FileExt::try_lock_exclusive(&lock).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        lock
+    });
     assert_eq!(
         unsafe { libc::kill(process.id() as libc::pid_t, signal) },
         0
     );
     let status = wait_with_deadline(&mut process);
+    if let Some(lock) = runtime_lock {
+        fs2::FileExt::try_lock_exclusive(&lock).unwrap();
+    }
     let log = fs::read_to_string(&marker).unwrap();
     let survived = reap_if_running(command_pid);
     assert!(
