@@ -1032,6 +1032,9 @@ fn public_dev_preserves_native_git_object_access_routes() {
         "reference",
         "independent",
         "late",
+        "missing",
+        "missing-alias",
+        "missing-direct",
     ] {
         let fixture = TestDir::new(&format!("git-object-route-{mode}"));
         let cwd = fixture.path();
@@ -1046,6 +1049,10 @@ fn public_dev_preserves_native_git_object_access_routes() {
         assert!(created.status.success(), "{}", stderr(&created));
         let donor = fixture.child("outside-donor");
         write_text(&donor.join("openclaw.mjs"), "// finite source command\n");
+        if mode.starts_with("missing") {
+            // Keep submodule discovery independent of the unavailable objects.
+            write_text(&donor.join(".gitmodules"), "");
+        }
         let donor = init_checkout(&donor);
         let source = fixture.child("borrowed-source");
         let route = owner.join("../outside-donor");
@@ -1054,12 +1061,20 @@ fn public_dev_preserves_native_git_object_access_routes() {
         } else {
             fixture.child("donor-alias")
         };
-        if matches!(mode, "symlink" | "late") {
-            symlink(&donor, &alias).unwrap();
+        if matches!(mode, "symlink" | "late" | "missing-alias") {
+            symlink(
+                if mode == "missing-alias" {
+                    &route
+                } else {
+                    &donor
+                },
+                &alias,
+            )
+            .unwrap();
         }
         let selected = match mode {
-            "parent" | "independent" => &route,
-            "symlink" | "late" => &alias,
+            "parent" | "independent" | "missing" => &route,
+            "symlink" | "late" | "missing-alias" => &alias,
             _ => &donor,
         };
         let selected = path_string(selected);
@@ -1099,7 +1114,7 @@ fn public_dev_preserves_native_git_object_access_routes() {
             let alternate = before_alternates.as_ref().unwrap();
             assert_eq!(
                 alternate.contains(&path_string(&owner)),
-                matches!(mode, "parent" | "symlink"),
+                matches!(mode, "parent" | "symlink" | "missing"),
                 "{mode}: {alternate}"
             );
             let counts = git(&source, &["count-objects", "-v"]);
@@ -1109,7 +1124,7 @@ fn public_dev_preserves_native_git_object_access_routes() {
         assert_eq!(git(&source, &["cat-file", "-t", "HEAD"]), "commit");
         git(&source, &["fsck", "--full", "--no-dangling"]);
 
-        let dependent = matches!(mode, "parent" | "symlink");
+        let dependent = matches!(mode, "parent" | "symlink" | "missing" | "missing-alias");
         let register = || {
             run_ocm(
                 cwd,
@@ -1146,6 +1161,18 @@ fn public_dev_preserves_native_git_object_access_routes() {
             fs::remove_file(&alias).unwrap();
             symlink(&route, &alias).unwrap();
         }
+        let displaced = if mode.starts_with("missing") {
+            let storage = if mode == "missing-alias" {
+                donor.clone()
+            } else {
+                donor.join(".git/objects")
+            };
+            let held = fixture.child("held-storage");
+            fs::rename(&storage, &held).unwrap();
+            Some((storage, held))
+        } else {
+            None
+        };
         let registry = env_registry_path(&env, cwd).unwrap();
         let before_registry = fs::read(&registry).unwrap();
         let removed = run_ocm(cwd, &env, &["env", "remove", "owner"]);
@@ -1162,6 +1189,11 @@ fn public_dev_preserves_native_git_object_access_routes() {
             assert_eq!(fs::read(&registry).unwrap(), before_registry);
         } else {
             assert!(!owner.exists());
+        }
+        if let Some((storage, held)) = displaced {
+            // Returning the donor must suffice; removal must not add a second
+            // repair requirement by deleting its stored access route meanwhile.
+            fs::rename(held, storage).unwrap();
         }
         assert_eq!(fs::read_to_string(&alternates).ok(), before_alternates);
         assert_eq!(git(&source, &["cat-file", "-t", "HEAD"]), "commit");

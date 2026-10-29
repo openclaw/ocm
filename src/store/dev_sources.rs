@@ -317,8 +317,15 @@ fn record_path_entries(
 }
 
 pub(crate) fn existing_source_path_entries(path: &Path) -> Result<BTreeSet<PathBuf>, String> {
+    existing_source_path_entries_with_routes(path, None)
+}
+
+pub(super) fn existing_source_path_entries_with_routes(
+    path: &Path,
+    directories: Option<&mut BTreeSet<PathBuf>>,
+) -> Result<BTreeSet<PathBuf>, String> {
     let mut entries = BTreeSet::new();
-    record_path_entries(path, &mut entries, &mut BTreeSet::new(), None)?;
+    record_path_entries(path, &mut entries, &mut BTreeSet::new(), directories)?;
     Ok(entries)
 }
 
@@ -337,8 +344,15 @@ pub(crate) fn existing_source_path_route_entries(path: &Path) -> Result<BTreeSet
     Ok(entries)
 }
 
-fn reserve_path(path: &Path, footprint: &mut SourceFootprint) -> Result<(), String> {
-    let (reserved, entries) = super::dev_registration::registration_path(path)?;
+fn reserve_path(
+    path: &Path,
+    footprint: &mut SourceFootprint,
+    include_routes: bool,
+) -> Result<(), String> {
+    let (reserved, entries) = super::dev_registration::registration_path_with_routes(
+        path,
+        include_routes.then_some(&mut footprint.read_entries),
+    )?;
     footprint.entries.extend(entries);
     footprint.reserved_roots.insert(reserved);
     Ok(())
@@ -352,7 +366,7 @@ fn record_git_path(
     links: &mut BTreeSet<PathBuf>,
 ) -> Result<Option<PathBuf>, String> {
     if reserve_missing && existing_cleanup_path(path)?.is_none() {
-        reserve_path(path, footprint)?;
+        reserve_path(path, footprint, false)?;
         return Ok(None);
     }
     let mut directories = BTreeSet::new();
@@ -542,7 +556,7 @@ fn append_git_object_footprint(
         *paths_left -= 1;
         if existing_cleanup_path(&objects)?.is_none() {
             if reserve_missing {
-                reserve_path(&objects, footprint)?;
+                reserve_path(&objects, footprint, true)?;
             }
             continue;
         }
@@ -655,7 +669,7 @@ fn inspect_source_footprint_paths(
         // for execution, including initialized submodules' surviving aliases.
         let git_entry = root.join(".git");
         if reserve_missing && existing_cleanup_path(&git_entry)?.is_none() {
-            reserve_path(&git_entry, &mut footprint)?;
+            reserve_path(&git_entry, &mut footprint, false)?;
             continue;
         }
         if let Some(git) = crate::openclaw_repo::git_identity_paths(&root)? {
@@ -857,7 +871,7 @@ fn borrowed_source_footprint_observed(
     if let Some(source) = existing_cleanup_path(source)? {
         footprint.content_roots.insert(source);
     }
-    reserve_path(source, &mut footprint)?;
+    reserve_path(source, &mut footprint, false)?;
     Ok(footprint)
 }
 

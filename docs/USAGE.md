@@ -1132,7 +1132,8 @@ resolve its stored alternate path is refused before deletion. This includes
 ordinary directories before `..`, even when the object store is outside the
 environment. Shared ancestor directories are read dependencies, not ownership of
 their contents. An independent clone with its own objects does not keep its former donor reserved.
-Missing borrowed object paths stay reserved, while unreadable or excessive Git
+Missing borrowed object paths and their existing access-route directories stay
+reserved, while unreadable or excessive Git
 dependency metadata requires restoring that metadata before cleanup can proceed.
 
 This includes loose-object fanout directory symlinks and individual object-file
