@@ -1494,10 +1494,14 @@ mod tests {
             ("a#b~c", Leftover::Unquoted, true),
             ("a{b}", Leftover::Unquoted, true),
             ("a]b", Leftover::Unquoted, true),
+            ("a}b{c", Leftover::Unquoted, true),
             ("my bin", Leftover::Quoted, true),
+            ("a{b}", Leftover::Quoted, true),
             ("my bin", Leftover::Unquoted, false),
             ("a{b,c}", Leftover::Unquoted, false),
             ("a{1..2}", Leftover::Unquoted, false),
+            // Bash pairs the `{` with the `}` after the comma and expands it.
+            ("a{b}/x,y}", Leftover::Unquoted, false),
             ("a[b]", Leftover::Unquoted, false),
             ("a{b}", Leftover::Command("pnpm openclaw"), false),
         ]
