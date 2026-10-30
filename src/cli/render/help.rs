@@ -1927,6 +1927,7 @@ pub fn env_snapshot_command_help(cmd: &str, action: &str) -> Option<String> {
                 "Restore refuses to replace another registered environment root or its access paths, including legacy nested roots. A scoped checkpoint must exclude the complete other root and its access paths.",
                 "Restore requires a completed source-watch session. Request shutdown of recorded ownership with dev stop. Older watches without an unfinished ownership record require their original dev terminal; unreadable or unverified ownership requires verified operator recovery.",
                 "Manual restore keeps a dev environment's current source binding and runtime/launcher binding. Upgrade rollback retains its dev identity while restoring the recorded runtime/launcher.",
+                "Restore keeps the snapshot's Gateway port. An automatically assigned port another environment now holds moves to the next available port, with a warning. Ports chosen with --port or set through a linked, included or independent config stay unchanged.",
             ],
         ),
         "remove" => render_leaf(

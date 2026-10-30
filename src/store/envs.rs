@@ -321,8 +321,20 @@ pub(crate) fn save_environment_with_runtime_guard(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<EnvMeta, String> {
+    save_environment_with_runtime_guard_admitted(meta, runtime_guard, env, cwd, |_, _| Ok(()))
+}
+
+/// Saves `meta` once `admit` accepts it against the registered environments,
+/// under the registry lock that Gateway port allocation also holds.
+pub(crate) fn save_environment_with_runtime_guard_admitted(
+    meta: EnvMeta,
+    runtime_guard: Option<&super::RuntimeMutationGuard>,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+    admit: impl FnOnce(&EnvMeta, &[EnvMeta]) -> Result<(), String>,
+) -> Result<EnvMeta, String> {
     let registration = DevSourceRegistration::acquire(&meta.name, meta.dev.as_ref(), env, cwd)?;
-    save_environment_registered(meta, &registration, runtime_guard, env, cwd)
+    save_environment_registered(meta, &registration, runtime_guard, env, cwd, admit)
 }
 
 pub(crate) fn save_environment_with_dev_registration(
@@ -331,7 +343,7 @@ pub(crate) fn save_environment_with_dev_registration(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<EnvMeta, String> {
-    save_environment_registered(meta, registration, None, env, cwd)
+    save_environment_registered(meta, registration, None, env, cwd, |_, _| Ok(()))
 }
 
 fn save_environment_registered(
@@ -340,12 +352,14 @@ fn save_environment_registered(
     runtime_guard: Option<&super::RuntimeMutationGuard>,
     env: &BTreeMap<String, String>,
     cwd: &Path,
+    admit: impl FnOnce(&EnvMeta, &[EnvMeta]) -> Result<(), String>,
 ) -> Result<EnvMeta, String> {
     let service = crate::env::EnvironmentService::new(env, cwd);
     let _admission_lock = service.lock_gateway_admission(&meta.name)?;
     let _lock = lock_env_registry(env, cwd)?;
     let mut registry = load_env_registry(env, cwd)?;
     registration.recheck(&meta.name, meta.dev.as_ref(), &registry.envs)?;
+    admit(&meta, &registry.envs)?;
     let policy_changed = find_environment(&registry, &meta.name).is_some_and(|current| {
         current.service_enabled != meta.service_enabled
             || current.service_running != meta.service_running

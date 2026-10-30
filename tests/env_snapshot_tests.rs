@@ -4935,3 +4935,398 @@ fn env_snapshot_restore_refuses_historical_live_alias_artifact() {
     assert_eq!(fs::read(&registry).unwrap(), registry_before);
     assert_eq!(fs::read_link(checkpoint).unwrap(), Path::new(&meta.root));
 }
+
+fn ocm_json(cwd: &Path, env: &std::collections::BTreeMap<String, String>, args: &[&str]) -> Value {
+    let output = run_ocm(cwd, env, args);
+    assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+    serde_json::from_str(&stdout(&output)).unwrap()
+}
+
+fn gateway_port(
+    cwd: &Path,
+    env: &std::collections::BTreeMap<String, String>,
+    name: &str,
+) -> (u32, bool) {
+    let meta = get_environment(name, env, cwd).unwrap();
+    (meta.gateway_port.unwrap(), meta.gateway_port_auto_assigned)
+}
+
+// Restore must not place two environments in one OpenClaw port family
+// (base port through base + 110), which the supervisor refuses to start.
+fn assert_disjoint_port_families(left: u32, right: u32) {
+    assert!(
+        left.abs_diff(right) > 110,
+        "ports {left} and {right} share a port family"
+    );
+}
+
+#[test]
+fn env_snapshot_restore_moves_an_automatic_gateway_port_another_env_now_holds() {
+    let root = TestDir::new("env-snapshot-restore-claimed-auto-port");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+
+    ocm_json(&cwd, &env, &["env", "create", "a", "--json"]);
+    let (snapshot_port, auto) = gateway_port(&cwd, &env, "a");
+    assert!(auto);
+    let snapshot = ocm_json(&cwd, &env, &["env", "snapshot", "create", "a", "--json"]);
+    let snapshot_id = snapshot["id"].as_str().unwrap().to_string();
+    ocm_json(&cwd, &env, &["env", "remove", "a", "--json"]);
+    // Automatic allocation would hand b the freed port unless a concurrent
+    // test binds it; name it so b holds it deterministically.
+    let held_port = snapshot_port.to_string();
+    ocm_json(
+        &cwd,
+        &env,
+        &["env", "create", "b", "--port", &held_port, "--json"],
+    );
+    ocm_json(&cwd, &env, &["env", "create", "a", "--json"]);
+
+    let restored = ocm_json(
+        &cwd,
+        &env,
+        &["env", "snapshot", "restore", "a", &snapshot_id, "--json"],
+    );
+
+    let (restored_port, auto) = gateway_port(&cwd, &env, "a");
+    assert!(auto);
+    assert_ne!(restored_port, snapshot_port);
+    assert_disjoint_port_families(restored_port, snapshot_port);
+    assert_eq!(gateway_port(&cwd, &env, "b"), (snapshot_port, false));
+    assert_eq!(
+        restored["warnings"],
+        serde_json::json!([format!(
+            "Gateway port {snapshot_port} conflicts with another environment; env a now uses Gateway port {restored_port}"
+        )])
+    );
+
+    // Restoring again moves the snapshot port off b again and reports it in
+    // plain output.
+    let human = run_ocm(
+        &cwd,
+        &env,
+        &["env", "snapshot", "restore", "a", &snapshot_id],
+    );
+    assert!(human.status.success(), "{}", stderr(&human));
+    assert!(
+        stdout(&human).contains(&format!(
+            "Gateway port {snapshot_port} conflicts with another environment; env a now uses Gateway port"
+        )),
+        "{}",
+        stdout(&human)
+    );
+    let (again, _) = gateway_port(&cwd, &env, "a");
+    assert_disjoint_port_families(again, snapshot_port);
+}
+
+#[test]
+fn env_snapshot_restore_keeps_a_free_automatic_gateway_port() {
+    let root = TestDir::new("env-snapshot-restore-free-auto-port");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+
+    ocm_json(&cwd, &env, &["env", "create", "a", "--json"]);
+    ocm_json(&cwd, &env, &["env", "create", "b", "--json"]);
+    let (snapshot_port, _) = gateway_port(&cwd, &env, "a");
+    let snapshot = ocm_json(&cwd, &env, &["env", "snapshot", "create", "a", "--json"]);
+    let snapshot_id = snapshot["id"].as_str().unwrap();
+
+    let restored = ocm_json(
+        &cwd,
+        &env,
+        &["env", "snapshot", "restore", "a", snapshot_id, "--json"],
+    );
+
+    assert_eq!(gateway_port(&cwd, &env, "a"), (snapshot_port, true));
+    assert!(restored.get("warnings").is_none(), "{restored}");
+}
+
+#[test]
+fn env_snapshot_restore_keeps_an_explicit_gateway_port() {
+    let root = TestDir::new("env-snapshot-restore-explicit-port");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+
+    ocm_json(
+        &cwd,
+        &env,
+        &["env", "create", "a", "--port", "19789", "--json"],
+    );
+    let snapshot = ocm_json(&cwd, &env, &["env", "snapshot", "create", "a", "--json"]);
+    let snapshot_id = snapshot["id"].as_str().unwrap();
+    ocm_json(
+        &cwd,
+        &env,
+        &["env", "create", "b", "--port", "19789", "--json"],
+    );
+
+    let restored = ocm_json(
+        &cwd,
+        &env,
+        &["env", "snapshot", "restore", "a", snapshot_id, "--json"],
+    );
+
+    assert_eq!(gateway_port(&cwd, &env, "a"), (19789, false));
+    assert_eq!(gateway_port(&cwd, &env, "b"), (19789, false));
+    assert!(restored.get("warnings").is_none(), "{restored}");
+}
+
+#[test]
+fn env_snapshot_restore_moves_a_claimed_automatic_port_from_a_legacy_archive() {
+    let root = TestDir::new("env-snapshot-restore-legacy-claimed-port");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+
+    ocm_json(&cwd, &env, &["env", "create", "source", "--json"]);
+    let (snapshot_port, auto) = gateway_port(&cwd, &env, "source");
+    assert!(auto);
+    let config_path = root.child("ocm-home/envs/source/.openclaw/openclaw.json");
+    write_text(
+        &config_path,
+        &format!("{{\"gateway\":{{\"port\":{snapshot_port}}}}}\n"),
+    );
+    let snapshot_id = "1700000000-000000001";
+    let snapshot_dir = root.child("ocm-home/snapshots/source");
+    fs::create_dir_all(&snapshot_dir).unwrap();
+    let archive_path = snapshot_dir.join(format!("{snapshot_id}.tar"));
+    ocm_json(
+        &cwd,
+        &env,
+        &[
+            "env",
+            "export",
+            "source",
+            "--output",
+            archive_path.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    let metadata = serde_json::json!({
+        "kind": "ocm-env-snapshot",
+        "id": snapshot_id,
+        "envName": "source",
+        "archivePath": archive_path,
+        "sourceRoot": root.child("ocm-home/envs/source"),
+        "gatewayPort": snapshot_port,
+        "serviceEnabled": false,
+        "serviceRunning": false,
+        "defaultRuntime": null,
+        "defaultLauncher": null,
+        "protected": false,
+        "createdAt": "2023-11-14T22:13:20Z"
+    });
+    fs::write(
+        snapshot_dir.join(format!("{snapshot_id}.json")),
+        serde_json::to_vec_pretty(&metadata).unwrap(),
+    )
+    .unwrap();
+    let holder_port = snapshot_port.to_string();
+    ocm_json(
+        &cwd,
+        &env,
+        &["env", "create", "holder", "--port", &holder_port, "--json"],
+    );
+
+    let restored = ocm_json(
+        &cwd,
+        &env,
+        &[
+            "env",
+            "snapshot",
+            "restore",
+            "source",
+            snapshot_id,
+            "--json",
+        ],
+    );
+
+    let (restored_port, auto) = gateway_port(&cwd, &env, "source");
+    assert!(auto);
+    assert_disjoint_port_families(restored_port, snapshot_port);
+    let config: Value = serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    assert_eq!(
+        config["gateway"]["port"].as_u64(),
+        Some(restored_port as u64)
+    );
+    assert_eq!(restored["warnings"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn env_snapshot_restore_moves_a_claimed_config_gateway_port() {
+    let root = TestDir::new("env-snapshot-restore-claimed-config-port");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+
+    ocm_json(&cwd, &env, &["env", "create", "a", "--json"]);
+    let (snapshot_port, _) = gateway_port(&cwd, &env, "a");
+    let config_path = root.child("ocm-home/envs/a/.openclaw/openclaw.json");
+    write_text(
+        &config_path,
+        &format!("{{\"gateway\":{{\"port\":{snapshot_port},\"bind\":\"loopback\"}}}}\n"),
+    );
+    let snapshot = ocm_json(&cwd, &env, &["env", "snapshot", "create", "a", "--json"]);
+    let snapshot_id = snapshot["id"].as_str().unwrap();
+    let holder_port = snapshot_port.to_string();
+    ocm_json(
+        &cwd,
+        &env,
+        &["env", "create", "holder", "--port", &holder_port, "--json"],
+    );
+
+    ocm_json(
+        &cwd,
+        &env,
+        &["env", "snapshot", "restore", "a", snapshot_id, "--json"],
+    );
+
+    let (restored_port, auto) = gateway_port(&cwd, &env, "a");
+    assert!(auto);
+    assert_disjoint_port_families(restored_port, snapshot_port);
+    let config: Value = serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    assert_eq!(
+        config["gateway"]["port"].as_u64(),
+        Some(restored_port as u64)
+    );
+    assert_eq!(config["gateway"]["bind"], "loopback");
+}
+
+fn write_legacy_snapshot(
+    root: &TestDir,
+    cwd: &Path,
+    env: &std::collections::BTreeMap<String, String>,
+    name: &str,
+    snapshot_id: &str,
+    gateway_port: u32,
+) {
+    let snapshot_dir = root.child(&format!("ocm-home/snapshots/{name}"));
+    fs::create_dir_all(&snapshot_dir).unwrap();
+    let archive_path = snapshot_dir.join(format!("{snapshot_id}.tar"));
+    ocm_json(
+        cwd,
+        env,
+        &[
+            "env",
+            "export",
+            name,
+            "--output",
+            archive_path.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    let metadata = serde_json::json!({
+        "kind": "ocm-env-snapshot",
+        "id": snapshot_id,
+        "envName": name,
+        "archivePath": archive_path,
+        "sourceRoot": root.child(&format!("ocm-home/envs/{name}")),
+        "gatewayPort": gateway_port,
+        "serviceEnabled": false,
+        "serviceRunning": false,
+        "defaultRuntime": null,
+        "defaultLauncher": null,
+        "protected": false,
+        "createdAt": "2023-11-14T22:13:20Z"
+    });
+    fs::write(
+        snapshot_dir.join(format!("{snapshot_id}.json")),
+        serde_json::to_vec_pretty(&metadata).unwrap(),
+    )
+    .unwrap();
+}
+
+// A legacy archive restores its recorded port into the config, so that port,
+// not the archived config's own value, decides whether restore moves it.
+#[test]
+fn env_snapshot_restore_checks_the_port_a_legacy_archive_applies() {
+    let root = TestDir::new("env-snapshot-restore-legacy-applied-port");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+
+    ocm_json(&cwd, &env, &["env", "create", "source", "--json"]);
+    let (recorded_port, auto) = gateway_port(&cwd, &env, "source");
+    assert!(auto);
+    let config_port = recorded_port + 1_000;
+    let config_path = root.child("ocm-home/envs/source/.openclaw/openclaw.json");
+    write_text(
+        &config_path,
+        &format!("{{\"gateway\":{{\"port\":{config_port}}}}}\n"),
+    );
+    let snapshot_id = "1700000000-000000002";
+    write_legacy_snapshot(&root, &cwd, &env, "source", snapshot_id, recorded_port);
+    let holder_port = recorded_port.to_string();
+    ocm_json(
+        &cwd,
+        &env,
+        &["env", "create", "holder", "--port", &holder_port, "--json"],
+    );
+
+    let restored = ocm_json(
+        &cwd,
+        &env,
+        &[
+            "env",
+            "snapshot",
+            "restore",
+            "source",
+            snapshot_id,
+            "--json",
+        ],
+    );
+
+    let (restored_port, auto) = gateway_port(&cwd, &env, "source");
+    assert!(auto);
+    assert_disjoint_port_families(restored_port, recorded_port);
+    let config: Value = serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    assert_eq!(
+        config["gateway"]["port"].as_u64(),
+        Some(restored_port as u64)
+    );
+    assert_eq!(restored["warnings"].as_array().unwrap().len(), 1);
+}
+
+// A port set in a config the restore does not replace is the user's choice,
+// like an explicit `--port`; restore neither moves it nor writes through the link.
+#[cfg(unix)]
+#[test]
+fn env_snapshot_restore_leaves_a_port_set_through_a_linked_config() {
+    let root = TestDir::new("env-snapshot-restore-linked-config-port");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+
+    ocm_json(&cwd, &env, &["env", "create", "a", "--json"]);
+    let (snapshot_port, _) = gateway_port(&cwd, &env, "a");
+    let config_path = root.child("ocm-home/envs/a/.openclaw/openclaw.json");
+    let external_config = root.child("external/openclaw.json");
+    let external_raw = format!("{{\"gateway\":{{\"port\":{snapshot_port}}}}}\n");
+    write_text(&external_config, &external_raw);
+    if config_path.exists() {
+        fs::remove_file(&config_path).unwrap();
+    }
+    std::os::unix::fs::symlink(&external_config, &config_path).unwrap();
+    let snapshot = ocm_json(&cwd, &env, &["env", "snapshot", "create", "a", "--json"]);
+    let snapshot_id = snapshot["id"].as_str().unwrap();
+    let holder_port = snapshot_port.to_string();
+    ocm_json(
+        &cwd,
+        &env,
+        &["env", "create", "holder", "--port", &holder_port, "--json"],
+    );
+
+    let restored = ocm_json(
+        &cwd,
+        &env,
+        &["env", "snapshot", "restore", "a", snapshot_id, "--json"],
+    );
+
+    assert!(restored.get("warnings").is_none(), "{restored}");
+    assert_eq!(gateway_port(&cwd, &env, "a"), (snapshot_port, true));
+    assert_eq!(fs::read_to_string(&external_config).unwrap(), external_raw);
+    assert!(fs::symlink_metadata(&config_path).unwrap().is_symlink());
+}

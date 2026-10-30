@@ -73,14 +73,68 @@ pub(crate) fn choose_available_gateway_port(
     envs: &[EnvMeta],
     env: &BTreeMap<String, String>,
 ) -> Result<u32, String> {
-    let effective = resolve_effective_gateway_ports(envs, env);
-    let mut claimed = BTreeSet::new();
-    reserve_foreign_openclaw_port_family(env, &mut claimed);
-    reserve_dev_ui_ports(envs, &mut claimed);
-    for port in effective.into_values() {
-        reserve_openclaw_port_family(port?, &mut claimed);
-    }
+    let (claimed, allocation_error) = registered_port_claims(envs, env);
+    choose_unclaimed_gateway_port(preferred_port, claimed, allocation_error, &[], env)
+}
 
+/// Keeps `port` unless one of `envs` claims part of its port family, and
+/// otherwise selects the next available port the way allocation does, also
+/// avoiding `reserved` ports. Only registered environments decide whether the
+/// port is kept, so a port left unbound while its own service is stopped is
+/// not treated as taken.
+pub(crate) fn retain_unclaimed_gateway_port(
+    port: u32,
+    envs: &[EnvMeta],
+    reserved: &[u32],
+    env: &BTreeMap<String, String>,
+) -> Result<u32, String> {
+    let (claimed, allocation_error) = registered_port_claims(envs, env);
+    if !openclaw_port_family_conflicts(port, &claimed) {
+        return Ok(port);
+    }
+    choose_unclaimed_gateway_port(port, claimed, allocation_error, reserved, env)
+}
+
+/// Reports whether `envs` hold a Gateway port family or dev UI port inside
+/// the port family of `port`.
+pub(crate) fn gateway_port_family_claimed(
+    port: u32,
+    envs: &[EnvMeta],
+    env: &BTreeMap<String, String>,
+) -> bool {
+    openclaw_port_family_conflicts(port, &registered_port_claims(envs, env).0)
+}
+
+// The dev UI ports and Gateway port families `envs` hold, with the error of an
+// environment whose automatic port could not be resolved.
+fn registered_port_claims(
+    envs: &[EnvMeta],
+    env: &BTreeMap<String, String>,
+) -> (BTreeSet<u32>, Option<String>) {
+    let mut claimed = BTreeSet::new();
+    reserve_dev_ui_ports(envs, &mut claimed);
+    let mut allocation_error = None;
+    for port in resolve_effective_gateway_ports(envs, env).into_values() {
+        match port {
+            Ok(port) => reserve_openclaw_port_family(port, &mut claimed),
+            Err(error) => allocation_error = allocation_error.or(Some(error)),
+        }
+    }
+    (claimed, allocation_error)
+}
+
+fn choose_unclaimed_gateway_port(
+    preferred_port: u32,
+    mut claimed: BTreeSet<u32>,
+    allocation_error: Option<String>,
+    reserved: &[u32],
+    env: &BTreeMap<String, String>,
+) -> Result<u32, String> {
+    if let Some(error) = allocation_error {
+        return Err(error);
+    }
+    reserve_foreign_openclaw_port_family(env, &mut claimed);
+    claimed.extend(reserved);
     next_available_gateway_port(preferred_port.max(DEFAULT_GATEWAY_PORT), &claimed)
 }
 

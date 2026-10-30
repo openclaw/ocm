@@ -1559,6 +1559,15 @@ Restore:
 ocm env snapshot restore mira <snapshot>
 ```
 
+Restore keeps the snapshot's Gateway port. When OCM assigned that port
+automatically and another registered environment now holds its port family,
+restore selects the next available port the way clone and import do, moves a
+`gateway.port` set in the restored OpenClaw config with it, and reports the
+change as a warning. A port chosen with `--port`, or set through config that
+restore does not replace (a linked config file, an include, or an independent
+path), is left unchanged, and upgrade rollback keeps the environment's own
+pre-upgrade port.
+
 Restore retains the displaced environment until supervisor synchronization and managed-service acceptance succeed.
 If synchronization fails, OCM attempts to restore the pre-restore root and registry before returning the error. A quiesced service resumes only when its prior data was unchanged or recovered successfully, including recovery with cleanup or resynchronization warnings.
 An error distinguishes a failed rollback from restored data that still needs supervisor resynchronization or cleanup.
