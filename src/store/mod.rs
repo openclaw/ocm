@@ -102,7 +102,7 @@ pub(crate) use runtimes::{
     RuntimeMutationGuard, RuntimeReleaseDetails, add_runtime_with_context,
     install_runtime_from_official_openclaw_release_with_context,
     install_runtime_from_release_with_context, install_runtime_from_url_with_context,
-    install_runtime_with_context, lock_runtime_mutation,
+    install_runtime_with_context, lock_runtime_mutation, official_openclaw_release_description,
     prepare_runtime_from_selected_official_openclaw_release, prepare_runtime_from_selected_release,
     remove_runtime_with_guard, runtime_binding_dependencies, runtime_operational_issue,
     runtime_owner_identity, try_lock_runtime_binding, try_lock_runtime_binding_with_guard,

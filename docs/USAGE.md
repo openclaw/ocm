@@ -479,6 +479,8 @@ Runtime registrations and managed directories share a namespace: the registratio
 OCM refuses an installation that would replace another runtime's registration or payload, including with `--force`; choose another name when these paths conflict.
 Names ending in `.json` remain supported when their destinations are available, and `--force` still replaces an unbound runtime of the same name.
 
+When a runtime moves to another release through `ocm runtime update`, `ocm upgrade` or a replacing official `ocm runtime install`, a description OCM recorded for the previous release (`Official OpenClaw release <version>` or the release manifest's description) is replaced by the new release's, while a description set with `--description` is kept.
+
 Runtime installs unpack into a hidden staging directory and publish it only when they succeed.
 If OCM is interrupted or killed during an install, a later install that prepares a new runtime, of any name, removes the leftover staging directory.
 A leftover is kept while another operation holds that runtime's lock and is removed by a later install after the lock is released; removal is best effort, like the cleanup of an ordinary failed install.

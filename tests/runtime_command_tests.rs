@@ -5556,6 +5556,221 @@ fn runtime_update_reuses_the_official_release_selector() {
     assert!(stdout(&show).contains("releaseVersion: 2026.3.25"));
 }
 
+/// Installs the official `stable` channel runtime at 2026.3.24, moves the
+/// channel to 2026.3.25, runs `change_args`, and returns the runtime's
+/// `releaseVersion` and `description` from `runtime show --json`.
+fn official_stable_after_release_change(
+    test_name: &str,
+    install_args: &[&str],
+    change_args: &[&str],
+) -> (Value, Value) {
+    let root = TestDir::new(test_name);
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+
+    let stable_tar = openclaw_package_tarball("#!/usr/bin/env node\nconsole.log('stable');\n");
+    let updated_tar = openclaw_package_tarball("#!/usr/bin/env node\nconsole.log('updated');\n");
+    let stable_integrity = sha512_integrity(&stable_tar);
+    let updated_integrity = sha512_integrity(&updated_tar);
+    let stable_tarball_server = TestHttpServer::serve_bytes(
+        "/openclaw-2026.3.24.tgz",
+        "application/octet-stream",
+        &stable_tar,
+    );
+    let updated_tarball_server = TestHttpServer::serve_bytes(
+        "/openclaw-2026.3.25.tgz",
+        "application/octet-stream",
+        &updated_tar,
+    );
+    let packument_v1 = format!(
+        "{{\"dist-tags\":{{\"latest\":\"2026.3.24\"}},\"versions\":{{\"2026.3.24\":{{\"version\":\"2026.3.24\",\"dist\":{{\"tarball\":\"{}\",\"integrity\":\"{}\"}}}}}}}}",
+        stable_tarball_server.url(),
+        stable_integrity
+    );
+    let packument_v2 = format!(
+        "{{\"dist-tags\":{{\"latest\":\"2026.3.25\"}},\"versions\":{{\"2026.3.24\":{{\"version\":\"2026.3.24\",\"dist\":{{\"tarball\":\"{}\",\"integrity\":\"{}\"}}}},\"2026.3.25\":{{\"version\":\"2026.3.25\",\"dist\":{{\"tarball\":\"{}\",\"integrity\":\"{}\"}}}}}},\"time\":{{\"2026.3.25\":\"2026-03-26T10:00:00.000Z\"}}}}",
+        stable_tarball_server.url(),
+        stable_integrity,
+        updated_tarball_server.url(),
+        updated_integrity
+    );
+    let packument_server = TestHttpServer::serve_bytes_sequence(
+        "/openclaw",
+        "application/json",
+        vec![packument_v1.into_bytes(), packument_v2.into_bytes()],
+    );
+    let mut env = ocm_env(&root);
+    install_fake_node_and_npm(&root, &mut env, "22.22.3");
+    env.insert(
+        "OCM_INTERNAL_OPENCLAW_RELEASES_URL".to_string(),
+        packument_server.url(),
+    );
+
+    let install = run_ocm(&cwd, &env, install_args);
+    assert!(install.status.success(), "{}", stderr(&install));
+    let change = run_ocm(&cwd, &env, change_args);
+    assert!(change.status.success(), "{}", stderr(&change));
+
+    let show = run_ocm(&cwd, &env, &["runtime", "show", "stable", "--json"]);
+    assert!(show.status.success(), "{}", stderr(&show));
+    let show: Value = serde_json::from_str(&stdout(&show)).unwrap();
+    (show["releaseVersion"].clone(), show["description"].clone())
+}
+
+#[test]
+fn runtime_update_regenerates_the_generated_official_release_description() {
+    let (version, description) = official_stable_after_release_change(
+        "runtime-update-official-generated-description",
+        &["runtime", "install", "stable", "--channel", "stable"],
+        &["runtime", "update", "stable"],
+    );
+    assert_eq!(version, "2026.3.25");
+    assert_eq!(description, "Official OpenClaw release 2026.3.25");
+}
+
+#[test]
+fn runtime_install_replacement_regenerates_the_generated_official_release_description() {
+    let (version, description) = official_stable_after_release_change(
+        "runtime-reinstall-official-generated-description",
+        &["runtime", "install", "stable", "--channel", "stable"],
+        &["runtime", "install", "stable", "--channel", "stable"],
+    );
+    assert_eq!(version, "2026.3.25");
+    assert_eq!(description, "Official OpenClaw release 2026.3.25");
+}
+
+#[test]
+fn runtime_update_keeps_a_user_supplied_official_runtime_description() {
+    let (version, description) = official_stable_after_release_change(
+        "runtime-update-official-user-description",
+        &[
+            "runtime",
+            "install",
+            "stable",
+            "--channel",
+            "stable",
+            "--description",
+            "team baseline",
+        ],
+        &["runtime", "update", "stable"],
+    );
+    assert_eq!(version, "2026.3.25");
+    assert_eq!(description, "team baseline");
+}
+
+#[test]
+fn runtime_install_replacement_keeps_a_user_supplied_official_runtime_description() {
+    let (version, description) = official_stable_after_release_change(
+        "runtime-reinstall-official-user-description",
+        &[
+            "runtime",
+            "install",
+            "stable",
+            "--channel",
+            "stable",
+            "--description",
+            "team baseline",
+        ],
+        &["runtime", "install", "stable", "--channel", "stable"],
+    );
+    assert_eq!(version, "2026.3.25");
+    assert_eq!(description, "team baseline");
+}
+
+/// Installs manifest release 0.2.0, updates to 0.3.0, and returns the
+/// runtime's `releaseVersion` and `description` from `runtime show --json`.
+/// Each manifest release carries its own description.
+fn manifest_runtime_after_update(
+    test_name: &str,
+    install_description: Option<&str>,
+) -> (Value, Value) {
+    let root = TestDir::new(test_name);
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+
+    let stable_body = b"runtime-v0.2.0";
+    let stable_digest_path = root.child("sha256/openclaw-0.2.0");
+    fs::create_dir_all(stable_digest_path.parent().unwrap()).unwrap();
+    fs::write(&stable_digest_path, stable_body).unwrap();
+    let stable_sha256 = file_sha256(&stable_digest_path).unwrap();
+
+    let next_body = b"runtime-v0.3.0";
+    let next_digest_path = root.child("sha256/openclaw-0.3.0");
+    fs::write(&next_digest_path, next_body).unwrap();
+    let next_sha256 = file_sha256(&next_digest_path).unwrap();
+
+    let stable_server = TestHttpServer::serve_bytes(
+        "/artifacts/openclaw-0.2.0",
+        "application/octet-stream",
+        stable_body,
+    );
+    let next_server = TestHttpServer::serve_bytes(
+        "/artifacts/openclaw-0.3.0",
+        "application/octet-stream",
+        next_body,
+    );
+    let manifest_body = format!(
+        "{{\"releases\":[{{\"version\":\"0.2.0\",\"channel\":\"stable\",\"url\":\"{}\",\"sha256\":\"{}\",\"description\":\"Team build 0.2.0\"}},{{\"version\":\"0.3.0\",\"channel\":\"stable\",\"url\":\"{}\",\"sha256\":\"{}\",\"description\":\"Team build 0.3.0\"}}]}}",
+        stable_server.url(),
+        stable_sha256,
+        next_server.url(),
+        next_sha256
+    );
+    let manifest_server = TestHttpServer::serve_bytes_times(
+        "/manifests/releases.json",
+        "application/json",
+        manifest_body.as_bytes(),
+        2,
+    );
+    let env = ocm_env(&root);
+
+    let manifest_url = manifest_server.url();
+    let mut install_args = vec![
+        "runtime",
+        "install",
+        "stable",
+        "--manifest-url",
+        manifest_url.as_str(),
+        "--version",
+        "0.2.0",
+    ];
+    if let Some(description) = install_description {
+        install_args.extend(["--description", description]);
+    }
+    let install = run_ocm(&cwd, &env, &install_args);
+    assert!(install.status.success(), "{}", stderr(&install));
+
+    let update = run_ocm(
+        &cwd,
+        &env,
+        &["runtime", "update", "stable", "--version", "0.3.0"],
+    );
+    assert!(update.status.success(), "{}", stderr(&update));
+
+    let show = run_ocm(&cwd, &env, &["runtime", "show", "stable", "--json"]);
+    assert!(show.status.success(), "{}", stderr(&show));
+    let show: Value = serde_json::from_str(&stdout(&show)).unwrap();
+    (show["releaseVersion"].clone(), show["description"].clone())
+}
+
+#[test]
+fn runtime_update_replaces_the_previous_manifest_release_description() {
+    let (version, description) =
+        manifest_runtime_after_update("runtime-update-manifest-release-description", None);
+    assert_eq!(version, "0.3.0");
+    assert_eq!(description, "Team build 0.3.0");
+}
+
+#[test]
+fn runtime_update_keeps_a_user_supplied_manifest_runtime_description() {
+    let (version, description) = manifest_runtime_after_update(
+        "runtime-update-manifest-user-description",
+        Some("pinned for staging"),
+    );
+    assert_eq!(version, "0.3.0");
+    assert_eq!(description, "pinned for staging");
+}
+
 #[test]
 fn runtime_install_from_manifest_channel_selects_the_matching_release() {
     let root = TestDir::new("runtime-install-manifest-channel");

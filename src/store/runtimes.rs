@@ -56,6 +56,12 @@ fn trim_description(description: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// The description OCM records for an official OpenClaw release installed
+/// without `--description`.
+pub(crate) fn official_openclaw_release_description(version: &str) -> String {
+    format!("Official OpenClaw release {version}")
+}
+
 fn installed_openclaw_binary_path(install_files: &Path) -> PathBuf {
     install_files.join("node_modules/openclaw/openclaw.mjs")
 }
@@ -4494,7 +4500,7 @@ pub(crate) fn install_runtime_from_official_openclaw_release_with_context(
         }
     };
     let description = trim_description(options.description)
-        .or_else(|| Some(format!("Official OpenClaw release {}", release.version)));
+        .or_else(|| Some(official_openclaw_release_description(&release.version)));
 
     install_runtime_from_selected_official_openclaw_release(
         name,
@@ -4555,7 +4561,7 @@ pub(crate) fn prepare_runtime_from_selected_official_openclaw_release(
         })
         .and_then(normalize_file_integrity)?;
     let description = trim_description(description)
-        .or_else(|| Some(format!("Official OpenClaw release {}", release.version)));
+        .or_else(|| Some(official_openclaw_release_description(&release.version)));
     let source = RuntimeSourceDetails {
         url: Some(release.tarball_url),
         manifest_url: Some(releases_url),

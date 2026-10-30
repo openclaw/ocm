@@ -2,9 +2,9 @@ use super::{RuntimeMeta, RuntimeReleaseSelectorKind, RuntimeService};
 use crate::infra::download::normalize_file_integrity;
 use crate::runtime::releases::{
     OpenClawRelease, RuntimeRelease, is_official_openclaw_releases_url,
-    load_official_openclaw_release_selection, normalize_openclaw_channel_selector,
-    official_openclaw_releases_url, select_official_openclaw_release_by_channel,
-    select_official_openclaw_release_by_version,
+    load_official_openclaw_release_selection, load_release_manifest,
+    normalize_openclaw_channel_selector, official_openclaw_releases_url, query_releases,
+    select_official_openclaw_release_by_channel, select_official_openclaw_release_by_version,
 };
 use crate::store::{
     BuildLocalRuntimeOptions as StoreBuildLocalRuntimeOptions, InstallContext,
@@ -12,7 +12,7 @@ use crate::store::{
     install_runtime_from_local_openclaw_build,
     install_runtime_from_official_openclaw_release_with_context,
     install_runtime_from_release_with_context, install_runtime_from_url_with_context,
-    install_runtime_with_context, list_runtimes,
+    install_runtime_with_context, list_runtimes, official_openclaw_release_description,
     prepare_runtime_from_selected_official_openclaw_release, prepare_runtime_from_selected_release,
     runtime_integrity_issue,
 };
@@ -86,6 +86,32 @@ pub(crate) struct ResolvedRuntimeUpdate {
     selector_kind: RuntimeReleaseSelectorKind,
     selector_value: String,
     release: ResolvedRuntimeUpdateRelease,
+    /// The existing description to keep for the new release; `None` lets the
+    /// new release supply its own.
+    description: Option<String>,
+}
+
+/// Returns the description a runtime keeps when it moves to another release.
+/// `previous_release_description` is the text OCM records for the runtime's
+/// current release when no `--description` is given; that text describes only
+/// that release, so it is dropped. Any other description was supplied by the
+/// user and is kept.
+fn description_kept_across_releases(
+    existing: &RuntimeMeta,
+    previous_release_description: Option<&str>,
+) -> Option<String> {
+    existing
+        .description
+        .clone()
+        .filter(|description| Some(description.as_str()) != previous_release_description)
+}
+
+fn official_description_kept_across_releases(existing: &RuntimeMeta) -> Option<String> {
+    let previous = existing
+        .release_version
+        .as_deref()
+        .map(official_openclaw_release_description);
+    description_kept_across_releases(existing, previous.as_deref())
 }
 
 impl ResolvedRuntimeUpdate {
@@ -377,7 +403,7 @@ impl<'a> RuntimeService<'a> {
         let description = options.description.or_else(|| {
             existing_meta
                 .as_ref()
-                .and_then(|meta| meta.description.clone())
+                .and_then(official_description_kept_across_releases)
         });
         let install = |runtime_guard: Option<&Arc<RuntimeMutationGuard>>| {
             prepare_runtime_from_selected_official_openclaw_release(
@@ -575,21 +601,38 @@ impl<'a> RuntimeService<'a> {
             _ => unreachable!("runtime update requires a resolved selector"),
         };
 
-        let release = if is_official_openclaw_releases_url(Some(manifest_url.as_str()), self.env) {
-            let release = self
-                .official_openclaw_releases(version.as_deref(), channel.as_deref())?
-                .into_iter()
-                .next()
-                .ok_or_else(|| "OpenClaw release was not found".to_string())?;
-            ResolvedRuntimeUpdateRelease::Official(release)
-        } else {
-            let release = self
-                .releases_from_manifest(&manifest_url, version.as_deref(), channel.as_deref())?
-                .into_iter()
-                .next()
-                .ok_or_else(|| "runtime release was not found".to_string())?;
-            ResolvedRuntimeUpdateRelease::Manifest(release)
-        };
+        let (release, description) =
+            if is_official_openclaw_releases_url(Some(manifest_url.as_str()), self.env) {
+                let release = self
+                    .official_openclaw_releases(version.as_deref(), channel.as_deref())?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| "OpenClaw release was not found".to_string())?;
+                (
+                    ResolvedRuntimeUpdateRelease::Official(release),
+                    official_description_kept_across_releases(&existing),
+                )
+            } else {
+                let manifest = load_release_manifest(&manifest_url)?;
+                let release = query_releases(&manifest, version.as_deref(), channel.as_deref())?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| "runtime release was not found".to_string())?;
+                // A manifest description of the current release was recorded
+                // from the manifest, not supplied by the user.
+                let previous = existing.release_version.as_deref().and_then(|version| {
+                    manifest
+                        .releases
+                        .iter()
+                        .find(|candidate| candidate.version == version)
+                        .and_then(|candidate| candidate.description.as_deref())
+                        .map(str::trim)
+                });
+                (
+                    ResolvedRuntimeUpdateRelease::Manifest(release),
+                    description_kept_across_releases(&existing, previous),
+                )
+            };
 
         Ok(ResolvedRuntimeUpdate {
             existing,
@@ -597,6 +640,7 @@ impl<'a> RuntimeService<'a> {
             selector_kind,
             selector_value,
             release,
+            description,
         })
     }
 
@@ -629,7 +673,7 @@ impl<'a> RuntimeService<'a> {
                     resolved.manifest_url,
                     release,
                     RuntimeReleaseDetails::with_selector(selector_kind, selector_value),
-                    resolved.existing.description,
+                    resolved.description,
                     InstallContext {
                         env: self.env,
                         cwd: self.cwd,
@@ -645,7 +689,7 @@ impl<'a> RuntimeService<'a> {
                     release,
                     selector_kind,
                     selector_value,
-                    resolved.existing.description,
+                    resolved.description,
                     self.env,
                     self.cwd,
                     runtime_guard,
