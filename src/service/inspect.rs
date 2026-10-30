@@ -563,7 +563,9 @@ fn resolve_summary_process(
     if planned_child.is_some() {
         return None;
     }
-    Some(env_service.resolve_gateway_process(name, true))
+    // Status only inspects: never download OCM's private Node.js or wait on its
+    // install lock. A missing toolchain is reported, as the supervisor does.
+    Some(env_service.resolve_gateway_process(name, false))
 }
 
 fn binding_from_meta(meta: &EnvMeta) -> Option<(String, String)> {

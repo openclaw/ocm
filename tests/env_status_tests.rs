@@ -471,13 +471,157 @@ fn env_status_keeps_official_runtime_healthy_when_managed_fallback_is_available(
             .to_string_lossy()
             .to_string(),
     );
-    let _managed_node_server = install_fake_managed_node_archive(&root, &mut status_env, "24.22.1");
+    let managed_node_server = install_fake_managed_node_archive(&root, &mut status_env, "24.22.1");
 
     let status = run_ocm(&cwd, &status_env, &["env", "status", "demo", "--json"]);
     assert!(status.status.success(), "{}", stderr(&status));
     let value: Value = serde_json::from_str(&stdout(&status)).unwrap();
     assert_eq!(value["runtimeHealth"], "ok");
     assert_eq!(value["issue"], Value::Null);
+    let not_installed = "compatible managed Node.js is not installed";
+    assert!(
+        value["serviceIssue"]
+            .as_str()
+            .is_some_and(|issue| issue.contains(not_installed)),
+        "{value}"
+    );
+
+    let service = run_ocm(&cwd, &status_env, &["service", "status", "demo", "--json"]);
+    assert!(service.status.success(), "{}", stderr(&service));
+    let value: Value = serde_json::from_str(&stdout(&service)).unwrap();
+    assert_eq!(value["installed"], false);
+    assert!(
+        value["issue"]
+            .as_str()
+            .is_some_and(|issue| issue.contains(not_installed)),
+        "{value}"
+    );
+
+    // Inspection reports the missing private Node.js instead of installing it.
+    assert!(managed_node_server.requests().is_empty());
+    assert!(!root.child("ocm-home/toolchains/node").exists());
+}
+
+#[test]
+fn env_and_service_status_do_not_wait_for_private_node_installation() {
+    use fs2::FileExt;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let root = TestDir::new("env-status-private-node-lock");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let empty_path = root.child("empty-bin");
+    fs::create_dir_all(&empty_path).unwrap();
+
+    let tarball =
+        openclaw_package_tarball("#!/usr/bin/env node\nconsole.log('stable');\n", "2026.3.24");
+    let tarball_server = TestHttpServer::serve_bytes(
+        "/openclaw-2026.3.24.tgz",
+        "application/octet-stream",
+        &tarball,
+    );
+    let packument = format!(
+        "{{\"dist-tags\":{{\"latest\":\"2026.3.24\"}},\"versions\":{{\"2026.3.24\":{{\"version\":\"2026.3.24\",\"dist\":{{\"tarball\":\"{}\",\"integrity\":\"{}\"}}}}}},\"time\":{{\"2026.3.24\":\"2026-03-25T16:35:52.000Z\"}}}}",
+        tarball_server.url(),
+        sha512_integrity(&tarball)
+    );
+    let packument_server =
+        TestHttpServer::serve_bytes("/openclaw", "application/json", packument.as_bytes());
+    let mut env = ocm_env(&root);
+    env.insert("PATH".to_string(), empty_path.to_string_lossy().to_string());
+    env.insert(
+        "OCM_INTERNAL_OPENCLAW_RELEASES_URL".to_string(),
+        packument_server.url(),
+    );
+    env.insert(
+        "OCM_INTERNAL_NPM_BIN".to_string(),
+        root.child("missing-npm").to_string_lossy().to_string(),
+    );
+    let managed_node_server = install_fake_managed_node_archive(&root, &mut env, "24.22.1");
+
+    // Without a host Node.js, the release flow installs the private toolchain.
+    let install = run_ocm(&cwd, &env, &["runtime", "install", "--channel", "stable"]);
+    assert!(install.status.success(), "{}", stderr(&install));
+    let create = run_ocm(
+        &cwd,
+        &env,
+        &["env", "create", "demo", "--runtime", "stable"],
+    );
+    assert!(create.status.success(), "{}", stderr(&create));
+    assert_eq!(managed_node_server.requests().len(), 1);
+
+    // Hold the toolchain install lock as a concurrent installation would.
+    let lock_path = fs::read_dir(root.child("ocm-home/toolchains/node"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            let name = path.file_name().unwrap().to_string_lossy();
+            name.starts_with(".node-v24.22.1-") && name.ends_with(".lock")
+        })
+        .expect("private Node install lock");
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
+    lock.lock_exclusive().unwrap();
+
+    let status_issues = || {
+        [
+            ["env", "status", "demo", "--json"],
+            ["service", "status", "demo", "--json"],
+        ]
+        .map(|args| {
+            let mut child = Command::new(support::ocm_test_binary_path())
+                .current_dir(&cwd)
+                .env_clear()
+                .envs(&env)
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while child.try_wait().unwrap().is_none() {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("{args:?} waited for the private Node.js install lock");
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success(), "{}", stderr(&output));
+            let value: Value = serde_json::from_str(&stdout(&output)).unwrap();
+            let key = if args[0] == "env" {
+                "serviceIssue"
+            } else {
+                "issue"
+            };
+            value[key].as_str().map(str::to_string)
+        })
+    };
+
+    // A valid private Node.js is used without waiting for the installer.
+    assert_eq!(status_issues(), [None, None]);
+
+    // A missing private Node.js is reported without waiting or installing.
+    fs::remove_dir_all(lock_path.with_file_name(
+        lock_path.file_name().unwrap().to_string_lossy()[1..].trim_end_matches(".lock"),
+    ))
+    .unwrap();
+    for issue in status_issues() {
+        assert!(
+            issue
+                .as_deref()
+                .is_some_and(|issue| issue.contains("compatible managed Node.js is not installed")),
+            "{issue:?}"
+        );
+    }
+    FileExt::unlock(&lock).unwrap();
+    assert_eq!(managed_node_server.requests().len(), 1);
 }
 
 #[test]
