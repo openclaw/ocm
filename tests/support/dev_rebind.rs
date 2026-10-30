@@ -223,6 +223,24 @@ fn dev_rebind_refusals_preserve_the_binding_and_policy() {
         assert!(!message.contains("operation in progress"), "{message}");
         assert_eq!(fs::read(&registry).unwrap(), unchanged);
     }
+    // Another containing environment that is genuinely busy is still reported
+    // as an operation in progress.
+    let peer = run_ocm(root.path(), &env, &["env", "create", "peer"]);
+    assert!(peer.status.success(), "{}", stderr(&peer));
+    let peer_root =
+        Path::new(&get_environment("peer", &env, root.path()).unwrap().root).join("source");
+    init_nested_openclaw_repo(&peer_root);
+    let unchanged = fs::read(&registry).unwrap();
+    let peer_operation = hold_environment_operation(&root, "peer");
+    let busy = rebind(root.path(), &env, &peer_root);
+    assert!(!busy.status.success());
+    assert!(
+        stderr(&busy).contains("environment peer has an operation in progress"),
+        "{}",
+        stderr(&busy)
+    );
+    assert_eq!(fs::read(&registry).unwrap(), unchanged);
+    drop(peer_operation);
     let operation = hold_environment_operation(&root, "demo");
     let busy = rebind(root.path(), &env, &repo);
     assert!(!busy.status.success());
