@@ -1824,6 +1824,10 @@ underlying error; preview and apply preserve that binding. Restore access or rep
 the metadata, then rerun doctor. Restoring valid metadata allows execution to
 recover without rebinding. `--all` applies the same rule.
 
+If the checkout a dev environment records is later moved or deleted, emptied, or replaced by a symlink to a different checkout, `env run` and `env resolve` refuse the environment, and `env status` and `env doctor` report the same refusal as an issue instead of calling it healthy: `env doctor` shows `healthy: false` and `resolutionStatus: error` with the message in its issues, and `env status` sets `issue` to it. While a foreground `ocm dev` session is running for the environment, `env status` describes that session and does not check the checkout. The message names the recorded path, for example `failed to resolve OpenClaw source <path>: <error>; restore that checkout before retrying`, `OpenClaw checkout not found at <path>` or `saved dev source <path> now resolves to a different checkout; restore the recorded path before retrying`. An older environment that owns a linked worktree reports messages such as `saved dev worktree is missing: <path>; restore that checkout before resuming the env`.
+
+Restore the checkout at the recorded path and the environment is reported healthy again. To use a different checkout instead, stop the environment with `ocm dev stop <env>` (and `ocm service stop <env>` if its background service runs), then run `ocm dev rebind <env> --repo <path>`; the old checkout need not exist. Rebind applies to borrowed dev environments only, so restore the checkout of an older environment that owns a linked worktree.
+
 Config repair moves paths under another registered environment's root into this environment's root.
 Without a registered owner, it maps only paths inside another `.openclaw` directory onto this environment's `.openclaw` directory and leaves other paths unchanged.
 Paths in your own `~/.openclaw` are references to your existing OpenClaw home, so doctor does not report them as copied paths and config repair leaves them unchanged.
