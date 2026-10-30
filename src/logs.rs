@@ -10,7 +10,7 @@ use time::OffsetDateTime;
 
 use crate::env::EnvironmentService;
 use crate::infra::file_identity::{FileIdentity, file_identity, file_is_excluded};
-use crate::store::{derive_env_paths, display_path};
+use crate::store::{derive_env_paths, display_path, supervisor_child_log_file};
 
 const FOLLOW_POLL_INTERVAL_MS: u64 = 250;
 const TAIL_READ_CHUNK_SIZE: usize = 8 * 1024;
@@ -53,6 +53,11 @@ struct LogSources {
     stream: String,
     gateway_path: PathBuf,
     service_path: PathBuf,
+    /// The registered name and the store whose registrations decide whose
+    /// name-keyed service file this is.
+    registered_name: String,
+    store_env: BTreeMap<String, String>,
+    store_cwd: PathBuf,
     excluded_paths: Vec<PathBuf>,
     service_available: bool,
 }
@@ -66,33 +71,46 @@ impl LogSources {
         }
     }
 
+    /// The env's service log file as it resolves now. A follower selects
+    /// again until a file exists, and meanwhile the name-keyed file can come
+    /// to belong to a case-distinct name or be taken over by this one.
+    fn service_file(&self) -> PathBuf {
+        supervisor_child_log_file(
+            &self.service_path,
+            &self.registered_name,
+            &self.stream,
+            crate::supervisor::registered_env(&self.store_env, &self.store_cwd),
+        )
+    }
+
     /// Picks the newer existing file, or the Gateway path when neither exists.
     fn select(&self) -> Result<LogTarget, String> {
+        let service_path = self.service_file();
         let gateway_modified = modified_at(&self.gateway_path);
         let service_modified = if !self.service_available {
             None
         } else if self.excluded_paths.is_empty() {
-            modified_at(&self.service_path)
+            modified_at(&service_path)
         } else if gateway_modified.is_some_and(|gateway_time| {
-            modified_at(&self.service_path).is_some_and(|service_time| gateway_time >= service_time)
+            modified_at(&service_path).is_some_and(|service_time| gateway_time >= service_time)
         }) {
             // Gateway wins ties too. An unused child file need not be opened
             // for diagnostic ownership checks before reading Gateway output.
             None
         } else {
-            open_log_excluding(&self.service_path, &self.excluded_paths)?
+            open_log_excluding(&service_path, &self.excluded_paths)?
                 .and_then(|(_, metadata)| modified_time(&metadata))
         };
         let (source_kind, path) = match (gateway_modified, service_modified) {
             (Some(gateway_time), Some(service_time)) => {
                 if service_time > gateway_time {
-                    ("service", &self.service_path)
+                    ("service", &service_path)
                 } else {
                     ("gateway", &self.gateway_path)
                 }
             }
             (Some(_), None) => ("gateway", &self.gateway_path),
-            (None, Some(_)) => ("service", &self.service_path),
+            (None, Some(_)) => ("service", &service_path),
             (None, None) => ("gateway", &self.gateway_path),
         };
 
@@ -226,7 +244,7 @@ impl<'a> LogService<'a> {
                 _ => unreachable!("stream validated by normalize_stream"),
             });
         let supervisor = crate::supervisor::SupervisorService::new(self.env, self.cwd);
-        let service_path = supervisor.child_log_path(&meta, &stream)?;
+        let service_path = supervisor.saved_child_log_path(&meta, &stream)?;
         let mut service_available = true;
         let excluded_paths = if meta.name.eq_ignore_ascii_case("daemon") {
             match supervisor.daemon_log_paths() {
@@ -246,6 +264,9 @@ impl<'a> LogService<'a> {
             stream,
             gateway_path,
             service_path,
+            registered_name: meta.name,
+            store_env: self.env.clone(),
+            store_cwd: self.cwd.to_path_buf(),
             excluded_paths,
             service_available,
         })
@@ -294,7 +315,7 @@ impl<'a> LogService<'a> {
                         path: format!(
                             "{} or {}",
                             display_path(&sources.gateway_path),
-                            display_path(&sources.service_path)
+                            display_path(&sources.service_file())
                         ),
                     }
                 })
@@ -2520,6 +2541,52 @@ mod tests {
     }
 
     #[test]
+    fn pending_follower_ignores_a_case_distinct_envs_service_log() {
+        let root = test_root("follow-pending-case-distinct");
+        let gateway_path = root.join("gateway.err.log");
+        let service_path = root.join("demo.stderr.log");
+        let mut cursor =
+            FollowCursor::for_sources(stderr_sources(&gateway_path, &service_path)).unwrap();
+        assert!(cursor.snapshot(Some(50), false).unwrap().is_none());
+
+        // On case-insensitive storage, Demo's file is what demo.stderr.log opens.
+        let store_env = test_store_env(&gateway_path);
+        crate::store::create_environment(
+            crate::env::CreateEnvironmentOptions {
+                name: "Demo".to_string(),
+                root: None,
+                gateway_port: Some(19789),
+                service_enabled: false,
+                service_running: false,
+                default_runtime: None,
+                default_launcher: None,
+                dev: None,
+                protected: false,
+            },
+            &store_env,
+            &root,
+        )
+        .unwrap();
+        fs::write(root.join("Demo.stderr.log"), b"other env error\n").unwrap();
+        assert!(cursor.snapshot(Some(50), false).unwrap().is_none());
+
+        let separate =
+            crate::store::supervisor_child_case_distinct_log_path(&root, "demo", "stderr");
+        fs::create_dir_all(separate.parent().unwrap()).unwrap();
+        let own = if root.join("DEMO.STDERR.LOG").exists() {
+            separate
+        } else {
+            service_path
+        };
+        fs::write(&own, b"own error\n").unwrap();
+        let snapshot = cursor.snapshot(Some(50), false).unwrap().unwrap();
+        assert_eq!(snapshot.bytes, b"own error\n");
+        assert_eq!(cursor.target.path, own);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn follow_cursor_attaches_to_the_gateway_log_when_it_appears_first() {
         let root = test_root("follow-pending-gateway");
         let gateway_path = root.join("gateway.err.log");
@@ -2729,12 +2796,20 @@ mod tests {
         }
     }
 
+    fn test_store_env(gateway_path: &Path) -> BTreeMap<String, String> {
+        let home = gateway_path.parent().unwrap().join("ocm-home");
+        BTreeMap::from([("OCM_HOME".to_string(), crate::store::display_path(&home))])
+    }
+
     fn stderr_sources(gateway_path: &Path, service_path: &Path) -> LogSources {
         LogSources {
             env_name: "demo".to_string(),
             stream: "stderr".to_string(),
             gateway_path: gateway_path.to_path_buf(),
             service_path: service_path.to_path_buf(),
+            registered_name: "demo".to_string(),
+            store_env: test_store_env(gateway_path),
+            store_cwd: gateway_path.parent().unwrap().to_path_buf(),
             excluded_paths: Vec::new(),
             service_available: true,
         }

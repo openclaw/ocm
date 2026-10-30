@@ -1927,7 +1927,19 @@ environment starts without the earlier one's service logs. Copy them before
 reusing the name if you need them. OCM never deletes a file that belongs to
 another registered environment or the supervisor daemon's own
 `daemon.stdout.log` and `daemon.stderr.log`, for example when a case-insensitive
-filesystem resolves the new name to one of those files. For daemon-named
+filesystem resolves the new name to one of those files. On case-insensitive
+storage, accepted case-distinct environment names such as `alpha` and `Alpha`
+also keep separate service output. While the name whose output created
+`<env>.stdout.log` or `<env>.stderr.log` is registered, it keeps that file, and
+the other name writes to its own
+`$OCM_HOME/supervisor/logs/case-distinct/<hash>.stdout.log` and `.stderr.log`,
+which `ocm logs` and `ocm service status` report for it. A file left by a
+removed environment does not move another name's output: the next environment
+that writes to it takes it over, and registering a name again deletes a
+leftover that no registered environment uses. When OCM is updated,
+a file that both names already shared stays with the name that created it and
+keeps their earlier mixed output, and a Gateway already running keeps writing
+where it started until it is next started. For daemon-named
 environments, name reuse clears only their separate `.<env>.stdout.log` and
 `.<env>.stderr.log` child output; the legacy `daemon.*.log` files remain preserved.
 

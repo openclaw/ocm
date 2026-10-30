@@ -38,9 +38,10 @@ use crate::service::platform::{
     write_managed_service_definition,
 };
 use crate::store::{
-    display_path, ensure_dir, ensure_store, list_environments, lock_file, now_utc,
-    openclaw_port_family_available, openclaw_port_family_range, read_json, resolve_ocm_home,
-    supervisor_child_log_destination, supervisor_child_log_path, supervisor_logs_dir,
+    adopt_supervisor_child_log_file, display_path, ensure_dir, ensure_store, list_environments,
+    lock_file, now_utc, openclaw_port_family_available, openclaw_port_family_range, read_json,
+    resolve_ocm_home, supervisor_child_case_distinct_log_path, supervisor_child_log_destination,
+    supervisor_child_log_file, supervisor_child_log_path, supervisor_logs_dir,
     supervisor_runtime_path, supervisor_state_path, write_json,
 };
 
@@ -122,6 +123,25 @@ pub struct SupervisorChildSpec {
 
 impl SupervisorChildSpec {
     pub(crate) fn log_destination(&self, stream: &str) -> PathBuf {
+        supervisor_child_log_file(
+            &self.saved_log_destination(stream),
+            &self.env_name,
+            stream,
+            registered_env(&self.process_env, Path::new(&self.run_dir)),
+        )
+    }
+
+    /// The file a newly spawned child writes; see `log_destination`.
+    fn spawn_log_destination(&self, stream: &str) -> Result<PathBuf, String> {
+        adopt_supervisor_child_log_file(
+            &self.saved_log_destination(stream),
+            &self.env_name,
+            stream,
+            registered_env(&self.process_env, Path::new(&self.run_dir)),
+        )
+    }
+
+    fn saved_log_destination(&self, stream: &str) -> PathBuf {
         let path = if stream == "stdout" {
             &self.stdout_path
         } else {
@@ -382,9 +402,13 @@ pub fn sync_supervisor_env_if_present(
 /// environment root and are keyed only by name, so they can hold output from an
 /// earlier environment of the same name, including one removed by an older OCM.
 ///
-/// On a case-insensitive filesystem the path can also resolve to a file that
-/// still belongs to someone else: a registered env whose name differs only in
-/// case, or the daemon's own daemon.<stream>.log. Those files are kept.
+/// The name's separate case-distinct files are always its own. On a
+/// case-insensitive filesystem the name-keyed path can also resolve to a file
+/// that belongs to someone else: one created under a registered name that
+/// differs only in case, one a registered env still uses, one another running
+/// child writes, or the daemon's own daemon.<stream>.log. Those files are kept;
+/// when a running child writes one, the name starts in its own case-distinct
+/// file instead of sharing it.
 pub(crate) fn discard_child_logs<'n>(
     env_name: &str,
     registered: impl IntoIterator<Item = &'n str>,
@@ -392,39 +416,98 @@ pub(crate) fn discard_child_logs<'n>(
     cwd: &Path,
 ) -> Result<(), String> {
     let logs_dir = supervisor_logs_dir(env, cwd)?;
-    let owners = registered
+    let registered = registered
         .into_iter()
-        .filter(|name| *name != env_name)
-        .map(|name| (logs_dir.clone(), name.to_string()))
+        .map(str::to_string)
         .collect::<Vec<_>>();
+    // Judge ownership as it will be once this name is registered.
+    let is_registered =
+        |name: &str| Some(name == env_name || registered.iter().any(|current| current == name));
     let daemon_logs_dir = if env_name.eq_ignore_ascii_case("daemon") {
         Some(SupervisorService::new(env, cwd).saved_daemon_logs_dir()?)
     } else {
         None
     };
+    // Files other running children write, as their daemon recorded them. A
+    // daemon started by an older OCM records a name-keyed path even when it
+    // opens a case-distinct name's file.
+    let running_outputs = SupervisorService::new(env, cwd)
+        .read_runtime_state()
+        .ok()
+        .flatten()
+        .map(|runtime| {
+            runtime
+                .children
+                .into_iter()
+                .filter(|child| child.env_name != env_name)
+                .flat_map(|child| [PathBuf::from(child.stdout_path), child.stderr_path.into()])
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     for stream in ["stdout", "stderr"] {
+        let separate = supervisor_child_case_distinct_log_path(&logs_dir, env_name, stream);
+        remove_earlier_child_log(&separate, env_name)?;
         let path = supervisor_child_log_path(&logs_dir, env_name, stream);
-        if owners
+        if running_outputs
             .iter()
-            .any(|(dir, owner)| is_same_file(&path, &supervisor_child_log_path(dir, owner, stream)))
+            .any(|output| is_same_file(&path, output))
+        {
+            // Keep the running child's output and start this name in its own
+            // file instead of sharing that one.
+            if let Some(parent) = separate.parent() {
+                ensure_dir(parent)?;
+            }
+            fs::write(&separate, b"").map_err(|error| {
+                format!(
+                    "failed creating service log {} for env \"{env_name}\": {error}",
+                    display_path(&separate)
+                )
+            })?;
+            continue;
+        }
+        if supervisor_child_log_file(&path, env_name, stream, is_registered) != path
+            || registered
+                .iter()
+                .filter(|owner| *owner != env_name)
+                .any(|owner| {
+                    let owner_path = supervisor_child_log_path(&logs_dir, owner, stream);
+                    is_same_file(&path, &owner_path)
+                        && supervisor_child_log_file(&owner_path, owner, stream, is_registered)
+                            == owner_path
+                })
             || daemon_logs_dir
                 .as_ref()
                 .is_some_and(|dir| is_same_file(&path, &dir.join(format!("daemon.{stream}.log"))))
         {
             continue;
         }
-        match fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(format!(
-                    "failed removing earlier service log {} for env \"{env_name}\": {error}",
-                    display_path(&path)
-                ));
-            }
-        }
+        remove_earlier_child_log(&path, env_name)?;
     }
     Ok(())
+}
+
+fn remove_earlier_child_log(path: &Path, env_name: &str) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "failed removing earlier service log {} for env \"{env_name}\": {error}",
+            display_path(path)
+        )),
+    }
+}
+
+/// Whether a registered environment has exactly this name, or `None` when the
+/// registry cannot be read.
+pub(crate) fn registered_env<'a>(
+    env: &'a BTreeMap<String, String>,
+    cwd: &'a Path,
+) -> impl FnOnce(&str) -> Option<bool> + 'a {
+    move |name| {
+        list_environments(env, cwd)
+            .ok()
+            .map(|envs| envs.iter().any(|meta| meta.name == name))
+    }
 }
 
 /// Whether both paths exist and resolve to the same file.
@@ -749,7 +832,11 @@ impl<'a> SupervisorService<'a> {
         }))
     }
 
-    pub(crate) fn child_log_path(
+    /// The service log path saved for an env before case-distinct resolution:
+    /// its name-keyed file, or a daemon-named child's saved destination.
+    /// Readers resolve it with `supervisor_child_log_file` whenever they look,
+    /// because which name owns a name-keyed file can change while they wait.
+    pub(crate) fn saved_child_log_path(
         &self,
         meta: &crate::env::EnvMeta,
         stream: &str,
@@ -762,13 +849,12 @@ impl<'a> SupervisorService<'a> {
         if !meta.name.eq_ignore_ascii_case("daemon") {
             return Ok(default);
         }
-        let path = self
+        Ok(self
             .persisted_child_for_logs(&meta.name, &meta.root)
             .ok()
             .flatten()
-            .map(|child| child.log_destination(stream))
-            .unwrap_or(default);
-        Ok(path)
+            .map(|child| child.saved_log_destination(stream))
+            .unwrap_or(default))
     }
 
     pub(crate) fn has_legacy_child_log_paths(&self, meta: &crate::env::EnvMeta) -> bool {
@@ -778,8 +864,8 @@ impl<'a> SupervisorService<'a> {
                 .ok()
                 .flatten()
                 .is_some_and(|child| {
-                    child.log_destination("stdout") != Path::new(&child.stdout_path)
-                        || child.log_destination("stderr") != Path::new(&child.stderr_path)
+                    child.saved_log_destination("stdout") != Path::new(&child.stdout_path)
+                        || child.saved_log_destination("stderr") != Path::new(&child.stderr_path)
                 })
     }
 
@@ -2058,8 +2144,8 @@ fn spawn_supervisor_child(spec: &SupervisorChildSpec) -> Result<Child, String> {
             spec.env_name
         ));
     };
-    let stdout_path = spec.log_destination("stdout");
-    let stderr_path = spec.log_destination("stderr");
+    let stdout_path = spec.spawn_log_destination("stdout")?;
+    let stderr_path = spec.spawn_log_destination("stderr")?;
     let daemon_logs = if spec.env_name.eq_ignore_ascii_case("daemon") {
         SupervisorService::new(&spec.process_env, Path::new(&spec.run_dir)).daemon_log_paths()?
     } else {

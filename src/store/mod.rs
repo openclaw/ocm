@@ -79,7 +79,9 @@ pub use layout::{
     validate_name,
 };
 pub(crate) use layout::{
-    source_watch_case_distinct_override_path, supervisor_child_log_destination,
+    adopt_supervisor_child_log_file, source_watch_case_distinct_override_path,
+    supervisor_child_case_distinct_log_path, supervisor_child_log_destination,
+    supervisor_child_log_file,
 };
 pub(crate) use openclaw_config::{
     GatewayReadinessHost, MinimumLocalConfig, OpenClawConfigAudit, OpenClawConfigRepair,

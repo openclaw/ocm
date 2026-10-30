@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
+use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Clone, Debug)]
@@ -341,6 +342,125 @@ pub fn supervisor_child_log_path(logs_dir: &Path, env_name: &str, stream: &str) 
     logs_dir.join(format!("{prefix}{env_name}.{stream}.log"))
 }
 
+/// A case-distinct file name for an exact environment name. The SHA-256 of the
+/// exact name keeps every accepted name distinct under case folding and keeps
+/// the file name short for any accepted name length.
+fn case_distinct_key(name: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(name.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Separate service output for a name whose name-keyed file already belongs to
+/// a registered case-distinct environment on case-insensitive storage.
+pub(crate) fn supervisor_child_case_distinct_log_path(
+    logs_dir: &Path,
+    env_name: &str,
+    stream: &str,
+) -> PathBuf {
+    logs_dir
+        .join("case-distinct")
+        .join(format!("{}.{stream}.log", case_distinct_key(env_name)))
+}
+
+/// The file that holds one environment's service output. On case-insensitive
+/// storage `alpha.stdout.log` can open `Alpha.stdout.log`. The directory entry
+/// keeps the spelling of the name that created it. While that name is a
+/// registered environment, it keeps the file and the other name uses its own
+/// case-distinct file, and a name keeps its case-distinct file once it exists.
+/// Every other name-keyed file, including one left by a removed environment, is
+/// used unchanged.
+pub(crate) fn supervisor_child_log_file(
+    path: &Path,
+    env_name: &str,
+    stream: &str,
+    is_registered: impl FnOnce(&str) -> Option<bool>,
+) -> PathBuf {
+    resolve_child_log_file(path, env_name, stream, is_registered).0
+}
+
+/// The file a newly spawned child writes. A file left under a removed
+/// environment's spelling is renamed to this name's spelling first, so the
+/// file stays this environment's when that spelling is registered again. A
+/// child must not write the file under the other spelling, so a failed rename
+/// is an error.
+pub(crate) fn adopt_supervisor_child_log_file(
+    path: &Path,
+    env_name: &str,
+    stream: &str,
+    is_registered: impl FnOnce(&str) -> Option<bool>,
+) -> Result<PathBuf, String> {
+    let (file, leftover) = resolve_child_log_file(path, env_name, stream, is_registered);
+    if let Some(leftover) = leftover {
+        fs::rename(&leftover, &file).map_err(|error| {
+            format!(
+                "failed taking over service log {} for env \"{env_name}\": {error}",
+                display_path(&leftover)
+            )
+        })?;
+    }
+    Ok(file)
+}
+
+/// The resolved file, and the entry it opens when that entry is spelled for a
+/// name that is not registered. `is_registered` answers `None` when
+/// registration cannot be read.
+fn resolve_child_log_file(
+    path: &Path,
+    env_name: &str,
+    stream: &str,
+    is_registered: impl FnOnce(&str) -> Option<bool>,
+) -> (PathBuf, Option<PathBuf>) {
+    let unchanged = || (path.to_path_buf(), None);
+    let (Some(dir), Some(file_name)) = (path.parent(), path.file_name()) else {
+        return unchanged();
+    };
+    let own_name = format!("{env_name}.{stream}.log");
+    let Some(own) = file_name
+        .to_str()
+        .filter(|name| *name == own_name || name.strip_prefix('.') == Some(own_name.as_str()))
+    else {
+        return unchanged();
+    };
+    let separate = supervisor_child_case_distinct_log_path(dir, env_name, stream);
+    if fs::symlink_metadata(&separate).is_ok() {
+        return (separate, None);
+    }
+    if fs::symlink_metadata(path).is_err() {
+        return unchanged();
+    }
+    // A listing that cannot be read completely proves nothing about the
+    // spelling; keep the name-keyed file rather than hiding existing output.
+    let Ok(entries) = fs::read_dir(dir).and_then(|entries| entries.collect::<Result<Vec<_>, _>>())
+    else {
+        return unchanged();
+    };
+    let names = entries
+        .iter()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect::<Vec<_>>();
+    if names.iter().any(|name| name == own) {
+        return unchanged();
+    }
+    let prefix = &own[..own.len() - own_name.len()];
+    let suffix = format!(".{stream}.log");
+    let Some((entry, creator)) = names.iter().find_map(|name| {
+        let creator = name.strip_prefix(prefix)?.strip_suffix(&suffix)?;
+        name.eq_ignore_ascii_case(own).then_some((name, creator))
+    }) else {
+        return unchanged();
+    };
+    // Unknown registration keeps the file as it is: never rename a file that
+    // may still belong to a registered environment.
+    match (creator == env_name, is_registered(creator)) {
+        (true, _) | (false, None) => unchanged(),
+        (false, Some(true)) => (separate, None),
+        (false, Some(false)) => (path.to_path_buf(), Some(dir.join(entry))),
+    }
+}
+
 /// Old plans can name the shared daemon's diagnostic file. Keep the saved
 /// launch identity intact, but separate the output of each newly spawned child.
 /// An explicit destination outside that reserved basename remains unchanged.
@@ -385,17 +505,12 @@ pub fn source_watch_case_distinct_override_path(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<PathBuf, String> {
-    use sha2::{Digest, Sha256};
     let stores = resolve_store_paths(env, cwd)?;
-    let key = Sha256::digest(name.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
     Ok(stores
         .home
         .join("source-watch")
         .join("case-distinct")
-        .join(format!("{key}.json")))
+        .join(format!("{}.json", case_distinct_key(name))))
 }
 
 pub fn snapshot_archive_path(
@@ -414,4 +529,67 @@ pub fn snapshot_checkpoint_path(
     cwd: &Path,
 ) -> Result<PathBuf, String> {
     Ok(snapshot_env_dir(env_name, env, cwd)?.join(format!("{snapshot_id}.checkpoint")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry_names(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn a_case_variants_service_log_is_renamed_only_when_its_name_is_known_unregistered() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        fs::write(dir.join("Alpha.stdout.log"), "left output\n").unwrap();
+        let case_insensitive = dir.join("ALPHA.STDOUT.LOG").exists();
+        let path = dir.join("alpha.stdout.log");
+
+        // Registration that cannot be read never moves the entry.
+        assert_eq!(
+            adopt_supervisor_child_log_file(&path, "alpha", "stdout", |_| None).unwrap(),
+            path
+        );
+        assert_eq!(entry_names(dir), ["Alpha.stdout.log"]);
+
+        assert_eq!(
+            adopt_supervisor_child_log_file(&path, "alpha", "stdout", |_| Some(false)).unwrap(),
+            path
+        );
+        let expected = if case_insensitive {
+            "alpha.stdout.log"
+        } else {
+            "Alpha.stdout.log"
+        };
+        assert_eq!(entry_names(dir), [expected]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_takeover_of_a_case_variants_service_log_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("logs");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("alpha.stdout.log"), "left output\n").unwrap();
+        let case_insensitive = dir.join("ALPHA.STDOUT.LOG").exists();
+        let path = dir.join("Alpha.stdout.log");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let result = adopt_supervisor_child_log_file(&path, "Alpha", "stdout", |_| Some(false));
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        if case_insensitive {
+            let error = result.unwrap_err();
+            assert!(error.contains("failed taking over service log"), "{error}");
+        } else {
+            assert_eq!(result.unwrap(), path);
+        }
+        assert_eq!(entry_names(&dir), ["alpha.stdout.log"]);
+    }
 }

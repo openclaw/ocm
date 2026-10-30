@@ -468,6 +468,376 @@ fn creating_a_case_variant_name_keeps_the_registered_envs_logs() {
     assert!(content.contains("current stderr"), "{content}");
 }
 
+#[cfg(unix)]
+struct ServiceLogFixture {
+    root: TestDir,
+    cwd: std::path::PathBuf,
+    env: std::collections::BTreeMap<String, String>,
+}
+
+#[cfg(unix)]
+impl ServiceLogFixture {
+    fn new(label: &str) -> Self {
+        use crate::support::{install_fake_service_manager, write_executable_script};
+
+        let root = TestDir::new(label);
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut env = ocm_env(&root);
+        install_fake_service_manager(&root, &mut env);
+        let gateway = root.child("gateway.sh");
+        write_executable_script(
+            &gateway,
+            "#!/bin/sh\necho \"service-out $OCM_ACTIVE_ENV\"\necho \"service-err $OCM_ACTIVE_ENV\" >&2\nsleep 1\n",
+        );
+        let fixture = Self { root, cwd, env };
+        fixture.run(&["launcher", "add", "gw", "--command", &path_string(&gateway)]);
+        fixture
+    }
+
+    fn case_insensitive(&self) -> bool {
+        fs::write(self.root.child("case-probe"), "").unwrap();
+        self.root.child("CASE-PROBE").exists()
+    }
+
+    fn run(&self, args: &[&str]) {
+        let output = run_ocm(&self.cwd, &self.env, args);
+        assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+    }
+
+    fn create_and_start(&self, name: &str, root: &str) {
+        let root = path_string(&self.root.child(root));
+        self.run(&["env", "create", name, "--launcher", "gw", "--root", &root]);
+        self.run(&["service", "start", name]);
+    }
+
+    fn service_output(&self, name: &str) -> String {
+        let output = run_ocm(&self.cwd, &self.env, &["logs", name, "--json"]);
+        if !output.status.success() {
+            return String::new();
+        }
+        let body: Value = serde_json::from_str(&stdout(&output)).unwrap();
+        body["content"].as_str().unwrap().to_string()
+    }
+
+    /// The service log files `service status` reports for an env.
+    fn status_log_paths(&self, name: &str) -> Vec<std::path::PathBuf> {
+        let output = run_ocm(&self.cwd, &self.env, &["service", "status", name, "--json"]);
+        assert!(output.status.success(), "{}", stderr(&output));
+        let body: Value = serde_json::from_str(&stdout(&output)).unwrap();
+        ["stdoutPath", "stderrPath"]
+            .iter()
+            .map(|key| {
+                let path = body[*key]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{key}: {body}"));
+                std::path::PathBuf::from(path)
+            })
+            .collect()
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn case_distinct_envs_keep_separate_service_output() {
+    let fixture = ServiceLogFixture::new("logs-case-distinct-service-output");
+    let case_insensitive = fixture.case_insensitive();
+    let names = ["alpha", "Alpha", "ALPHA"];
+    for (index, name) in names.iter().enumerate() {
+        fixture.create_and_start(name, &format!("root-{index}"));
+    }
+    fixture.run(&["__daemon", "run", "--once", "--json"]);
+
+    let assert_own_output = |name: &str| {
+        let content = fixture.service_output(name);
+        let files = fixture
+            .status_log_paths(name)
+            .iter()
+            .map(|path| fs::read_to_string(path).unwrap())
+            .collect::<Vec<_>>();
+        for other in names.iter().filter(|other| **other != name) {
+            for stream in ["out", "err"] {
+                let line = format!("service-{stream} {other}\n");
+                assert!(!content.contains(&line), "{name}: {content}");
+                assert!(
+                    !files.iter().any(|file| file.contains(&line)),
+                    "{name}: {files:?}"
+                );
+            }
+        }
+        assert!(
+            content.contains(&format!("service-out {name}\n")),
+            "{name}: {content}"
+        );
+        assert!(
+            content.contains(&format!("service-err {name}\n")),
+            "{name}: {content}"
+        );
+        assert!(
+            files[0].contains(&format!("service-out {name}\n")),
+            "{name}: {files:?}"
+        );
+        assert!(
+            files[1].contains(&format!("service-err {name}\n")),
+            "{name}: {files:?}"
+        );
+    };
+    for name in names {
+        assert_own_output(name);
+    }
+    // Only case-insensitive storage needs the separate files.
+    let logs_dir = fixture.root.child("ocm-home/supervisor/logs");
+    assert_eq!(logs_dir.join("case-distinct").exists(), case_insensitive);
+
+    // A stopped env without a running child still reports its own files.
+    fixture.run(&["service", "stop", "Alpha"]);
+    assert_own_output("Alpha");
+
+    // A recreated name starts without the removed environment's output.
+    fixture.run(&["env", "remove", "Alpha"]);
+    let third_root = path_string(&fixture.root.child("third-root"));
+    fixture.run(&[
+        "env",
+        "create",
+        "Alpha",
+        "--launcher",
+        "gw",
+        "--root",
+        &third_root,
+    ]);
+    assert!(!fixture.service_output("Alpha").contains("service-"));
+    for name in ["alpha", "ALPHA"] {
+        let content = fixture.service_output(name);
+        assert!(
+            content.contains(&format!("service-out {name}\n")),
+            "{content}"
+        );
+        assert!(!content.contains("service-out Alpha\n"), "{content}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_removed_case_variants_service_logs_do_not_move_a_lone_env() {
+    let fixture = ServiceLogFixture::new("logs-case-variant-leftover");
+    fixture.create_and_start("Alpha", "alpha-upper");
+    fixture.run(&["__daemon", "run", "--once", "--json"]);
+    fixture.run(&["service", "stop", "Alpha"]);
+    fixture.run(&["env", "remove", "Alpha"]);
+
+    fixture.create_and_start("alpha", "alpha-lower");
+    fixture.run(&["__daemon", "run", "--once", "--json"]);
+    let logs_dir = fixture.root.child("ocm-home/supervisor/logs");
+    assert!(!logs_dir.join("case-distinct").exists());
+    assert_eq!(
+        fixture.status_log_paths("alpha"),
+        [
+            logs_dir.join("alpha.stdout.log"),
+            logs_dir.join("alpha.stderr.log")
+        ]
+    );
+    let content = fixture.service_output("alpha");
+    assert!(content.contains("service-out alpha\n"), "{content}");
+    assert!(!content.contains("service-out Alpha\n"), "{content}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_recreated_name_keeps_its_output_apart_from_a_registered_case_variant() {
+    // The case variant either never runs, or runs on the removed name's
+    // leftover file before the name is registered again.
+    for variant_ran in [false, true] {
+        let fixture = ServiceLogFixture::new("logs-case-variant-reuse");
+        fixture.create_and_start("alpha", "alpha-first");
+        fixture.run(&["__daemon", "run", "--once", "--json"]);
+        let upper_root = path_string(&fixture.root.child("alpha-upper"));
+        fixture.run(&[
+            "env",
+            "create",
+            "Alpha",
+            "--launcher",
+            "gw",
+            "--root",
+            &upper_root,
+        ]);
+        fixture.run(&["service", "stop", "alpha"]);
+        fixture.run(&["env", "remove", "alpha"]);
+        if variant_ran {
+            fixture.run(&["service", "start", "Alpha"]);
+            fixture.run(&["__daemon", "run", "--once", "--json"]);
+        }
+
+        fixture.create_and_start("alpha", "alpha-second");
+        fixture.run(&["__daemon", "run", "--once", "--json"]);
+        let content = fixture.service_output("alpha");
+        assert_eq!(
+            content.matches("service-out alpha\n").count(),
+            1,
+            "{variant_ran}: {content}"
+        );
+        assert!(!content.contains("service-out Alpha\n"), "{content}");
+        for path in fixture.status_log_paths("alpha") {
+            let file = fs::read_to_string(&path).unwrap();
+            assert!(!file.contains(" Alpha\n"), "{variant_ran}: {file}");
+        }
+        if variant_ran {
+            let content = fixture.service_output("Alpha");
+            assert!(content.contains("service-out Alpha\n"), "{content}");
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_takeover_of_a_leftover_service_log_keeps_the_variants_output() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = ServiceLogFixture::new("logs-case-variant-failed-takeover");
+    fixture.create_and_start("alpha", "alpha-first");
+    fixture.run(&["__daemon", "run", "--once", "--json"]);
+    let upper_root = path_string(&fixture.root.child("alpha-upper"));
+    fixture.run(&[
+        "env",
+        "create",
+        "Alpha",
+        "--launcher",
+        "gw",
+        "--root",
+        &upper_root,
+    ]);
+    fixture.run(&["service", "stop", "alpha"]);
+    fixture.run(&["env", "remove", "alpha"]);
+
+    // Alpha starts while the leftover's directory entry cannot be renamed.
+    let logs_dir = fixture.root.child("ocm-home/supervisor/logs");
+    fixture.run(&["service", "start", "Alpha"]);
+    fs::set_permissions(&logs_dir, fs::Permissions::from_mode(0o555)).unwrap();
+    let _ = run_ocm(
+        &fixture.cwd,
+        &fixture.env,
+        &["__daemon", "run", "--once", "--json"],
+    );
+    fs::set_permissions(&logs_dir, fs::Permissions::from_mode(0o755)).unwrap();
+    let before = fixture.service_output("Alpha");
+
+    // Registering alpha again must not delete output Alpha already wrote.
+    fixture.create_and_start("alpha", "alpha-second");
+    let after = fixture.service_output("Alpha");
+    assert_eq!(
+        after.matches("service-out Alpha\n").count(),
+        before.matches("service-out Alpha\n").count(),
+        "before: {before}\nafter: {after}"
+    );
+    fixture.run(&["__daemon", "run", "--once", "--json"]);
+    let content = fixture.service_output("alpha");
+    assert_eq!(
+        content.matches("service-out alpha\n").count(),
+        1,
+        "{content}"
+    );
+    assert!(!content.contains("service-out Alpha\n"), "{content}");
+}
+
+#[cfg(unix)]
+#[test]
+fn reusing_a_name_keeps_the_file_an_older_daemons_running_child_writes() {
+    let fixture = ServiceLogFixture::new("logs-case-variant-running-child");
+    let case_insensitive = fixture.case_insensitive();
+    for (name, root) in [("alpha", "lower-root"), ("Alpha", "upper-root")] {
+        let root = path_string(&fixture.root.child(root));
+        fixture.run(&["env", "create", name, "--launcher", "gw", "--root", &root]);
+    }
+    // An older OCM let both names write Alpha's files, and its daemon still
+    // runs alpha, recorded under alpha's name-keyed paths.
+    let logs_dir = fixture.root.child("ocm-home/supervisor/logs");
+    fs::create_dir_all(&logs_dir).unwrap();
+    for stream in ["out", "err"] {
+        fs::write(
+            logs_dir.join(format!("Alpha.std{stream}.log")),
+            format!("service-{stream} Alpha\nservice-{stream} alpha\n"),
+        )
+        .unwrap();
+    }
+    let runtime = serde_json::json!({
+        "kind": "ocm-supervisor-runtime",
+        "ocmHome": path_string(&fixture.root.child("ocm-home")),
+        "updatedAt": "2026-10-30T00:00:00Z",
+        "services": [],
+        "children": [{
+            "envName": "alpha",
+            "bindingKind": "launcher",
+            "bindingName": "gw",
+            "pid": std::process::id(),
+            "restartCount": 0,
+            "childPort": 18789,
+            "stdoutPath": path_string(&logs_dir.join("alpha.stdout.log")),
+            "stderrPath": path_string(&logs_dir.join("alpha.stderr.log")),
+        }],
+    });
+    fs::write(
+        fixture.root.child("ocm-home/supervisor/runtime.json"),
+        runtime.to_string(),
+    )
+    .unwrap();
+
+    fixture.run(&["env", "remove", "Alpha"]);
+    let again = path_string(&fixture.root.child("upper-again"));
+    fixture.run(&[
+        "env",
+        "create",
+        "Alpha",
+        "--launcher",
+        "gw",
+        "--root",
+        &again,
+    ]);
+    if case_insensitive {
+        for stream in ["out", "err"] {
+            let shared = fs::read_to_string(logs_dir.join(format!("alpha.std{stream}.log")))
+                .expect("the running child's file was deleted");
+            assert!(
+                shared.contains(&format!("service-{stream} alpha\n")),
+                "{shared}"
+            );
+        }
+    }
+    assert!(!fixture.service_output("Alpha").contains("service-"));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_pending_follower_attaches_to_a_leftover_its_env_takes_over() {
+    let fixture = ServiceLogFixture::new("logs-follow-case-variant-takeover");
+    fixture.create_and_start("Alpha", "upper-root");
+    fixture.run(&["__daemon", "run", "--once", "--json"]);
+    fixture.run(&["service", "stop", "Alpha"]);
+    let lower_root = path_string(&fixture.root.child("lower-root"));
+    fixture.run(&[
+        "env",
+        "create",
+        "alpha",
+        "--launcher",
+        "gw",
+        "--root",
+        &lower_root,
+    ]);
+
+    let (mut child, receiver) = spawn_follow(
+        &fixture.cwd,
+        &fixture.env,
+        &["logs", "alpha", "--stream", "info", "--follow", "--raw"],
+    );
+    // Let the follower start and poll while alpha has no service output.
+    thread::sleep(Duration::from_millis(600));
+    fixture.run(&["env", "remove", "Alpha"]);
+    fixture.run(&["service", "start", "alpha"]);
+    fixture.run(&["__daemon", "run", "--once", "--json"]);
+    receive_line_containing(&receiver, "service-out alpha");
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 #[test]
 fn env_create_fails_when_an_earlier_service_log_cannot_be_deleted() {
     let root = TestDir::new("logs-create-undeletable");
