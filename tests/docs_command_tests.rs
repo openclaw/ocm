@@ -120,7 +120,10 @@ fn is_word(token: &str) -> bool {
 }
 
 /// Checks that `ocm <tokens>` names a command the CLI accepts. Tokens after
-/// the command path (names, flags, placeholders) are not examined.
+/// the command path (names, flags, placeholders) are not examined. A command
+/// that takes an environment name where a subcommand could stand, such as
+/// `ocm dev <env>` or `ocm upgrade <env>`, cannot be told from a misspelled
+/// subcommand by its words alone, so only its listed groups are checked.
 fn check_command(help: &mut Help, tokens: &[String]) -> Result<(), String> {
     let mut index = 0;
     while tokens.get(index).map(String::as_str) == Some("--color") {
