@@ -2108,7 +2108,7 @@ fn environment_cleanup_preserves_bindings_when_metadata_cannot_be_read() {
     let env = ocm_env(&root);
     let service = EnvironmentService::new(&env, &cwd);
     let binary = cwd.join("runtime");
-    fs::write(&binary, "fixture").unwrap();
+    write_executable_script(&binary, "fixture");
 
     for kind in ["runtime", "launcher"] {
         let metadata = if kind == "runtime" {
