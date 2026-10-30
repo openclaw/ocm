@@ -91,7 +91,8 @@ fn env_set_runtime_updates_and_clears_the_default_runtime() {
 
     let clear = run_ocm(&cwd, &env, &["env", "set-runtime", "demo", "none"]);
     assert!(clear.status.success(), "{}", stderr(&clear));
-    assert!(stdout(&clear).contains("Updated env demo: defaultRuntime=none"));
+    assert!(stdout(&clear).contains("Updated env demo: defaultRuntime cleared"));
+    assert!(!stdout(&clear).contains("defaultRuntime=none"));
 
     let show_cleared = run_ocm(&cwd, &env, &["env", "show", "demo"]);
     assert!(show_cleared.status.success(), "{}", stderr(&show_cleared));

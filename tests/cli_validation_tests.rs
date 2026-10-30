@@ -4,7 +4,9 @@ use std::fs;
 
 use ocm::store::ensure_store;
 
-use crate::support::{TestDir, TestHttpServer, ocm_env, run_ocm, stderr, stdout};
+use crate::support::{
+    TestDir, TestHttpServer, ocm_env, run_ocm, stderr, stdout, write_executable_script,
+};
 
 #[test]
 fn env_create_rejects_invalid_names() {
@@ -66,6 +68,161 @@ fn runtime_install_rejects_invalid_names() {
     );
     assert_eq!(install.status.code(), Some(1));
     assert!(stderr(&install).contains("Runtime name must use letters, numbers, '.', '_', or '-'"));
+}
+
+#[test]
+fn runtime_and_launcher_registration_reserve_the_clear_keyword() {
+    let root = TestDir::new("cli-reserved-binding-name");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    write_executable_script(&cwd.join("openclaw"), "#!/bin/sh\nprintf '2026.8.1\\n'\n");
+    let env = ocm_env(&root);
+
+    for name in ["none", "None", "NONE"] {
+        // URL and manifest sources are unreachable and the build-local repo is
+        // missing, so the reserved-name error proves the refusal comes first.
+        for args in [
+            vec!["runtime", "add", name, "--path", "./openclaw"],
+            vec!["runtime", "install", name, "--path", "./openclaw"],
+            vec![
+                "runtime",
+                "install",
+                name,
+                "--url",
+                "http://127.0.0.1:9/openclaw",
+            ],
+            vec![
+                "runtime",
+                "install",
+                name,
+                "--manifest-url",
+                "http://127.0.0.1:9/releases.json",
+                "--version",
+                "2026.8.1",
+            ],
+            vec![
+                "runtime",
+                "build-local",
+                name,
+                "--repo",
+                "./missing-checkout",
+            ],
+        ] {
+            let refused = run_ocm(&cwd, &env, &args);
+            assert_eq!(refused.status.code(), Some(1), "{args:?}");
+            assert!(
+                stderr(&refused).contains(&format!("Runtime name \"{name}\" is reserved")),
+                "{args:?}: {}",
+                stderr(&refused)
+            );
+        }
+        let refused = run_ocm(
+            &cwd,
+            &env,
+            &["launcher", "add", name, "--command", "./openclaw"],
+        );
+        assert_eq!(refused.status.code(), Some(1));
+        assert!(
+            stderr(&refused).contains(&format!("Launcher name \"{name}\" is reserved")),
+            "{}",
+            stderr(&refused)
+        );
+    }
+    let runtimes = run_ocm(&cwd, &env, &["runtime", "list", "--json"]);
+    assert!(runtimes.status.success(), "{}", stderr(&runtimes));
+    assert_eq!(stdout(&runtimes).trim(), "[]");
+    let launchers = run_ocm(&cwd, &env, &["launcher", "list", "--json"]);
+    assert!(launchers.status.success(), "{}", stderr(&launchers));
+    assert_eq!(stdout(&launchers).trim(), "[]");
+
+    // Names that only contain the keyword stay ordinary, and `none` still clears.
+    for args in [
+        vec!["runtime", "add", "nonee", "--path", "./openclaw"],
+        vec!["runtime", "install", "none.local", "--path", "./openclaw"],
+        vec!["launcher", "add", "lnone", "--command", "./openclaw"],
+        vec!["env", "create", "demo", "--runtime", "nonee"],
+    ] {
+        let added = run_ocm(&cwd, &env, &args);
+        assert!(added.status.success(), "{args:?}: {}", stderr(&added));
+    }
+    let bind = run_ocm(&cwd, &env, &["env", "set-launcher", "demo", "lnone"]);
+    assert!(bind.status.success(), "{}", stderr(&bind));
+    assert!(stdout(&bind).contains("Updated env demo: defaultLauncher=lnone"));
+    let clear = run_ocm(&cwd, &env, &["env", "set-launcher", "demo", "None"]);
+    assert!(clear.status.success(), "{}", stderr(&clear));
+    assert!(stdout(&clear).contains("Updated env demo: defaultLauncher cleared"));
+    let show = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
+    assert!(show.status.success(), "{}", stderr(&show));
+    let show: serde_json::Value = serde_json::from_str(&stdout(&show)).unwrap();
+    assert!(show["defaultLauncher"].is_null());
+    assert!(show["defaultRuntime"].is_null());
+}
+
+#[test]
+fn existing_reserved_name_runtime_can_still_be_replaced_and_removed() {
+    let root = TestDir::new("cli-reserved-binding-name-existing");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    write_executable_script(&cwd.join("openclaw"), "#!/bin/sh\nprintf '2026.8.1\\n'\n");
+    let env = ocm_env(&root);
+
+    // A registry written before the name was reserved can hold `none`.
+    let add = run_ocm(
+        &cwd,
+        &env,
+        &["runtime", "add", "legacy", "--path", "./openclaw"],
+    );
+    assert!(add.status.success(), "{}", stderr(&add));
+    let legacy_path = ocm::store::runtime_meta_path("legacy", &env, &cwd).unwrap();
+    let mut legacy: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&legacy_path).unwrap()).unwrap();
+    legacy["name"] = serde_json::Value::from("none");
+    fs::write(
+        ocm::store::runtime_meta_path("none", &env, &cwd).unwrap(),
+        serde_json::to_string_pretty(&legacy).unwrap(),
+    )
+    .unwrap();
+    fs::remove_file(&legacy_path).unwrap();
+
+    let replace = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "runtime",
+            "install",
+            "none",
+            "--path",
+            "./openclaw",
+            "--force",
+        ],
+    );
+    assert!(replace.status.success(), "{}", stderr(&replace));
+    let show = run_ocm(&cwd, &env, &["runtime", "show", "none", "--json"]);
+    assert!(show.status.success(), "{}", stderr(&show));
+    assert!(stdout(&show).contains("\"sourceKind\": \"installed\""));
+
+    let remove = run_ocm(&cwd, &env, &["runtime", "remove", "none"]);
+    assert!(remove.status.success(), "{}", stderr(&remove));
+
+    // Once it is gone, `none` is a new registration again and is refused.
+    let reinstall = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "runtime",
+            "install",
+            "none",
+            "--path",
+            "./openclaw",
+            "--force",
+        ],
+    );
+    assert_eq!(reinstall.status.code(), Some(1));
+    assert!(
+        stderr(&reinstall).contains("Runtime name \"none\" is reserved"),
+        "{}",
+        stderr(&reinstall)
+    );
 }
 
 #[test]

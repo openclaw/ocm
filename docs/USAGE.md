@@ -541,6 +541,10 @@ Plain executable recipes still run directly under the supervisor.
   source-checkout extensions omitted from the release package
 - day-to-day work: use `env`
 
+Runtime and launcher names use letters, numbers, `.`, `_` and `-`. The name
+`none`, in any letter case, is reserved: `ocm env set-runtime <env> none` and
+`ocm env set-launcher <env> none` clear the binding and report it as cleared.
+
 ## Running commands inside environments
 
 ### Activate the environment

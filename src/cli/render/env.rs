@@ -1389,8 +1389,9 @@ mod tests {
 
     use super::{
         RenderProfile, env_cleanup, env_cleanup_batch, env_destroy_preview, env_destroyed,
-        env_doctor, env_list, env_prune_preview, env_pruned, env_resolved, env_show,
-        env_snapshot_list_with_width, env_snapshot_prune_preview, env_snapshot_show, env_status,
+        env_doctor, env_launcher_updated, env_list, env_prune_preview, env_pruned, env_resolved,
+        env_runtime_updated, env_show, env_snapshot_list_with_width, env_snapshot_prune_preview,
+        env_snapshot_show, env_status,
     };
     use crate::cli::env::{BlockedPruneSummary, EnvDestroyStepSummary, EnvDestroySummary};
     use crate::env::{
@@ -1420,6 +1421,48 @@ mod tests {
             issues_before: Vec::new(),
             issues_after: apply.then(Vec::new),
         }
+    }
+
+    #[test]
+    fn binding_updates_report_a_clear_differently_from_a_bind() {
+        assert_eq!(
+            env_runtime_updated("demo", Some("stable"), RenderProfile::raw()),
+            vec!["Updated env demo: defaultRuntime=stable"]
+        );
+        assert_eq!(
+            env_runtime_updated("demo", None, RenderProfile::raw()),
+            vec!["Updated env demo: defaultRuntime cleared"]
+        );
+        assert_eq!(
+            env_launcher_updated("demo", None, RenderProfile::raw()),
+            vec!["Updated env demo: defaultLauncher cleared"]
+        );
+        let bound = env_launcher_updated("demo", Some("dev"), RenderProfile::pretty(false));
+        assert!(
+            bound
+                .iter()
+                .any(|line| line.contains("Launcher") && line.contains("dev"))
+        );
+        // A clear never matches the bind of an entry named like the clear wording.
+        assert_ne!(
+            env_runtime_updated("demo", None, RenderProfile::raw()),
+            env_runtime_updated("demo", Some("cleared"), RenderProfile::raw())
+        );
+        let cleared = env_runtime_updated("demo", None, RenderProfile::pretty(false));
+        assert_ne!(
+            cleared,
+            env_runtime_updated("demo", Some("cleared"), RenderProfile::pretty(false))
+        );
+        assert!(
+            cleared
+                .iter()
+                .any(|line| line.contains("Runtime") && line.contains("(cleared)")),
+            "{cleared:?}"
+        );
+        assert!(
+            !cleared.iter().any(|line| line.contains("none")),
+            "{cleared:?}"
+        );
     }
 
     #[test]
@@ -3106,33 +3149,36 @@ fn env_resolved_raw(summary: &ExecutionSummary) -> Vec<String> {
     lines
 }
 
-pub fn env_runtime_updated(name: &str, runtime_name: &str, profile: RenderProfile) -> Vec<String> {
-    if !profile.pretty {
-        return vec![format!("Updated env {name}: defaultRuntime={runtime_name}")];
-    }
-
-    let mut lines = vec![paint("Environment updated", Tone::Strong, profile.color)];
-    push_card(
-        &mut lines,
-        "Binding",
-        vec![
-            KeyValueRow::accent("Env", name),
-            KeyValueRow::accent("Runtime", runtime_name),
-        ],
-        profile.color,
-    );
-    lines
+pub fn env_runtime_updated(
+    name: &str,
+    runtime_name: Option<&str>,
+    profile: RenderProfile,
+) -> Vec<String> {
+    env_binding_updated(name, "Runtime", "defaultRuntime", runtime_name, profile)
 }
 
 pub fn env_launcher_updated(
     name: &str,
-    launcher_name: &str,
+    launcher_name: Option<&str>,
+    profile: RenderProfile,
+) -> Vec<String> {
+    env_binding_updated(name, "Launcher", "defaultLauncher", launcher_name, profile)
+}
+
+/// A cleared binding reads differently from a bind, so it is never mistaken
+/// for an entry named like the clear keyword.
+fn env_binding_updated(
+    name: &str,
+    label: &str,
+    field: &str,
+    bound: Option<&str>,
     profile: RenderProfile,
 ) -> Vec<String> {
     if !profile.pretty {
-        return vec![format!(
-            "Updated env {name}: defaultLauncher={launcher_name}"
-        )];
+        return vec![match bound {
+            Some(bound) => format!("Updated env {name}: {field}={bound}"),
+            None => format!("Updated env {name}: {field} cleared"),
+        }];
     }
 
     let mut lines = vec![paint("Environment updated", Tone::Strong, profile.color)];
@@ -3141,7 +3187,11 @@ pub fn env_launcher_updated(
         "Binding",
         vec![
             KeyValueRow::accent("Env", name),
-            KeyValueRow::accent("Launcher", launcher_name),
+            match bound {
+                Some(bound) => KeyValueRow::accent(label, bound),
+                // Parentheses never appear in a registered name.
+                None => KeyValueRow::muted(label, "(cleared)"),
+            },
         ],
         profile.color,
     );

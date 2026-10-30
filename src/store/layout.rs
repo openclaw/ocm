@@ -179,6 +179,19 @@ pub fn validate_name(name: &str, label: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
+/// Validates a new runtime or launcher name. `env set-runtime` and
+/// `env set-launcher` read `none` in any letter case as "clear the binding",
+/// so an entry with that name could not be bound by name.
+pub(crate) fn validate_registration_name(name: &str, label: &str) -> Result<String, String> {
+    let name = validate_name(name, label)?;
+    if name.eq_ignore_ascii_case("none") {
+        return Err(format!(
+            "{label} \"{name}\" is reserved; `none` clears a binding in env set-runtime and env set-launcher"
+        ));
+    }
+    Ok(name)
+}
+
 pub fn derive_env_paths(root: impl AsRef<Path>) -> EnvPaths {
     let clean_root = clean_path(root.as_ref());
     let state_dir = clean_root.join(".openclaw");
