@@ -74,7 +74,7 @@ struct PlannedCleanupAction {
 impl<'a> EnvironmentService<'a> {
     pub fn cleanup_preview(&self, name: &str) -> Result<EnvCleanupSummary, String> {
         let env = self.get(name)?;
-        let config_audit = audit_openclaw_config(&env, &self.list()?);
+        let config_audit = audit_openclaw_config(&env, &self.list()?, self.env);
         let state_audit = audit_openclaw_state(&env, &self.list()?, self.env);
         if let Some(error) = &state_audit.cleanup_error {
             return Err(error.clone());
@@ -95,7 +95,7 @@ impl<'a> EnvironmentService<'a> {
     pub fn cleanup(&self, name: &str) -> Result<EnvCleanupSummary, String> {
         let _operation_lock = self.lock_operation(name)?;
         let mut env = self.get(name)?;
-        let config_audit = audit_openclaw_config(&env, &self.list()?);
+        let config_audit = audit_openclaw_config(&env, &self.list()?, self.env);
         let state_audit = audit_openclaw_state(&env, &self.list()?, self.env);
         if let Some(error) = &state_audit.cleanup_error {
             return Err(error.clone());
@@ -184,7 +184,7 @@ impl<'a> EnvironmentService<'a> {
             .iter()
             .any(|action| action.kind == "repair-openclaw-config")
         {
-            prepare_openclaw_config_repair(env, &known_envs)?
+            prepare_openclaw_config_repair(env, &known_envs, self.env)?
         } else {
             None
         };
@@ -242,7 +242,7 @@ impl<'a> EnvironmentService<'a> {
             "missing".to_string()
         };
 
-        let config_audit = audit_openclaw_config(&env, &known_envs);
+        let config_audit = audit_openclaw_config(&env, &known_envs, self.env);
         for issue in &config_audit.issues {
             push_issue(&mut issues, issue.clone());
         }
@@ -470,7 +470,7 @@ fn cleanup_actions(
     }
 
     if doctor.config_status == "drifted"
-        && (config_audit.repair_source_root.is_some()
+        && (config_audit.repair_root_rewrite.is_some()
             || config_audit.repair_workspace
             || config_audit.repair_gateway_port)
     {
