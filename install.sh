@@ -68,6 +68,8 @@ download_url_for() {
 }
 
 version="latest"
+prefix=""
+prefix_given="false"
 bin_dir=""
 force="false"
 
@@ -82,6 +84,7 @@ while [[ $# -gt 0 ]]; do
       shift
       [[ $# -gt 0 ]] || { echo "error: --prefix requires a value" >&2; exit 1; }
       prefix="$1"
+      prefix_given="true"
       ;;
     --bin-dir)
       shift
@@ -116,7 +119,7 @@ if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1
 fi
 
 if [[ -z "$bin_dir" ]]; then
-  if [[ -z "${prefix+x}" ]]; then
+  if [[ "$prefix_given" != "true" ]]; then
     if [[ -z "${HOME+x}" ]]; then
       echo "error: HOME is not set; pass --prefix or --bin-dir to choose where to install ocm" >&2
       exit 1

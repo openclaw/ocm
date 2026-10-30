@@ -496,3 +496,36 @@ fn installer_with_home_still_defaults_to_its_local_prefix() {
         STANDALONE_BINARY
     );
 }
+
+#[test]
+fn installer_ignores_an_inherited_prefix_variable() {
+    let root = TestDir::new("install-inherited-prefix");
+    let (fake_bin, archive) = standalone_release(&root);
+    let home = root.child("home");
+    let inherited = root.child("inherited");
+    let output = installer_command(&root, &fake_bin, &archive)
+        .env("HOME", &home)
+        .env("prefix", &inherited)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        fs::read(home.join(".local/bin/ocm")).unwrap(),
+        STANDALONE_BINARY
+    );
+    assert!(!inherited.exists());
+
+    let output = installer_command(&root, &fake_bin, &archive)
+        .env("prefix", &inherited)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("HOME is not set; pass --prefix or --bin-dir"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!inherited.exists());
+}
