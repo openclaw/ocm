@@ -109,21 +109,39 @@ struct EnvDestroyState<'a> {
 
 /// Tells whether forwarded `onboard` or `setup` arguments run onboarding, the
 /// only case where OCM clears the `skipBootstrap` its older releases wrote.
-/// Help, version and `--dry-run` queries, an explicit `--skip-bootstrap`, and
-/// `setup --baseline`, which OpenClaw runs without onboarding and which keeps a
-/// persisted `skipBootstrap`, leave the config alone.
+/// These leave the config alone: help, version and `--dry-run` queries; an
+/// explicit `--skip-bootstrap`; `onboard recommendations`; `setup --baseline`,
+/// which keeps a persisted `skipBootstrap`; and a `setup` request to the
+/// system agent (`-m`/`--message` or `--yes` without onboarding options).
 fn should_clear_skip_bootstrap_for_openclaw_args(args: &[String]) -> bool {
-    let Some(command @ ("onboard" | "setup")) = openclaw_command_words(args).next() else {
+    let mut words = openclaw_command_words(args);
+    let Some(command @ ("onboard" | "setup")) = words.next() else {
         return false;
     };
-    if args.iter().any(|arg| arg == "--skip-bootstrap") {
+    if args.iter().any(|arg| arg == "--skip-bootstrap")
+        || (command == "onboard" && words.next() == Some("recommendations"))
+    {
         return false;
     }
 
-    !openclaw_options(args).any(|option| {
-        matches!(option, "-h" | "--help" | "-V" | "--version" | "--dry-run")
+    let mut system_agent_request = false;
+    let mut onboarding_option = false;
+    for option in openclaw_options(args) {
+        if matches!(option, "-h" | "--help" | "-V" | "--version" | "--dry-run")
             || (command == "setup" && option == "--baseline")
-    })
+        {
+            return false;
+        }
+        if option.starts_with("-m")
+            || option == "--yes"
+            || option.split('=').next() == Some("--message")
+        {
+            system_agent_request = true;
+        } else if option != "--json" {
+            onboarding_option = true;
+        }
+    }
+    !(command == "setup" && system_agent_request && !onboarding_option)
 }
 
 impl Cli {
@@ -2292,7 +2310,7 @@ mod tests {
 
     #[test]
     fn skip_bootstrap_clears_only_for_onboarding_runs() {
-        let cases: [(&[&str], bool); 11] = [
+        let cases: [(&[&str], bool); 21] = [
             (&["onboard"], true),
             (&["--log-level", "debug", "setup", "--workspace", "w"], true),
             (&["--no-color", "onboard", "--flow", "quickstart"], true),
@@ -2304,6 +2322,19 @@ mod tests {
             (&["setup", "--dry-run"], false),
             (&["--no-color", "setup", "--baseline"], false),
             (&["status", "--help"], false),
+            (&["--log-level", "--help", "onboard"], false),
+            (&["--profile", "work", "onboard"], true),
+            (&["onboard", "--", "--help"], true),
+            (&["onboard", "recommendations"], false),
+            (
+                &["--no-color", "onboard", "recommendations", "acknowledge"],
+                false,
+            ),
+            (&["setup", "-m", "status"], false),
+            (&["setup", "--message=status", "--yes", "--json"], false),
+            (&["--log-level", "debug", "setup", "--yes"], false),
+            (&["setup", "-m", "status", "--wizard"], true),
+            (&["setup", "--json"], true),
         ];
         for (forwarded, expected) in cases {
             let forwarded: Vec<String> = forwarded.iter().map(|arg| arg.to_string()).collect();

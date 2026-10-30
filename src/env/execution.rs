@@ -297,9 +297,11 @@ fn openclaw_command_path(args: &[String]) -> impl Iterator<Item = (&str, bool)> 
 
 const OPENCLAW_ROOT_OPTIONS_WITH_VALUE: [&str; 3] = ["--profile", "--log-level", "--container"];
 
-/// Yields the options OpenClaw reads in forwarded arguments, such as `--help`:
-/// every flag before the first `--`, without the values of root options that
-/// take one.
+/// Yields the flags before the first `--` in forwarded arguments, such as
+/// `--help` or `--yes`, leaving out OpenClaw's root options (`--no-color`,
+/// `--log-level debug`) and their values. As in OpenClaw's help detection, a
+/// root option takes the next token as its value only when that token does not
+/// look like a flag.
 pub(crate) fn openclaw_options(args: &[String]) -> impl Iterator<Item = &str> {
     let mut index = 0;
     std::iter::from_fn(move || {
@@ -310,10 +312,17 @@ pub(crate) fn openclaw_options(args: &[String]) -> impl Iterator<Item = &str> {
                 return None;
             }
             if OPENCLAW_ROOT_OPTIONS_WITH_VALUE.contains(&arg) {
-                index = (index + 1).min(args.len());
-                return Some(arg);
+                if args.get(index).is_some_and(|value| !value.starts_with('-')) {
+                    index += 1;
+                }
+                continue;
             }
-            if arg.starts_with('-') {
+            let is_root_option = matches!(arg, "--dev" | "--no-color")
+                || OPENCLAW_ROOT_OPTIONS_WITH_VALUE.iter().any(|option| {
+                    arg.strip_prefix(option)
+                        .is_some_and(|rest| rest.starts_with('='))
+                });
+            if arg.starts_with('-') && !is_root_option {
                 return Some(arg);
             }
         }
