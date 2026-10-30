@@ -6304,6 +6304,124 @@ fn daemon_keeps_running_when_one_env_fails_to_spawn() {
     stop_process(&mut daemon);
 }
 
+#[cfg(unix)]
+#[test]
+fn daemon_names_a_launcher_working_directory_removed_after_install() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("daemon-launcher-cwd-removed");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    install_fake_systemd_tools(&root, &mut env);
+    let runtime_path = root.child("ocm-home/supervisor/runtime.json");
+    let checkout = root.child("checkout");
+    let moved = root.child("checkout-moved");
+    fs::create_dir_all(&checkout).unwrap();
+    let started = root.child("started.txt");
+    let script = root.child("bin/openclaw");
+    write_legacy_openclaw_script(
+        &script,
+        &format!(
+            "#!/bin/sh\nprintf 'started\\n' >> '{}'\nwhile :; do sleep 1; done\n",
+            path_string(&started),
+        ),
+    );
+
+    let launcher = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "launcher",
+            "add",
+            "dev",
+            "--command",
+            &path_string(&script),
+            "--cwd",
+            &path_string(&checkout),
+        ],
+    );
+    assert!(launcher.status.success(), "{}", stderr(&launcher));
+    let created = run_ocm(&cwd, &env, &["env", "create", "demo", "--launcher", "dev"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    let show = run_ocm(&cwd, &env, &["launcher", "show", "dev", "--json"]);
+    assert!(show.status.success(), "{}", stderr(&show));
+    let recorded = serde_json::from_slice::<Value>(&show.stdout).unwrap()["cwd"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let installed = run_ocm(&cwd, &env, &["service", "install", "demo"]);
+    assert!(installed.status.success(), "{}", stderr(&installed));
+
+    let mut daemon = spawn_daemon_process(&cwd, &env);
+    let started_service = run_ocm(&cwd, &env, &["service", "start", "demo"]);
+    assert!(
+        started_service.status.success(),
+        "{}",
+        stderr(&started_service)
+    );
+    let runtime = wait_for_runtime_children(&runtime_path, 1, Some("demo"), Duration::from_secs(5))
+        .expect("daemon did not start the launcher gateway");
+    let pid = runtime_child_pid(&runtime, "demo").unwrap();
+    assert!(wait_for_file_value(
+        &started,
+        "started",
+        Duration::from_secs(5)
+    ));
+
+    // The checkout moves while its Gateway runs; the Gateway then exits.
+    fs::rename(&checkout, &moved).unwrap();
+    let killed = Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+
+    let expected = format!("launcher \"dev\" working directory does not exist: {recorded}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut recorded_error = Value::Null;
+    while Instant::now() < deadline {
+        if let Ok(raw) = fs::read(&runtime_path)
+            && let Ok(body) = serde_json::from_slice::<Value>(&raw)
+            && let Some(service) = body["services"]
+                .as_array()
+                .and_then(|services| services.iter().find(|service| service["envName"] == "demo"))
+        {
+            recorded_error = service["lastError"].clone();
+            if recorded_error
+                .as_str()
+                .is_some_and(|error| error.contains("failed starting"))
+            {
+                break;
+            }
+        }
+        sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        recorded_error.as_str(),
+        Some(format!("failed starting env \"demo\": {expected}").as_str())
+    );
+
+    let status = run_ocm(&cwd, &env, &["service", "status", "demo", "--json"]);
+    assert!(status.status.success(), "{}", stderr(&status));
+    let body: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(body["gatewayState"], "backoff");
+    let issue = body["issue"].as_str().unwrap();
+    assert!(issue.contains(&expected), "{issue}");
+    assert!(!issue.contains("os error"), "{issue}");
+
+    // The service keeps retrying and recovers once the directory is back.
+    fs::rename(&moved, &checkout).unwrap();
+    wait_for_runtime_service_state(&runtime_path, "demo", "running", Duration::from_secs(15))
+        .expect("daemon did not recover after the working directory returned");
+    assert!(wait_for_file_value(
+        &started,
+        "started\nstarted",
+        Duration::from_secs(5)
+    ));
+
+    stop_process(&mut daemon);
+}
+
 #[test]
 fn daemon_stops_a_running_child_after_service_stop() {
     let _guard = daemon_runtime_test_lock();
