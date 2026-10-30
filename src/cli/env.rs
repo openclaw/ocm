@@ -113,14 +113,20 @@ struct EnvDestroyState<'a> {
 /// explicit `--skip-bootstrap`; `onboard recommendations`; `setup --baseline`,
 /// which keeps a persisted `skipBootstrap`; and a `setup` request to the
 /// system agent (`-m`/`--message` or `--yes` without onboarding options).
+/// A bare `setup` still clears: OpenClaw then chooses between onboarding and
+/// the system agent from the config and terminal, which the arguments do not
+/// show.
 fn should_clear_skip_bootstrap_for_openclaw_args(args: &[String]) -> bool {
-    let mut words = openclaw_command_words(args);
-    let Some(command @ ("onboard" | "setup")) = words.next() else {
+    let Some(command @ ("onboard" | "setup")) = openclaw_command_words(args).next() else {
         return false;
     };
-    if args.iter().any(|arg| arg == "--skip-bootstrap")
-        || (command == "onboard" && words.next() == Some("recommendations"))
-    {
+    // Only `onboard recommendations` names the subcommand: after an option, the
+    // word can be that option's value, as in `onboard --workspace recommendations`.
+    let recommendations = command == "onboard"
+        && args
+            .windows(2)
+            .any(|pair| pair[0] == "onboard" && pair[1] == "recommendations");
+    if recommendations || args.iter().any(|arg| arg == "--skip-bootstrap") {
         return false;
     }
 
@@ -134,7 +140,8 @@ fn should_clear_skip_bootstrap_for_openclaw_args(args: &[String]) -> bool {
         }
         if option.starts_with("-m")
             || option == "--yes"
-            || option.split('=').next() == Some("--message")
+            || option == "--message"
+            || option.starts_with("--message=")
         {
             system_agent_request = true;
         } else if option != "--json" {
@@ -2310,7 +2317,7 @@ mod tests {
 
     #[test]
     fn skip_bootstrap_clears_only_for_onboarding_runs() {
-        let cases: [(&[&str], bool); 21] = [
+        let cases: [(&[&str], bool); 23] = [
             (&["onboard"], true),
             (&["--log-level", "debug", "setup", "--workspace", "w"], true),
             (&["--no-color", "onboard", "--flow", "quickstart"], true),
@@ -2335,6 +2342,8 @@ mod tests {
             (&["--log-level", "debug", "setup", "--yes"], false),
             (&["setup", "-m", "status", "--wizard"], true),
             (&["setup", "--json"], true),
+            (&["setup", "-mstatus"], false),
+            (&["onboard", "--workspace", "recommendations"], true),
         ];
         for (forwarded, expected) in cases {
             let forwarded: Vec<String> = forwarded.iter().map(|arg| arg.to_string()).collect();
