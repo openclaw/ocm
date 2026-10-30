@@ -37,9 +37,9 @@ use crate::service::platform::{
     write_managed_service_definition,
 };
 use crate::store::{
-    display_path, ensure_dir, ensure_store, list_environments, lock_file, now_utc,
-    openclaw_port_family_available, openclaw_port_family_range, read_json, resolve_ocm_home,
-    supervisor_child_case_distinct_log_path, supervisor_child_log_destination,
+    adopt_supervisor_child_log_file, display_path, ensure_dir, ensure_store, list_environments,
+    lock_file, now_utc, openclaw_port_family_available, openclaw_port_family_range, read_json,
+    resolve_ocm_home, supervisor_child_case_distinct_log_path, supervisor_child_log_destination,
     supervisor_child_log_file, supervisor_child_log_path, supervisor_logs_dir,
     supervisor_runtime_path, supervisor_state_path, write_json,
 };
@@ -123,6 +123,16 @@ pub struct SupervisorChildSpec {
 impl SupervisorChildSpec {
     pub(crate) fn log_destination(&self, stream: &str) -> PathBuf {
         supervisor_child_log_file(
+            &self.saved_log_destination(stream),
+            &self.env_name,
+            stream,
+            registered_env(&self.process_env, Path::new(&self.run_dir)),
+        )
+    }
+
+    /// The file a newly spawned child writes; see `log_destination`.
+    fn spawn_log_destination(&self, stream: &str) -> PathBuf {
+        adopt_supervisor_child_log_file(
             &self.saved_log_destination(stream),
             &self.env_name,
             stream,
@@ -407,7 +417,9 @@ pub(crate) fn discard_child_logs<'n>(
         .into_iter()
         .map(str::to_string)
         .collect::<Vec<_>>();
-    let is_registered = |name: &str| registered.iter().any(|current| current == name);
+    // Judge ownership as it will be once this name is registered.
+    let is_registered =
+        |name: &str| name == env_name || registered.iter().any(|current| current == name);
     let daemon_logs_dir = if env_name.eq_ignore_ascii_case("daemon") {
         Some(SupervisorService::new(env, cwd).saved_daemon_logs_dir()?)
     } else {
@@ -2105,8 +2117,8 @@ fn spawn_supervisor_child(spec: &SupervisorChildSpec) -> Result<Child, String> {
             spec.env_name
         ));
     };
-    let stdout_path = spec.log_destination("stdout");
-    let stderr_path = spec.log_destination("stderr");
+    let stdout_path = spec.spawn_log_destination("stdout");
+    let stderr_path = spec.spawn_log_destination("stderr");
     let daemon_logs = if spec.env_name.eq_ignore_ascii_case("daemon") {
         SupervisorService::new(&spec.process_env, Path::new(&spec.run_dir)).daemon_log_paths()?
     } else {

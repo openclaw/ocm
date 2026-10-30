@@ -378,46 +378,80 @@ pub(crate) fn supervisor_child_log_file(
     stream: &str,
     is_registered: impl FnOnce(&str) -> bool,
 ) -> PathBuf {
+    resolve_child_log_file(path, env_name, stream, is_registered).0
+}
+
+/// The file a newly spawned child writes. A file left under a removed
+/// environment's spelling is renamed to this name's spelling first, so the
+/// file stays this environment's when that spelling is registered again.
+pub(crate) fn adopt_supervisor_child_log_file(
+    path: &Path,
+    env_name: &str,
+    stream: &str,
+    is_registered: impl FnOnce(&str) -> bool,
+) -> PathBuf {
+    let (file, leftover) = resolve_child_log_file(path, env_name, stream, is_registered);
+    if let Some(leftover) = leftover {
+        // A failed rename leaves the spelling as it was; output still goes to
+        // the same file.
+        let _ = fs::rename(leftover, &file);
+    }
+    file
+}
+
+/// The resolved file, and the entry it opens when that entry is spelled for a
+/// name that is not registered.
+fn resolve_child_log_file(
+    path: &Path,
+    env_name: &str,
+    stream: &str,
+    is_registered: impl FnOnce(&str) -> bool,
+) -> (PathBuf, Option<PathBuf>) {
+    let unchanged = || (path.to_path_buf(), None);
     let (Some(dir), Some(file_name)) = (path.parent(), path.file_name()) else {
-        return path.to_path_buf();
+        return unchanged();
     };
     let own_name = format!("{env_name}.{stream}.log");
     let Some(own) = file_name
         .to_str()
         .filter(|name| *name == own_name || name.strip_prefix('.') == Some(own_name.as_str()))
     else {
-        return path.to_path_buf();
+        return unchanged();
     };
     let separate = supervisor_child_case_distinct_log_path(dir, env_name, stream);
     if fs::symlink_metadata(&separate).is_ok() {
-        return separate;
+        return (separate, None);
     }
     if fs::symlink_metadata(path).is_err() {
-        return path.to_path_buf();
+        return unchanged();
     }
     // A listing that cannot be read completely proves nothing about the
     // spelling; keep the name-keyed file rather than hiding existing output.
     let Ok(entries) = fs::read_dir(dir).and_then(|entries| entries.collect::<Result<Vec<_>, _>>())
     else {
-        return path.to_path_buf();
+        return unchanged();
     };
     let names = entries
         .iter()
         .filter_map(|entry| entry.file_name().into_string().ok())
         .collect::<Vec<_>>();
     if names.iter().any(|name| name == own) {
-        return path.to_path_buf();
+        return unchanged();
     }
     let prefix = &own[..own.len() - own_name.len()];
     let suffix = format!(".{stream}.log");
-    let creator = names.iter().find_map(|name| {
-        name.eq_ignore_ascii_case(own)
-            .then(|| name.strip_prefix(prefix)?.strip_suffix(&suffix))
-            .flatten()
-    });
-    match creator {
-        Some(creator) if creator != env_name && is_registered(creator) => separate,
-        _ => path.to_path_buf(),
+    let Some((entry, creator)) = names.iter().find_map(|name| {
+        let creator = name.strip_prefix(prefix)?.strip_suffix(&suffix)?;
+        name.eq_ignore_ascii_case(own).then_some((name, creator))
+    }) else {
+        return unchanged();
+    };
+    if creator == env_name {
+        unchanged()
+    } else if is_registered(creator) {
+        (separate, None)
+    } else {
+        (path.to_path_buf(), Some(dir.join(entry)))
     }
 }
 

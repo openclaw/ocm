@@ -1902,7 +1902,9 @@ also keep separate service output. While the name whose output created
 the other name writes to its own
 `$OCM_HOME/supervisor/logs/case-distinct/<hash>.stdout.log` and `.stderr.log`,
 which `ocm logs` and `ocm service status` report for it. A file left by a
-removed environment does not move another name's output. When OCM is updated,
+removed environment does not move another name's output: the next environment
+that writes to it takes it over, and registering a name again deletes a
+leftover that no registered environment uses. When OCM is updated,
 a file that both names already shared stays with the name that created it and
 keeps their earlier mixed output, and a Gateway already running keeps writing
 where it started until it is next started. For daemon-named

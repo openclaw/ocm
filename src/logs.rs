@@ -53,10 +53,11 @@ struct LogSources {
     stream: String,
     gateway_path: PathBuf,
     service_path: PathBuf,
-    /// The registered name and the registered names that differ from it only
-    /// in case, which decide whose name-keyed service file this is.
+    /// The registered name and the store whose registrations decide whose
+    /// name-keyed service file this is.
     registered_name: String,
-    case_distinct_peers: Vec<String>,
+    store_env: BTreeMap<String, String>,
+    store_cwd: PathBuf,
     excluded_paths: Vec<PathBuf>,
     service_available: bool,
 }
@@ -78,7 +79,7 @@ impl LogSources {
             &self.service_path,
             &self.registered_name,
             &self.stream,
-            |name| self.case_distinct_peers.iter().any(|peer| peer == name),
+            crate::supervisor::registered_env(&self.store_env, &self.store_cwd),
         );
         let gateway_modified = modified_at(&self.gateway_path);
         let service_modified = if !self.service_available {
@@ -252,11 +253,6 @@ impl<'a> LogService<'a> {
         } else {
             Vec::new()
         };
-        let case_distinct_peers = crate::store::list_environments(self.env, self.cwd)?
-            .into_iter()
-            .map(|current| current.name)
-            .filter(|current| *current != meta.name && current.eq_ignore_ascii_case(&meta.name))
-            .collect();
 
         Ok(LogSources {
             env_name: name.to_string(),
@@ -264,7 +260,8 @@ impl<'a> LogService<'a> {
             gateway_path,
             service_path,
             registered_name: meta.name,
-            case_distinct_peers,
+            store_env: self.env.clone(),
+            store_cwd: self.cwd.to_path_buf(),
             excluded_paths,
             service_available,
         })
@@ -2548,6 +2545,23 @@ mod tests {
         assert!(cursor.snapshot(Some(50), false).unwrap().is_none());
 
         // On case-insensitive storage, Demo's file is what demo.stderr.log opens.
+        let store_env = test_store_env(&gateway_path);
+        crate::store::create_environment(
+            crate::env::CreateEnvironmentOptions {
+                name: "Demo".to_string(),
+                root: None,
+                gateway_port: Some(19789),
+                service_enabled: false,
+                service_running: false,
+                default_runtime: None,
+                default_launcher: None,
+                dev: None,
+                protected: false,
+            },
+            &store_env,
+            &root,
+        )
+        .unwrap();
         fs::write(root.join("Demo.stderr.log"), b"other env error\n").unwrap();
         assert!(cursor.snapshot(Some(50), false).unwrap().is_none());
 
@@ -2777,6 +2791,11 @@ mod tests {
         }
     }
 
+    fn test_store_env(gateway_path: &Path) -> BTreeMap<String, String> {
+        let home = gateway_path.parent().unwrap().join("ocm-home");
+        BTreeMap::from([("OCM_HOME".to_string(), crate::store::display_path(&home))])
+    }
+
     fn stderr_sources(gateway_path: &Path, service_path: &Path) -> LogSources {
         LogSources {
             env_name: "demo".to_string(),
@@ -2784,7 +2803,8 @@ mod tests {
             gateway_path: gateway_path.to_path_buf(),
             service_path: service_path.to_path_buf(),
             registered_name: "demo".to_string(),
-            case_distinct_peers: vec!["Demo".to_string()],
+            store_env: test_store_env(gateway_path),
+            store_cwd: gateway_path.parent().unwrap().to_path_buf(),
             excluded_paths: Vec::new(),
             service_available: true,
         }

@@ -641,6 +641,52 @@ fn a_removed_case_variants_service_logs_do_not_move_a_lone_env() {
     assert!(!content.contains("service-out Alpha\n"), "{content}");
 }
 
+#[cfg(unix)]
+#[test]
+fn a_recreated_name_keeps_its_output_apart_from_a_registered_case_variant() {
+    // The case variant either never runs, or runs on the removed name's
+    // leftover file before the name is registered again.
+    for variant_ran in [false, true] {
+        let fixture = ServiceLogFixture::new("logs-case-variant-reuse");
+        fixture.create_and_start("alpha", "alpha-first");
+        fixture.run(&["__daemon", "run", "--once", "--json"]);
+        let upper_root = path_string(&fixture.root.child("alpha-upper"));
+        fixture.run(&[
+            "env",
+            "create",
+            "Alpha",
+            "--launcher",
+            "gw",
+            "--root",
+            &upper_root,
+        ]);
+        fixture.run(&["service", "stop", "alpha"]);
+        fixture.run(&["env", "remove", "alpha"]);
+        if variant_ran {
+            fixture.run(&["service", "start", "Alpha"]);
+            fixture.run(&["__daemon", "run", "--once", "--json"]);
+        }
+
+        fixture.create_and_start("alpha", "alpha-second");
+        fixture.run(&["__daemon", "run", "--once", "--json"]);
+        let content = fixture.service_output("alpha");
+        assert_eq!(
+            content.matches("service-out alpha\n").count(),
+            1,
+            "{variant_ran}: {content}"
+        );
+        assert!(!content.contains("service-out Alpha\n"), "{content}");
+        for path in fixture.status_log_paths("alpha") {
+            let file = fs::read_to_string(&path).unwrap();
+            assert!(!file.contains(" Alpha\n"), "{variant_ran}: {file}");
+        }
+        if variant_ran {
+            let content = fixture.service_output("Alpha");
+            assert!(content.contains("service-out Alpha\n"), "{content}");
+        }
+    }
+}
+
 #[test]
 fn env_create_fails_when_an_earlier_service_log_cannot_be_deleted() {
     let root = TestDir::new("logs-create-undeletable");
