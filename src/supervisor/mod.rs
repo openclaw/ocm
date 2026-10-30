@@ -25,6 +25,7 @@ use crate::infra::process_identity::{
     ProcessIdentity, current_process_identity, observe_process, process_scope_id,
 };
 use crate::infra::shell::{apply_external_supervision_hint, render_env_scoped_login_command};
+use crate::launcher::working_directory_issue;
 use crate::service::inspect::{
     LaunchdJobStatus, ManagedJobObservation, inspect_job, inspect_job_for_activation,
     inspect_job_for_recovery, observe_job_for_source_watch,
@@ -2126,6 +2127,16 @@ fn spawn_supervisor_child(spec: &SupervisorChildSpec) -> Result<Child, String> {
         command.process_group(0);
     }
     command.spawn().map_err(|error| {
+        // A launcher's directory can disappear after the service plans it,
+        // and the OS error alone does not say which path is missing.
+        if spec.binding_kind == "launcher"
+            && let Some(issue) = working_directory_issue(Path::new(&spec.run_dir))
+        {
+            return format!(
+                "failed starting env \"{}\": launcher \"{}\" {issue}",
+                spec.env_name, spec.binding_name
+            );
+        }
         format!(
             "failed starting env \"{}\" with {}: {error}",
             spec.env_name,
