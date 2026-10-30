@@ -1685,6 +1685,85 @@ fn env_import_relocates_separate_git_directory_repositories() {
 }
 
 #[test]
+fn env_import_refusal_names_the_unselected_checkout() {
+    let fixture = TestDir::new("import-separate-git-dir-external-worktree");
+    let root = fs::canonicalize(fixture.path()).unwrap();
+    let env = ocm_env(&fixture);
+    let source = root.join("source");
+    let target = root.join("target");
+    let created = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "create",
+            "source",
+            "--root",
+            source.to_str().unwrap(),
+        ],
+    );
+    assert!(created.status.success(), "{}", stderr(&created));
+    let workspace = source.join(".openclaw/workspace");
+    let checkout = workspace.join("project");
+    fs::create_dir_all(&checkout).unwrap();
+    let git_dir = workspace.join("project-git");
+    import_git(
+        &checkout,
+        &env,
+        &[
+            "init",
+            "-q",
+            "--separate-git-dir",
+            git_dir.to_str().unwrap(),
+        ],
+    );
+    let outside = root.join("outside worktree");
+    fs::create_dir(&outside).unwrap();
+    import_git(
+        &git_dir,
+        &env,
+        &["config", "core.worktree", outside.to_str().unwrap()],
+    );
+    let archive = root.join("source.tar");
+    let exported = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "export",
+            "source",
+            "--output",
+            archive.to_str().unwrap(),
+        ],
+    );
+    assert!(exported.status.success(), "{}", stderr(&exported));
+    let imported = run_ocm(
+        &root,
+        &env,
+        &[
+            "env",
+            "import",
+            archive.to_str().unwrap(),
+            "--name",
+            "target",
+            "--root",
+            target.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        !imported.status.success(),
+        "import accepted an external worktree"
+    );
+    let error = stderr(&imported);
+    assert!(
+        error.contains("copied Git configuration does not select a destination-owned checkout: ")
+            && error.contains("project"),
+        "{error}"
+    );
+    assert!(!target.exists());
+}
+
+#[test]
 fn env_import_relocates_native_bare_shared_history_without_the_source() {
     for include_state in [false, true] {
         let fixture = TestDir::new("import-bare-shared-history");
