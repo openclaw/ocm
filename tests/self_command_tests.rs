@@ -385,6 +385,119 @@ fn self_update_replaces_a_copied_binary_in_place() {
     );
 }
 
+fn serve_candidate_release(
+    root: &TestDir,
+    release_requests: usize,
+) -> (TestHttpServer, TestHttpServer) {
+    let archive_path = root.child(current_release_asset_name());
+    write_release_archive(
+        &archive_path,
+        "#!/usr/bin/env bash\nif [[ \"$1\" == \"--version\" ]]; then\n  printf '9.9.9\\n'\nelse\n  printf 'updated ocm\\n'\nfi\n",
+    );
+    let asset = TestHttpServer::serve_bytes(
+        "/download.tar.gz",
+        "application/gzip",
+        &fs::read(&archive_path).unwrap(),
+    );
+    let metadata = format!(
+        "{{\"tag_name\":\"v9.9.9\",\"assets\":[{{\"name\":\"{}\",\"browser_download_url\":\"{}\",\"digest\":\"sha256:{}\"}}]}}",
+        current_release_asset_name(),
+        asset.url(),
+        file_sha256(&archive_path).unwrap()
+    );
+    let release = TestHttpServer::serve_bytes_times(
+        "/release.json",
+        "application/json",
+        metadata.as_bytes(),
+        release_requests,
+    );
+    (release, asset)
+}
+
+#[cfg(unix)]
+#[test]
+fn self_update_through_a_symlink_replaces_the_real_binary() {
+    let root = TestDir::new("self-update-symlinked-binary");
+    let real = fs::canonicalize(copied_ocm(&root)).unwrap();
+    let linked = root.child("link/ocm");
+    fs::create_dir_all(linked.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink("../bin/ocm", &linked).unwrap();
+    let (release, _asset) = serve_candidate_release(&root, 2);
+    let env = release_env(&root, &release.url());
+
+    let check = run_ocm_binary(
+        &linked,
+        root.path(),
+        &env,
+        &["self", "update", "--check", "--json"],
+    );
+    assert!(check.status.success(), "{}", stderr(&check));
+    let summary: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+    assert_eq!(summary["status"], "updateAvailable");
+    assert_eq!(summary["binaryPath"], path_string(&real));
+
+    let update = run_ocm_binary(&linked, root.path(), &env, &["self", "update", "--json"]);
+    assert!(update.status.success(), "{}", stderr(&update));
+    let summary: serde_json::Value = serde_json::from_slice(&update.stdout).unwrap();
+    assert_eq!(summary["status"], "updated");
+    assert_eq!(summary["binaryPath"], path_string(&real));
+    let version = Command::new(&real)
+        .arg("--version")
+        .env_clear()
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8(version.stdout).unwrap(), "9.9.9\n");
+    assert_eq!(fs::read_link(&linked).unwrap(), Path::new("../bin/ocm"));
+    assert!(!root.child("link/.ocm.self-update").exists());
+
+    // The fixture candidate only reports its version; a real OCM reads the receipt.
+    fs::copy(env!("CARGO_BIN_EXE_ocm"), &real).unwrap();
+    let status = run_ocm_binary(&linked, root.path(), &env, &["self", "update", "--status"]);
+    assert!(status.status.success(), "{}", stderr(&status));
+    let receipt: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(receipt["phase"], "updated");
+    assert_eq!(receipt["binaryPath"], path_string(&real));
+}
+
+#[cfg(unix)]
+#[test]
+fn self_update_through_a_symlink_refuses_a_read_only_target_before_downloading() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = TestDir::new("self-update-symlinked-read-only");
+    let real = fs::canonicalize(copied_ocm(&root)).unwrap();
+    let bin = real.parent().unwrap().to_path_buf();
+    let linked = root.child("link/ocm");
+    fs::create_dir_all(linked.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&real, &linked).unwrap();
+    let original = file_sha256(&real).unwrap();
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o555)).unwrap();
+    // Permission bits do not stop a privileged user; the failure cannot be staged then.
+    if fs::write(bin.join("probe"), "").is_ok() {
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+    let (release, asset) = serve_candidate_release(&root, 1);
+    let env = release_env(&root, &release.url());
+
+    let output = run_ocm_binary(&linked, root.path(), &env, &["self", "update", "--json"]);
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains(&format!(
+            "cannot create update journal in {}: Permission denied",
+            bin.display()
+        )),
+        "{}",
+        stderr(&output)
+    );
+    assert!(asset.requests().is_empty());
+    assert_eq!(file_sha256(&real).unwrap(), original);
+    assert!(!root.child("link/.ocm.self-update").exists());
+    assert!(!bin.join(".ocm.self-update").exists());
+}
+
 #[test]
 fn self_update_unchanged_and_check_do_not_create_a_receipt() {
     let root = TestDir::new("self-update-unchanged");
@@ -456,7 +569,10 @@ fn self_update_unchanged_needs_no_write_access_beside_the_binary() {
     // A real update must still write beside the binary, so it fails clearly.
     assert!(!outputs[2].status.success());
     assert!(
-        stderr(&outputs[2]).contains("cannot create update journal: Permission denied"),
+        stderr(&outputs[2]).contains(&format!(
+            "cannot create update journal in {}: Permission denied",
+            bin.display()
+        )),
         "{}",
         stderr(&outputs[2])
     );

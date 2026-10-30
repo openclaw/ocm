@@ -45,6 +45,9 @@ original error, and any rollback error. It contains no saved process environment
 The receipt and retained executable live in `.<binary-name>.self-update` beside
 the executable. For an executable named `ocm`, that directory is
 `.ocm.self-update`. The command prints its recovery executable path before waiting.
+When OCM runs through a symlink to its executable, the update, `--check`,
+`--status`, and `--recover` act on the file the symlink resolves to, and the
+journal lives beside that file. The symlink is left unchanged.
 
 If activation or health checks fail, the helper restores the previous CLI and
 refreshes the daemon back to that version. `rolledBack` means recovery succeeded,

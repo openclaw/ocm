@@ -60,6 +60,23 @@ pub(super) struct Transaction {
     _lock: File,
 }
 
+/// The installed executable an update acts on. Linux already reports a
+/// symlinked executable as its target; elsewhere the invoked symlink is
+/// reported, and its directory holds neither the file nor its journal.
+pub(super) fn current_executable() -> Result<PathBuf, String> {
+    let path = std::env::current_exe()
+        .map_err(|error| format!("failed to resolve the current ocm binary: {error}"))?;
+    if !fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Ok(path);
+    }
+    path.canonicalize().map_err(|error| {
+        format!(
+            "failed to resolve the current ocm binary {}: {error}",
+            path.display()
+        )
+    })
+}
+
 fn transaction_root(binary: &Path) -> Result<PathBuf, String> {
     let name = binary.file_name().ok_or("executable has no filename")?;
     let mut directory = std::ffi::OsString::from(".");
@@ -95,7 +112,12 @@ impl Transaction {
         match builder.create(&root) {
             Ok(()) => sync_dir(root.parent().unwrap())?,
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(format!("cannot create update journal: {error}")),
+            Err(error) => {
+                return Err(format!(
+                    "cannot create update journal in {}: {error}",
+                    root.parent().unwrap().display()
+                ));
+            }
         }
         let metadata = fs::symlink_metadata(&root).map_err(|e| e.to_string())?;
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -305,7 +327,7 @@ fn worker_command(previous: &Path, receipt: &Receipt) -> Result<Command, String>
 
 impl Cli {
     pub(super) fn self_update_receipt(&self, recover: bool) -> Result<Receipt, String> {
-        let binary = std::env::current_exe().map_err(|e| e.to_string())?;
+        let binary = current_executable()?;
         // The retained helper remains usable even when the candidate cannot run.
         let root = if binary.file_name().is_some_and(|name| name == "previous") {
             binary
