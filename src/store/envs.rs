@@ -449,7 +449,7 @@ pub(crate) fn save_environment_with_validated_runtime_guard(
     )?;
     if let Some(runtime_name) = meta.default_runtime.as_deref() {
         meta.default_runtime =
-            Some(super::runtimes::get_runtime_verified(runtime_name, env, cwd)?.name);
+            Some(super::runtimes::get_runtime_for_binding(runtime_name, env, cwd)?.name);
     }
     let (meta, _admission) = upsert_environment(&mut registry, meta, runtime_guard, env, cwd)?;
     write_env_registry(&mut registry, env, cwd)?;
@@ -666,7 +666,7 @@ fn create_environment_with_runtime_validation(
         options
             .default_runtime
             .as_deref()
-            .map(|runtime_name| super::runtimes::get_runtime_verified(runtime_name, env, cwd))
+            .map(|runtime_name| super::runtimes::get_runtime_for_binding(runtime_name, env, cwd))
             .transpose()?
             .map(|runtime| runtime.name)
     } else {

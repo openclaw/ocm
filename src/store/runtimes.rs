@@ -3995,6 +3995,21 @@ pub fn get_runtime_verified(
     verify_runtime_binary(get_runtime(name, env, cwd)?, env)
 }
 
+/// Reads a runtime an environment is about to be bound to. Beyond the launch
+/// lookup's checks, a binding refuses a binary the current user cannot
+/// execute, as switching a bound environment's runtime already does.
+pub(crate) fn get_runtime_for_binding(
+    name: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<RuntimeMeta, String> {
+    let meta = get_runtime_verified(name, env, cwd)?;
+    if let Some(issue) = runtime_permission_issue(&meta, &RuntimeReadPaths::default()) {
+        return Err(format!("runtime \"{}\" is not healthy: {issue}", meta.name));
+    }
+    Ok(meta)
+}
+
 pub fn add_runtime(
     options: AddRuntimeOptions,
     env: &BTreeMap<String, String>,
@@ -4942,8 +4957,9 @@ fn runtime_companion_integrity_issue(
     None
 }
 
-// Health reports a binary the current user cannot execute. Launch-time lookups
-// (`runtime show`, `which`, `env resolve`, `env run`) keep their existing checks.
+// Health and binding admission report a binary the current user cannot execute.
+// Launch-time lookups (`runtime show`, `which`, `env resolve`, `env run`) keep
+// their existing checks.
 #[cfg(unix)]
 fn runtime_permission_issue(meta: &RuntimeMeta, paths: &RuntimeReadPaths) -> Option<String> {
     let binary_path = Path::new(&meta.binary_path);
