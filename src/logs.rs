@@ -71,16 +71,21 @@ impl LogSources {
         }
     }
 
-    /// Picks the newer existing file, or the Gateway path when neither exists.
-    fn select(&self) -> Result<LogTarget, String> {
-        // A follower selects again until a file exists. By then a case-distinct
-        // name may have created the name-keyed file, which is not this env's.
-        let service_path = supervisor_child_log_file(
+    /// The env's service log file as it resolves now. A follower selects
+    /// again until a file exists, and meanwhile the name-keyed file can come
+    /// to belong to a case-distinct name or be taken over by this one.
+    fn service_file(&self) -> PathBuf {
+        supervisor_child_log_file(
             &self.service_path,
             &self.registered_name,
             &self.stream,
             crate::supervisor::registered_env(&self.store_env, &self.store_cwd),
-        );
+        )
+    }
+
+    /// Picks the newer existing file, or the Gateway path when neither exists.
+    fn select(&self) -> Result<LogTarget, String> {
+        let service_path = self.service_file();
         let gateway_modified = modified_at(&self.gateway_path);
         let service_modified = if !self.service_available {
             None
@@ -239,7 +244,7 @@ impl<'a> LogService<'a> {
                 _ => unreachable!("stream validated by normalize_stream"),
             });
         let supervisor = crate::supervisor::SupervisorService::new(self.env, self.cwd);
-        let service_path = supervisor.child_log_path(&meta, &stream)?;
+        let service_path = supervisor.saved_child_log_path(&meta, &stream)?;
         let mut service_available = true;
         let excluded_paths = if meta.name.eq_ignore_ascii_case("daemon") {
             match supervisor.daemon_log_paths() {
@@ -310,7 +315,7 @@ impl<'a> LogService<'a> {
                         path: format!(
                             "{} or {}",
                             display_path(&sources.gateway_path),
-                            display_path(&sources.service_path)
+                            display_path(&sources.service_file())
                         ),
                     }
                 })

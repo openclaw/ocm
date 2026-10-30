@@ -404,8 +404,10 @@ pub fn sync_supervisor_env_if_present(
 /// The name's separate case-distinct files are always its own. On a
 /// case-insensitive filesystem the name-keyed path can also resolve to a file
 /// that belongs to someone else: one created under a registered name that
-/// differs only in case, one a registered env still uses, or the daemon's own
-/// daemon.<stream>.log. Those files are kept.
+/// differs only in case, one a registered env still uses, one another running
+/// child writes, or the daemon's own daemon.<stream>.log. Those files are kept;
+/// when a running child writes one, the name starts in its own case-distinct
+/// file instead of sharing it.
 pub(crate) fn discard_child_logs<'n>(
     env_name: &str,
     registered: impl IntoIterator<Item = &'n str>,
@@ -425,12 +427,43 @@ pub(crate) fn discard_child_logs<'n>(
     } else {
         None
     };
+    // Files other running children write, as their daemon recorded them. A
+    // daemon started by an older OCM records a name-keyed path even when it
+    // opens a case-distinct name's file.
+    let running_outputs = SupervisorService::new(env, cwd)
+        .read_runtime_state()
+        .ok()
+        .flatten()
+        .map(|runtime| {
+            runtime
+                .children
+                .into_iter()
+                .filter(|child| child.env_name != env_name)
+                .flat_map(|child| [PathBuf::from(child.stdout_path), child.stderr_path.into()])
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     for stream in ["stdout", "stderr"] {
-        remove_earlier_child_log(
-            &supervisor_child_case_distinct_log_path(&logs_dir, env_name, stream),
-            env_name,
-        )?;
+        let separate = supervisor_child_case_distinct_log_path(&logs_dir, env_name, stream);
+        remove_earlier_child_log(&separate, env_name)?;
         let path = supervisor_child_log_path(&logs_dir, env_name, stream);
+        if running_outputs
+            .iter()
+            .any(|output| is_same_file(&path, output))
+        {
+            // Keep the running child's output and start this name in its own
+            // file instead of sharing that one.
+            if let Some(parent) = separate.parent() {
+                ensure_dir(parent)?;
+            }
+            fs::write(&separate, b"").map_err(|error| {
+                format!(
+                    "failed creating service log {} for env \"{env_name}\": {error}",
+                    display_path(&separate)
+                )
+            })?;
+            continue;
+        }
         if supervisor_child_log_file(&path, env_name, stream, is_registered) != path
             || registered
                 .iter()
@@ -798,7 +831,11 @@ impl<'a> SupervisorService<'a> {
         }))
     }
 
-    pub(crate) fn child_log_path(
+    /// The service log path saved for an env before case-distinct resolution:
+    /// its name-keyed file, or a daemon-named child's saved destination.
+    /// Readers resolve it with `supervisor_child_log_file` whenever they look,
+    /// because which name owns a name-keyed file can change while they wait.
+    pub(crate) fn saved_child_log_path(
         &self,
         meta: &crate::env::EnvMeta,
         stream: &str,
@@ -809,27 +846,14 @@ impl<'a> SupervisorService<'a> {
             stream,
         );
         if !meta.name.eq_ignore_ascii_case("daemon") {
-            return Ok(supervisor_child_log_file(
-                &default,
-                &meta.name,
-                stream,
-                registered_env(self.env, self.cwd),
-            ));
+            return Ok(default);
         }
-        let path = self
+        Ok(self
             .persisted_child_for_logs(&meta.name, &meta.root)
             .ok()
             .flatten()
-            .map(|child| child.log_destination(stream))
-            .unwrap_or_else(|| {
-                supervisor_child_log_file(
-                    &default,
-                    &meta.name,
-                    stream,
-                    registered_env(self.env, self.cwd),
-                )
-            });
-        Ok(path)
+            .map(|child| child.saved_log_destination(stream))
+            .unwrap_or(default))
     }
 
     pub(crate) fn has_legacy_child_log_paths(&self, meta: &crate::env::EnvMeta) -> bool {

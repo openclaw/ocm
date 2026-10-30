@@ -738,6 +738,106 @@ fn a_failed_takeover_of_a_leftover_service_log_keeps_the_variants_output() {
     assert!(!content.contains("service-out Alpha\n"), "{content}");
 }
 
+#[cfg(unix)]
+#[test]
+fn reusing_a_name_keeps_the_file_an_older_daemons_running_child_writes() {
+    let fixture = ServiceLogFixture::new("logs-case-variant-running-child");
+    let case_insensitive = fixture.case_insensitive();
+    for (name, root) in [("alpha", "lower-root"), ("Alpha", "upper-root")] {
+        let root = path_string(&fixture.root.child(root));
+        fixture.run(&["env", "create", name, "--launcher", "gw", "--root", &root]);
+    }
+    // An older OCM let both names write Alpha's files, and its daemon still
+    // runs alpha, recorded under alpha's name-keyed paths.
+    let logs_dir = fixture.root.child("ocm-home/supervisor/logs");
+    fs::create_dir_all(&logs_dir).unwrap();
+    for stream in ["out", "err"] {
+        fs::write(
+            logs_dir.join(format!("Alpha.std{stream}.log")),
+            format!("service-{stream} Alpha\nservice-{stream} alpha\n"),
+        )
+        .unwrap();
+    }
+    let runtime = serde_json::json!({
+        "kind": "ocm-supervisor-runtime",
+        "ocmHome": path_string(&fixture.root.child("ocm-home")),
+        "updatedAt": "2026-10-30T00:00:00Z",
+        "services": [],
+        "children": [{
+            "envName": "alpha",
+            "bindingKind": "launcher",
+            "bindingName": "gw",
+            "pid": std::process::id(),
+            "restartCount": 0,
+            "childPort": 18789,
+            "stdoutPath": path_string(&logs_dir.join("alpha.stdout.log")),
+            "stderrPath": path_string(&logs_dir.join("alpha.stderr.log")),
+        }],
+    });
+    fs::write(
+        fixture.root.child("ocm-home/supervisor/runtime.json"),
+        runtime.to_string(),
+    )
+    .unwrap();
+
+    fixture.run(&["env", "remove", "Alpha"]);
+    let again = path_string(&fixture.root.child("upper-again"));
+    fixture.run(&[
+        "env",
+        "create",
+        "Alpha",
+        "--launcher",
+        "gw",
+        "--root",
+        &again,
+    ]);
+    if case_insensitive {
+        for stream in ["out", "err"] {
+            let shared = fs::read_to_string(logs_dir.join(format!("alpha.std{stream}.log")))
+                .expect("the running child's file was deleted");
+            assert!(
+                shared.contains(&format!("service-{stream} alpha\n")),
+                "{shared}"
+            );
+        }
+    }
+    assert!(!fixture.service_output("Alpha").contains("service-"));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_pending_follower_attaches_to_a_leftover_its_env_takes_over() {
+    let fixture = ServiceLogFixture::new("logs-follow-case-variant-takeover");
+    fixture.create_and_start("Alpha", "upper-root");
+    fixture.run(&["__daemon", "run", "--once", "--json"]);
+    fixture.run(&["service", "stop", "Alpha"]);
+    let lower_root = path_string(&fixture.root.child("lower-root"));
+    fixture.run(&[
+        "env",
+        "create",
+        "alpha",
+        "--launcher",
+        "gw",
+        "--root",
+        &lower_root,
+    ]);
+
+    let (mut child, receiver) = spawn_follow(
+        &fixture.cwd,
+        &fixture.env,
+        &["logs", "alpha", "--stream", "info", "--follow", "--raw"],
+    );
+    // Let the follower start and poll while alpha has no service output.
+    thread::sleep(Duration::from_millis(600));
+    fixture.run(&["env", "remove", "Alpha"]);
+    fixture.run(&["service", "start", "alpha"]);
+    fixture.run(&["__daemon", "run", "--once", "--json"]);
+    receive_line_containing(&receiver, "service-out alpha");
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 #[test]
 fn env_create_fails_when_an_earlier_service_log_cannot_be_deleted() {
     let root = TestDir::new("logs-create-undeletable");
