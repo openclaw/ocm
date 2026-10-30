@@ -11150,6 +11150,121 @@ fn upgrade_all_reports_unbound_envs_as_skipped_and_still_fails_real_failures() {
     }
 }
 
+#[test]
+fn upgrade_all_failed_entries_report_the_recorded_binding() {
+    let root = TestDir::new("upgrade-all-failed-binding");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    let executable = root.child("openclaw");
+    write_executable_script(&executable, "#!/bin/sh\necho fake-openclaw\n");
+    for args in [
+        vec![
+            "runtime",
+            "add",
+            "rt-ok",
+            "--path",
+            &path_string(&executable),
+        ],
+        vec![
+            "runtime",
+            "add",
+            "rt-lost",
+            "--path",
+            &path_string(&executable),
+        ],
+        vec![
+            "launcher",
+            "add",
+            "lc-ok",
+            "--command",
+            &path_string(&executable),
+        ],
+        vec![
+            "launcher",
+            "add",
+            "lc-corrupt",
+            "--command",
+            &path_string(&executable),
+        ],
+        vec!["env", "create", "manual", "--runtime", "rt-ok"],
+        vec!["env", "create", "runtime-failed", "--runtime", "rt-lost"],
+        vec!["env", "create", "local", "--launcher", "lc-ok"],
+        vec![
+            "env",
+            "create",
+            "launcher-failed",
+            "--launcher",
+            "lc-corrupt",
+        ],
+    ] {
+        let output = run_ocm(&cwd, &env, &args);
+        assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+    }
+    fs::remove_file(root.child("ocm-home/runtimes/rt-lost.json")).unwrap();
+    fs::write(root.child("ocm-home/launchers/lc-corrupt.json"), "{bad").unwrap();
+
+    for args in [
+        vec!["upgrade", "--all", "--dry-run", "--json"],
+        vec!["upgrade", "--all", "--json"],
+    ] {
+        let output = run_ocm(&cwd, &env, &args);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{args:?}: {}",
+            stdout(&output)
+        );
+        let json: Value = serde_json::from_str(&stdout(&output)).unwrap();
+        assert_eq!(json["count"], 4, "{args:?}: {json}");
+        assert_eq!(json["skipped"], 2, "{args:?}: {json}");
+        assert_eq!(json["failed"], 2, "{args:?}: {json}");
+        for (name, kind, binding) in [
+            ("manual", "runtime", "rt-ok"),
+            ("local", "launcher", "lc-ok"),
+            ("runtime-failed", "runtime", "rt-lost"),
+            ("launcher-failed", "launcher", "lc-corrupt"),
+        ] {
+            let result = batch_result(&json, name);
+            for field in ["previousBindingKind", "bindingKind"] {
+                assert_eq!(result[field], kind, "{args:?} {name}: {result}");
+            }
+            for field in ["previousBindingName", "bindingName"] {
+                assert_eq!(result[field], binding, "{args:?} {name}: {result}");
+            }
+        }
+        let runtime_failed = batch_result(&json, "runtime-failed");
+        assert_eq!(runtime_failed["outcome"], "failed", "{args:?}");
+        assert!(
+            runtime_failed["note"]
+                .as_str()
+                .unwrap()
+                .contains("runtime \"rt-lost\" does not exist"),
+            "{args:?}: {runtime_failed}"
+        );
+        assert_eq!(
+            batch_result(&json, "launcher-failed")["outcome"],
+            "failed",
+            "{args:?}"
+        );
+    }
+
+    let text = run_ocm(&cwd, &env, &["upgrade", "--all", "--dry-run"]);
+    assert_eq!(text.status.code(), Some(1), "{}", stdout(&text));
+    let text = stdout(&text);
+    assert!(
+        text.contains("runtime-failed  from=runtime:rt-lost  to=runtime:rt-lost  outcome=failed"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "launcher-failed  from=launcher:lc-corrupt  to=launcher:lc-corrupt  outcome=failed"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("unknown"), "{text}");
+}
+
 fn setup_named_runtime_candidate_fixture(
     root: &TestDir,
 ) -> (PathBuf, BTreeMap<String, String>, PathBuf) {
