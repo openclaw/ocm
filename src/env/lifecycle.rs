@@ -13,7 +13,7 @@ use crate::runtime::RuntimeService;
 use crate::store::{
     EnvironmentOperationLock, clone_environment, clone_environment_for_simulation,
     create_environment_with_validated_runtime, export_environment, get_environment,
-    get_runtime_verified, import_environment, list_environments, lock_environment_operation,
+    get_runtime_for_binding, import_environment, list_environments, lock_environment_operation,
     now_utc, remove_environment_locked, resolve_config_gateway_port,
     resolve_effective_gateway_ports, save_environment, set_environment_service_policy,
 };
@@ -367,7 +367,7 @@ impl<'a> EnvironmentService<'a> {
         if let Some(runtime_name) = runtime_name {
             let _admission =
                 crate::store::try_lock_runtime_binding(&runtime_name, self.env, self.cwd)?;
-            get_runtime_verified(&runtime_name, self.env, self.cwd)?;
+            get_runtime_for_binding(&runtime_name, self.env, self.cwd)?;
             return Ok(Some(runtime_name));
         }
 

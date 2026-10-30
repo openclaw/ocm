@@ -106,7 +106,7 @@ pub(crate) use runtimes::find_runtime;
 pub(crate) use runtimes::install_runtime_from_local_openclaw_build;
 pub(crate) use runtimes::{
     BuildLocalRuntimeOptions, InstallContext, PreparedRuntimeInstall, RuntimeBindingGuard,
-    RuntimeMutationGuard, RuntimeReleaseDetails, add_runtime_with_context,
+    RuntimeMutationGuard, RuntimeReleaseDetails, add_runtime_with_context, get_runtime_for_binding,
     install_runtime_from_official_openclaw_release_with_context,
     install_runtime_from_release_with_context, install_runtime_from_url_with_context,
     install_runtime_with_context, is_official_openclaw_release_description, lock_runtime_mutation,

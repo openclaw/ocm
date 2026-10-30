@@ -99,6 +99,106 @@ fn env_set_runtime_updates_and_clears_the_default_runtime() {
     assert!(!stdout(&show_cleared).contains("defaultRuntime:"));
 }
 
+#[cfg(unix)]
+#[test]
+fn binding_refuses_a_runtime_the_current_user_cannot_execute() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = TestDir::new("runtime-binding-not-executable");
+    let cwd = root.child("workspace");
+    let bin_dir = cwd.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    for name in ["good", "plain", "gone"] {
+        write_executable_script(&bin_dir.join(name), "#!/bin/sh\nexit 0\n");
+    }
+    let env = ocm_env(&root);
+    for name in ["good", "plain", "gone"] {
+        let path = format!("./bin/{name}");
+        let add = run_ocm(&cwd, &env, &["runtime", "add", name, "--path", &path]);
+        assert!(add.status.success(), "{}", stderr(&add));
+    }
+    let plain = bin_dir.join("plain");
+    fs::set_permissions(&plain, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::remove_file(bin_dir.join("gone")).unwrap();
+    for name in ["unbound", "started"] {
+        let create = run_ocm(&cwd, &env, &["env", "create", name]);
+        assert!(create.status.success(), "{}", stderr(&create));
+    }
+    let not_executable =
+        "runtime \"plain\" is not healthy: binary path is not executable by the current user:";
+    let missing = "runtime \"gone\" binary path does not exist:";
+    let attempts = |runtime: &str| {
+        [
+            vec!["env", "set-runtime", "unbound", runtime],
+            vec!["env", "create", "created", "--runtime", runtime],
+            vec!["start", "fresh", "--runtime", runtime, "--no-service"],
+            vec!["start", "started", "--runtime", runtime, "--no-service"],
+        ]
+        .map(|args| args.into_iter().map(str::to_string).collect::<Vec<_>>())
+    };
+
+    for (runtime, refusal) in [("plain", not_executable), ("gone", missing)] {
+        for args in attempts(runtime) {
+            let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+            let output = run_ocm(&cwd, &env, &args);
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "{args:?}: {}",
+                stdout(&output)
+            );
+            assert!(
+                stderr(&output).contains(refusal),
+                "{args:?}: {}",
+                stderr(&output)
+            );
+        }
+        for name in ["unbound", "started"] {
+            let show = run_ocm(&cwd, &env, &["env", "show", name]);
+            assert!(show.status.success(), "{}", stderr(&show));
+            assert!(
+                !stdout(&show).contains("defaultRuntime:"),
+                "{}",
+                stdout(&show)
+            );
+        }
+        for name in ["created", "fresh"] {
+            let show = run_ocm(&cwd, &env, &["env", "show", name]);
+            assert!(
+                !show.status.success(),
+                "{name} was created: {}",
+                stdout(&show)
+            );
+        }
+    }
+
+    // A binary made executable after the refusal binds through every entry.
+    fs::set_permissions(&plain, fs::Permissions::from_mode(0o755)).unwrap();
+    for runtime in ["plain", "good"] {
+        for args in attempts(runtime) {
+            let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+            let output = run_ocm(&cwd, &env, &args);
+            assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+        }
+        for name in ["unbound", "created", "fresh", "started"] {
+            let show = run_ocm(&cwd, &env, &["env", "show", name]);
+            assert!(
+                stdout(&show).contains(&format!("defaultRuntime: {runtime}")),
+                "{name}: {}",
+                stdout(&show)
+            );
+        }
+        for name in ["created", "fresh"] {
+            let remove = run_ocm(&cwd, &env, &["env", "destroy", name, "--yes"]);
+            assert!(remove.status.success(), "{}", stderr(&remove));
+        }
+        for name in ["unbound", "started"] {
+            let clear = run_ocm(&cwd, &env, &["env", "set-runtime", name, "none"]);
+            assert!(clear.status.success(), "{}", stderr(&clear));
+        }
+    }
+}
+
 #[test]
 fn managed_backing_lock_refuses_alias_binding_until_release() {
     let root = TestDir::new("runtime-alias-binding-lock");
