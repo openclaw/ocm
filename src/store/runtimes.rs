@@ -60,16 +60,24 @@ const OFFICIAL_OPENCLAW_RELEASE_DESCRIPTION_PREFIX: &str = "Official OpenClaw re
 
 /// The description OCM records for an official OpenClaw release installed
 /// without `--description`.
-pub(crate) fn official_openclaw_release_description(version: &str) -> String {
+fn official_openclaw_release_description(version: &str) -> String {
     format!("{OFFICIAL_OPENCLAW_RELEASE_DESCRIPTION_PREFIX}{version}")
 }
 
 /// Whether `description` is the text OCM records for some official OpenClaw
 /// release, including one an earlier update left behind for an older release.
+/// The text after the prefix must look like a release version (it starts with
+/// a digit and holds only version characters), so user text such as
+/// "Official OpenClaw release notes" is not mistaken for it.
 pub(crate) fn is_official_openclaw_release_description(description: &str) -> bool {
     description
         .strip_prefix(OFFICIAL_OPENCLAW_RELEASE_DESCRIPTION_PREFIX)
-        .is_some_and(|version| !version.is_empty() && !version.contains(char::is_whitespace))
+        .is_some_and(|version| {
+            version.starts_with(|c: char| c.is_ascii_digit())
+                && version
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
+        })
 }
 
 fn installed_openclaw_binary_path(install_files: &Path) -> PathBuf {

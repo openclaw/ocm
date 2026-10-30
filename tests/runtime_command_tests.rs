@@ -5680,6 +5680,26 @@ fn runtime_update_keeps_a_user_description_that_extends_the_generated_text() {
 }
 
 #[test]
+fn runtime_update_keeps_a_user_description_that_names_no_release_version() {
+    let (version, description) = official_stable_after_release_change(
+        "runtime-update-official-wordy-description",
+        &[
+            "runtime",
+            "install",
+            "stable",
+            "--channel",
+            "stable",
+            "--description",
+            "Official OpenClaw release notes",
+        ],
+        None,
+        &["runtime", "update", "stable"],
+    );
+    assert_eq!(version, "2026.3.25");
+    assert_eq!(description, "Official OpenClaw release notes");
+}
+
+#[test]
 fn runtime_update_keeps_a_user_supplied_official_runtime_description() {
     let (version, description) = official_stable_after_release_change(
         "runtime-update-official-user-description",
