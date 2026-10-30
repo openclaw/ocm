@@ -3815,10 +3815,11 @@ fn env_clone_skips_extension_runtime_dependencies_that_cleanup_clears() {
 }
 
 #[test]
-fn env_clone_refuses_a_separate_git_dir_checkout_outside_workspaces_like_import() {
+fn env_clone_copies_a_separate_git_dir_checkout_outside_workspaces_like_import() {
     for location in ["projects", ".openclaw/extensions/dev-plugin"] {
         let root = TestDir::new("copy-separate-git-dir-outside-workspace");
-        let (env, source, _) = copied_config_fixture(&root);
+        let (mut env, source, _) = copied_config_fixture(&root);
+        env.insert("GIT_OPTIONAL_LOCKS".into(), "0".into());
         let parent = source.join(location);
         let checkout = parent.join("checkout");
         fs::create_dir_all(&checkout).unwrap();
@@ -3855,13 +3856,12 @@ fn env_clone_refuses_a_separate_git_dir_checkout_outside_workspaces_like_import(
         );
         let before = file_bytes(&source);
 
+        let source_index = git_dir.join("index");
+        let index = fs::read(&source_index).unwrap();
+
         let cloned = run_ocm(root.path(), &env, &["env", "clone", "source", "target"]);
-        assert!(
-            !cloned.status.success(),
-            "{location}: clone kept a checkout that selects the source Git directory"
-        );
-        assert!(!source.parent().unwrap().join("target").exists());
-        assert_eq!(file_bytes(&source), before);
+        assert!(cloned.status.success(), "{location}: {}", stderr(&cloned));
+        assert_eq!(file_bytes(&source), before, "{location} changed its source");
 
         let archive = root.child("source.tar");
         let exported = run_ocm(
@@ -3885,11 +3885,34 @@ fn env_clone_refuses_a_separate_git_dir_checkout_outside_workspaces_like_import(
                 "import",
                 archive.to_str().unwrap(),
                 "--name",
-                "target",
+                "imported",
             ],
         );
-        assert!(!imported.status.success(), "{location}: import parity");
-        assert_eq!(stderr(&cloned), stderr(&imported), "{location}");
+        assert!(
+            imported.status.success(),
+            "{location}: {}",
+            stderr(&imported)
+        );
+
+        for name in ["target", "imported"] {
+            let copy = source.parent().unwrap().join(name).join(location);
+            let copied_checkout = copy.join("checkout");
+            let git_dir =
+                copied_config_git(&copied_checkout, &env, &["rev-parse", "--absolute-git-dir"]);
+            assert_eq!(
+                fs::canonicalize(git_dir).unwrap(),
+                fs::canonicalize(copy.join("checkout.git")).unwrap(),
+                "{location}: {name} checkout selects source storage"
+            );
+            write_text(&copied_checkout.join(name), "copy edit\n");
+            copied_config_git(&copied_checkout, &env, &["add", name]);
+            assert_eq!(
+                fs::read(&source_index).unwrap(),
+                index,
+                "{location}: {name}"
+            );
+        }
+        assert_eq!(file_bytes(&source), before, "{location}");
     }
 }
 
