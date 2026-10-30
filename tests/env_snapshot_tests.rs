@@ -5001,7 +5001,8 @@ fn env_snapshot_restore_moves_an_automatic_gateway_port_another_env_now_holds() 
         )])
     );
 
-    // Restoring again keeps the port the environment now holds.
+    // Restoring again moves the snapshot port off b again and reports it in
+    // plain output.
     let human = run_ocm(
         &cwd,
         &env,
