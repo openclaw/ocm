@@ -39,7 +39,8 @@ use crate::service::platform::{
 use crate::store::{
     display_path, ensure_dir, ensure_store, list_environments, lock_file, now_utc,
     openclaw_port_family_available, openclaw_port_family_range, read_json, resolve_ocm_home,
-    supervisor_child_log_destination, supervisor_child_log_path, supervisor_logs_dir,
+    supervisor_child_case_distinct_log_path, supervisor_child_log_destination,
+    supervisor_child_log_file, supervisor_child_log_path, supervisor_logs_dir,
     supervisor_runtime_path, supervisor_state_path, write_json,
 };
 
@@ -121,6 +122,10 @@ pub struct SupervisorChildSpec {
 
 impl SupervisorChildSpec {
     pub(crate) fn log_destination(&self, stream: &str) -> PathBuf {
+        supervisor_child_log_file(&self.saved_log_destination(stream), &self.env_name, stream)
+    }
+
+    fn saved_log_destination(&self, stream: &str) -> PathBuf {
         let path = if stream == "stdout" {
             &self.stdout_path
         } else {
@@ -381,9 +386,11 @@ pub fn sync_supervisor_env_if_present(
 /// environment root and are keyed only by name, so they can hold output from an
 /// earlier environment of the same name, including one removed by an older OCM.
 ///
-/// On a case-insensitive filesystem the path can also resolve to a file that
-/// still belongs to someone else: a registered env whose name differs only in
-/// case, or the daemon's own daemon.<stream>.log. Those files are kept.
+/// The name's separate case-distinct files are always its own. On a
+/// case-insensitive filesystem the name-keyed path can also resolve to a file
+/// that belongs to someone else: one created under a name that differs only in
+/// case, one a registered env still uses, or the daemon's own
+/// daemon.<stream>.log. Those files are kept.
 pub(crate) fn discard_child_logs<'n>(
     env_name: &str,
     registered: impl IntoIterator<Item = &'n str>,
@@ -402,28 +409,42 @@ pub(crate) fn discard_child_logs<'n>(
         None
     };
     for stream in ["stdout", "stderr"] {
+        remove_earlier_child_log(
+            &supervisor_child_case_distinct_log_path(&logs_dir, env_name, stream),
+            env_name,
+        )?;
         let path = supervisor_child_log_path(&logs_dir, env_name, stream);
-        if owners
-            .iter()
-            .any(|(dir, owner)| is_same_file(&path, &supervisor_child_log_path(dir, owner, stream)))
+        if supervisor_child_log_file(&path, env_name, stream) != path
+            || owners.iter().any(|(dir, owner)| {
+                is_same_file(
+                    &path,
+                    &supervisor_child_log_file(
+                        &supervisor_child_log_path(dir, owner, stream),
+                        owner,
+                        stream,
+                    ),
+                )
+            })
             || daemon_logs_dir
                 .as_ref()
                 .is_some_and(|dir| is_same_file(&path, &dir.join(format!("daemon.{stream}.log"))))
         {
             continue;
         }
-        match fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(format!(
-                    "failed removing earlier service log {} for env \"{env_name}\": {error}",
-                    display_path(&path)
-                ));
-            }
-        }
+        remove_earlier_child_log(&path, env_name)?;
     }
     Ok(())
+}
+
+fn remove_earlier_child_log(path: &Path, env_name: &str) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "failed removing earlier service log {} for env \"{env_name}\": {error}",
+            display_path(path)
+        )),
+    }
 }
 
 /// Whether both paths exist and resolve to the same file.
@@ -759,14 +780,14 @@ impl<'a> SupervisorService<'a> {
             stream,
         );
         if !meta.name.eq_ignore_ascii_case("daemon") {
-            return Ok(default);
+            return Ok(supervisor_child_log_file(&default, &meta.name, stream));
         }
         let path = self
             .persisted_child_for_logs(&meta.name, &meta.root)
             .ok()
             .flatten()
             .map(|child| child.log_destination(stream))
-            .unwrap_or(default);
+            .unwrap_or_else(|| supervisor_child_log_file(&default, &meta.name, stream));
         Ok(path)
     }
 
@@ -777,8 +798,8 @@ impl<'a> SupervisorService<'a> {
                 .ok()
                 .flatten()
                 .is_some_and(|child| {
-                    child.log_destination("stdout") != Path::new(&child.stdout_path)
-                        || child.log_destination("stderr") != Path::new(&child.stderr_path)
+                    child.saved_log_destination("stdout") != Path::new(&child.stdout_path)
+                        || child.saved_log_destination("stderr") != Path::new(&child.stderr_path)
                 })
     }
 

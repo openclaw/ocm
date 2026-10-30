@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
+use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Clone, Debug)]
@@ -339,6 +340,62 @@ pub fn supervisor_child_log_path(logs_dir: &Path, env_name: &str, stream: &str) 
         ""
     };
     logs_dir.join(format!("{prefix}{env_name}.{stream}.log"))
+}
+
+/// Separate service output for a name whose name-keyed file already belongs to
+/// a case-distinct environment on case-insensitive storage. Like the separate
+/// source-watch state, the SHA-256 of the exact name keeps every accepted name
+/// distinct under case folding.
+pub(crate) fn supervisor_child_case_distinct_log_path(
+    logs_dir: &Path,
+    env_name: &str,
+    stream: &str,
+) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let key = Sha256::digest(env_name.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    logs_dir
+        .join("case-distinct")
+        .join(format!("{key}.{stream}.log"))
+}
+
+/// The file that holds one environment's service output. On case-insensitive
+/// storage `alpha.stdout.log` can open `Alpha.stdout.log`. The directory entry
+/// keeps the spelling of the name that created it, so that name keeps the
+/// file, and the other name uses its own case-distinct file for as long as
+/// that file exists. Name-keyed files are otherwise used unchanged.
+pub(crate) fn supervisor_child_log_file(path: &Path, env_name: &str, stream: &str) -> PathBuf {
+    let (Some(dir), Some(file_name)) = (path.parent(), path.file_name()) else {
+        return path.to_path_buf();
+    };
+    let own_name = format!("{env_name}.{stream}.log");
+    let Some(own) = file_name
+        .to_str()
+        .filter(|name| *name == own_name || name.strip_prefix('.') == Some(own_name.as_str()))
+    else {
+        return path.to_path_buf();
+    };
+    let separate = supervisor_child_case_distinct_log_path(dir, env_name, stream);
+    if fs::symlink_metadata(&separate).is_ok() {
+        return separate;
+    }
+    if fs::symlink_metadata(path).is_err() {
+        return path.to_path_buf();
+    }
+    // An unreadable directory proves nothing about the spelling; keep the
+    // name-keyed file rather than hiding existing output.
+    let spelled_for_another_name = fs::read_dir(dir).is_ok_and(|entries| {
+        !entries
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_str() == Some(own))
+    });
+    if spelled_for_another_name {
+        separate
+    } else {
+        path.to_path_buf()
+    }
 }
 
 /// Old plans can name the shared daemon's diagnostic file. Keep the saved

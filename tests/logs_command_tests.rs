@@ -468,6 +468,88 @@ fn creating_a_case_variant_name_keeps_the_registered_envs_logs() {
     assert!(content.contains("current stderr"), "{content}");
 }
 
+#[cfg(unix)]
+#[test]
+fn case_distinct_envs_keep_separate_service_output() {
+    use crate::support::{install_fake_service_manager, write_executable_script};
+
+    let root = TestDir::new("logs-case-distinct-service-output");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    install_fake_service_manager(&root, &mut env);
+    let probe = root.child("case-probe");
+    fs::write(&probe, "").unwrap();
+    let case_insensitive = root.child("CASE-PROBE").exists();
+    let gateway = root.child("gateway.sh");
+    write_executable_script(
+        &gateway,
+        "#!/bin/sh\necho \"service-out $OCM_ACTIVE_ENV\"\necho \"service-err $OCM_ACTIVE_ENV\" >&2\nsleep 1\n",
+    );
+    let run = |args: &[&str]| {
+        let output = run_ocm(&cwd, &env, args);
+        assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+    };
+    let service_output = |name: &str| {
+        let output = run_ocm(&cwd, &env, &["logs", name, "--json"]);
+        if !output.status.success() {
+            return String::new();
+        }
+        let body: Value = serde_json::from_str(&stdout(&output)).unwrap();
+        body["content"].as_str().unwrap().to_string()
+    };
+    run(&["launcher", "add", "gw", "--command", &path_string(&gateway)]);
+    run(&["env", "create", "alpha", "--launcher", "gw"]);
+    let other_root = path_string(&root.child("other-root"));
+    run(&[
+        "env",
+        "create",
+        "Alpha",
+        "--launcher",
+        "gw",
+        "--root",
+        &other_root,
+    ]);
+    run(&["service", "start", "alpha"]);
+    run(&["service", "start", "Alpha"]);
+    run(&["__daemon", "run", "--once", "--json"]);
+
+    for (name, other) in [("alpha", "Alpha"), ("Alpha", "alpha")] {
+        let content = service_output(name);
+        for stream in ["out", "err"] {
+            assert!(
+                content.contains(&format!("service-{stream} {name}\n")),
+                "{name}: {content}"
+            );
+            assert!(
+                !content.contains(&format!("service-{stream} {other}\n")),
+                "{name}: {content}"
+            );
+        }
+    }
+    // Only case-insensitive storage needs the separate file.
+    let logs_dir = root.child("ocm-home/supervisor/logs");
+    assert_eq!(logs_dir.join("case-distinct").exists(), case_insensitive);
+
+    // A recreated name starts without the removed environment's output.
+    run(&["service", "stop", "Alpha"]);
+    run(&["env", "remove", "Alpha"]);
+    let third_root = path_string(&root.child("third-root"));
+    run(&[
+        "env",
+        "create",
+        "Alpha",
+        "--launcher",
+        "gw",
+        "--root",
+        &third_root,
+    ]);
+    assert!(!service_output("Alpha").contains("service-"));
+    let content = service_output("alpha");
+    assert!(content.contains("service-out alpha\n"), "{content}");
+    assert!(!content.contains("service-out Alpha\n"), "{content}");
+}
+
 #[test]
 fn env_create_fails_when_an_earlier_service_log_cannot_be_deleted() {
     let root = TestDir::new("logs-create-undeletable");
