@@ -9943,10 +9943,10 @@ fn start_with_a_case_variant_of_the_bound_runtime_stays_a_plain_start() {
         assert!(create.status.success(), "{}", stderr(&create));
     }
 
-    let show_demo = || json(&["env", "show", "demo", "--json"]);
+    let registry_path = env_registry_path(&env, &cwd).unwrap();
     let exact = start(&["start", "demo", "--runtime", "old-local", "--no-service"]);
     assert!(exact.status.success(), "{}", stderr(&exact));
-    let before = show_demo();
+    let before = fs::read_to_string(&registry_path).unwrap();
 
     let same = start(&["start", "demo", "--runtime", "OLD-LOCAL", "--no-service"]);
     if case_insensitive {
@@ -9970,8 +9970,11 @@ fn start_with_a_case_variant_of_the_bound_runtime_stays_a_plain_start() {
         serde_json::json!([])
     );
     // Like the exact spelling, the variant leaves the env record untouched.
-    assert_eq!(show_demo(), before);
-    assert_eq!(before["defaultRuntime"], "old-local");
+    assert_eq!(fs::read_to_string(&registry_path).unwrap(), before);
+    assert_eq!(
+        json(&["env", "show", "demo", "--json"])["defaultRuntime"],
+        "old-local"
+    );
 
     // Another runtime under another spelling is still a runtime transition.
     let switch = start(&["start", "other", "--runtime", "NEW-LOCAL", "--no-service"]);
