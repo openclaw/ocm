@@ -1920,7 +1920,8 @@ immutable file or while another process is still writing there, the command exit
 with an error that names the worktree, which stays registered and marked, and the
 environment stays listed. Re-run the same command after fixing the cause to finish
 the removal; a marked worktree is not checked for local changes again, because it
-passed that check before OCM deleted anything. Removal still refuses a directory
+passed that check before OCM deleted anything. Until then, `ocm dev` and new
+simulations refuse to reuse the marked worktree. Removal still refuses a directory
 at the worktree path that is not registered to the OpenClaw checkout.
 
 For legacy layouts created before overlapping roots were rejected, removal refuses

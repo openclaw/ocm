@@ -968,6 +968,9 @@ pub(crate) fn validate_openclaw_worktree(
             display_path(worktree_root)
         ));
     }
+    if removal_in_progress(worktree_root) {
+        return Err(worktree_being_removed(worktree_root));
+    }
     if !is_existing_openclaw_worktree(repo_root, worktree_root) {
         return Err(format!(
             "registered worktree is not a valid OpenClaw checkout: {}",
@@ -995,6 +998,8 @@ pub(crate) fn ensure_openclaw_worktree(
     if worktree_registered {
         if !worktree_root.exists() {
             remove_registered_worktree(&repo_root, &worktree_root)?;
+        } else if removal_in_progress(&worktree_root) {
+            return Err(worktree_being_removed(&worktree_root));
         } else if is_existing_openclaw_worktree(&repo_root, &worktree_root) {
             return Ok(OpenClawWorktree {
                 root: worktree_root,
@@ -1165,14 +1170,15 @@ const REMOVAL_MARKER_CONTENTS: &[u8] =
 
 fn remove_registered_worktree(repo_root: &Path, worktree_root: &Path) -> Result<(), String> {
     if worktree_root.exists() {
-        if !removal_in_progress(worktree_root) {
+        let resuming = removal_in_progress(worktree_root);
+        if !resuming {
             ensure_worktree_clean(worktree_root)?;
         }
         ensure_worktree_unlocked(worktree_root)?;
-        if !removal_in_progress(worktree_root) {
+        if !resuming {
             mark_worktree_removal(worktree_root)?;
         }
-        delete_worktree_files(worktree_root).map_err(|error| {
+        empty_worktree(worktree_root).map_err(|error| {
             format!(
                 "could not delete the files of git worktree {}: {error}; it stays registered and marked for removal, so fix the cause (such as permissions, an immutable flag, or a process still writing there) and re-run the command to finish removing it",
                 display_path(worktree_root)
@@ -1195,6 +1201,13 @@ fn remove_registered_worktree(repo_root: &Path, worktree_root: &Path) -> Result<
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let detail = if !stderr.is_empty() { stderr } else { stdout };
     Err(format!("git worktree remove failed: {detail}"))
+}
+
+fn worktree_being_removed(worktree_root: &Path) -> String {
+    format!(
+        "git worktree {} is partly deleted by an unfinished removal; re-run that environment's removal to finish it",
+        display_path(worktree_root)
+    )
 }
 
 // Only an untracked marker file that OCM wrote counts; a tracked file of the
@@ -1249,29 +1262,64 @@ fn ensure_worktree_unlocked(worktree_root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-// Deletes every entry except the `.git` link and the marker, so the worktree
-// stays registered and identifiable until its files are gone. Removal does not
-// follow symbolic links.
-fn delete_worktree_files(worktree_root: &Path) -> std::io::Result<()> {
+// Leaves only the `.git` link and the marker, so the worktree stays
+// registered and identifiable until its files are gone and Git's own delete
+// has nothing left that can fail. A pass that still finds entries repeats, so
+// files a running process adds meanwhile are deleted here too.
+fn empty_worktree(worktree_root: &Path) -> std::io::Result<()> {
+    for _ in 0..3 {
+        if !delete_worktree_files(worktree_root)? {
+            return Ok(());
+        }
+    }
+    Err(std::io::Error::other(
+        "files kept appearing while they were deleted",
+    ))
+}
+
+// Deletes every entry except the `.git` link and the marker and reports
+// whether there was anything to delete. Removal does not follow symbolic links.
+fn delete_worktree_files(worktree_root: &Path) -> std::io::Result<bool> {
+    let mut deleted = false;
     for entry in fs::read_dir(worktree_root)? {
         let entry = entry?;
         let name = entry.file_name();
         if name == ".git" || name == REMOVAL_MARKER {
             continue;
         }
+        deleted = true;
         let path = entry.path();
         let result = match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(&path),
-            Ok(_) => fs::remove_file(&path),
+            Ok(metadata) => remove_worktree_file(&path, metadata),
             Err(error) => Err(error),
         };
         match result {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
+            Err(error) => {
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!("{}: {error}", display_path(&path)),
+                ));
+            }
         }
     }
-    Ok(())
+    Ok(deleted)
+}
+
+// Windows refuses to delete a read-only file, which Git's delete handled;
+// the standard library's directory removal already ignores the attribute.
+fn remove_worktree_file(path: &Path, metadata: fs::Metadata) -> std::io::Result<()> {
+    #[cfg(windows)]
+    if metadata.is_file() && metadata.permissions().readonly() {
+        let mut permissions = metadata.permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(path, permissions)?;
+    }
+    #[cfg(not(windows))]
+    let _ = metadata;
+    fs::remove_file(path)
 }
 
 fn ensure_worktree_clean(worktree_root: &Path) -> Result<(), String> {
@@ -2633,6 +2681,26 @@ mod tests {
 
         assert!(!worktree.exists());
         assert!(!registered(&repo, &worktree));
+    }
+
+    #[test]
+    fn worktree_marked_for_removal_is_not_reused() {
+        let (_temp, repo) = init_openclaw_repo();
+        let worktree = ensure_openclaw_worktree(&repo, "demo-sim").unwrap().root;
+        fs::write(
+            worktree.join(super::REMOVAL_MARKER),
+            super::REMOVAL_MARKER_CONTENTS,
+        )
+        .unwrap();
+
+        let reuse = ensure_openclaw_worktree(&repo, "demo-sim").err().unwrap();
+        let resume = super::validate_openclaw_worktree(&repo, &worktree).unwrap_err();
+
+        for error in [&reuse, &resume] {
+            assert!(error.contains("unfinished removal"), "{error}");
+        }
+        remove_openclaw_worktree(&repo, &worktree).unwrap();
+        assert!(!worktree.exists());
     }
 
     #[test]
