@@ -2359,3 +2359,122 @@ exec /bin/kill "$@"
         "stale inventory must leave the installation recoverable"
     );
 }
+
+/// Lays out a Go-style module cache, whose directories and files Go leaves
+/// read-only, inside an environment's workspace.
+#[cfg(unix)]
+fn add_read_only_module_cache(env_root: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let cache = env_root.join(".openclaw/workspace/go/pkg/mod");
+    let module = cache.join("example.com/lib@v1.0.0");
+    crate::support::write_text(&module.join("go.mod"), "module example.com/lib\n");
+    crate::support::write_text(&module.join("internal/lib.go"), "package lib\n");
+    for file in [module.join("go.mod"), module.join("internal/lib.go")] {
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o444)).unwrap();
+    }
+    for dir in [
+        module.join("internal"),
+        module.clone(),
+        cache.join("example.com"),
+    ] {
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+    }
+    cache
+}
+
+#[cfg(unix)]
+#[test]
+fn env_remove_deletes_read_only_directories_without_following_links() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = TestDir::new("env-remove-read-only-dirs");
+    let cwd = root.path();
+    let env = ocm_env(&root);
+    let created = run_ocm(cwd, &env, &["env", "create", "cache"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    let env_root = PathBuf::from(get_environment("cache", &env, cwd).unwrap().root);
+    add_read_only_module_cache(&env_root);
+    let unreadable = env_root.join(".openclaw/workspace/unreadable");
+    crate::support::write_text(&unreadable.join("notes.txt"), "notes\n");
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+    // A link to a read-only directory elsewhere must not change its permissions.
+    let outside = root.child("outside/read-only");
+    crate::support::write_text(&outside.join("kept.txt"), "kept\n");
+    fs::set_permissions(&outside, fs::Permissions::from_mode(0o555)).unwrap();
+    std::os::unix::fs::symlink(&outside, env_root.join(".openclaw/workspace/linked")).unwrap();
+
+    let removed = run_ocm(cwd, &env, &["env", "remove", "cache"]);
+    let outside_mode = fs::metadata(&outside).unwrap().permissions().mode() & 0o777;
+    fs::set_permissions(&outside, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(removed.status.success(), "{}", stderr(&removed));
+    assert!(stdout(&removed).contains("Removed env cache"));
+    assert!(!env_root.exists());
+    assert!(get_environment("cache", &env, cwd).is_err());
+    assert_eq!(outside_mode, 0o555);
+    assert_eq!(
+        fs::read_to_string(outside.join("kept.txt")).unwrap(),
+        "kept\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn env_prune_removes_previewed_environments_with_read_only_directories() {
+    let root = TestDir::new("env-prune-read-only-dirs");
+    let cwd = root.path();
+    let env = ocm_env(&root);
+    let mut roots = Vec::new();
+    for name in ["a-cache", "b-plain"] {
+        let created = run_ocm(cwd, &env, &["env", "create", name]);
+        assert!(created.status.success(), "{}", stderr(&created));
+        let mut meta = get_environment(name, &env, cwd).unwrap();
+        meta.created_at -= time::Duration::days(30);
+        let meta = save_environment(meta, &env, cwd).unwrap();
+        roots.push(PathBuf::from(meta.root));
+    }
+    add_read_only_module_cache(&roots[0]);
+    let names = |result: &serde_json::Value, key: &str| -> Vec<String> {
+        result[key]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    let preview = run_ocm(cwd, &env, &["env", "prune", "--json"]);
+    assert!(preview.status.success(), "{}", stderr(&preview));
+    let preview: serde_json::Value = serde_json::from_str(&stdout(&preview)).unwrap();
+    assert_eq!(names(&preview, "candidates"), ["a-cache", "b-plain"]);
+
+    let applied = run_ocm(cwd, &env, &["env", "prune", "--yes", "--json"]);
+    assert!(applied.status.success(), "{}", stderr(&applied));
+    let applied: serde_json::Value = serde_json::from_str(&stdout(&applied)).unwrap();
+    assert_eq!(names(&applied, "removed"), ["a-cache", "b-plain"]);
+    for env_root in &roots {
+        assert!(!env_root.exists(), "{}", env_root.display());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn env_destroy_removes_read_only_directories_and_snapshots() {
+    let root = TestDir::new("env-destroy-read-only-dirs");
+    let cwd = root.path();
+    let env = ocm_env(&root);
+    let created = run_ocm(cwd, &env, &["env", "create", "cache"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    let env_root = PathBuf::from(get_environment("cache", &env, cwd).unwrap().root);
+    add_read_only_module_cache(&env_root);
+    let snapshot = run_ocm(cwd, &env, &["env", "snapshot", "create", "cache"]);
+    assert!(snapshot.status.success(), "{}", stderr(&snapshot));
+
+    let destroyed = run_ocm(cwd, &env, &["env", "destroy", "cache", "--yes", "--json"]);
+    assert!(destroyed.status.success(), "{}", stderr(&destroyed));
+    let summary: serde_json::Value = serde_json::from_str(&stdout(&destroyed)).unwrap();
+    assert_eq!(summary["removed"], true, "{summary}");
+    assert_eq!(summary["snapshotsRemoved"], 1, "{summary}");
+    assert!(!env_root.exists());
+    assert!(get_environment("cache", &env, cwd).is_err());
+}

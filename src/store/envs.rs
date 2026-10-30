@@ -1754,6 +1754,12 @@ pub(crate) fn remove_environment_locked(
     // Preliminary cleanup shares this registry lock through final deletion.
     // It must not call back into registry-mutating operations.
     before_remove(&meta)?;
+    prepare_environment_root_removal(&paths.root).map_err(|error| {
+        format!(
+            "cannot remove environment \"{}\": {error}; no files were removed",
+            meta.name
+        )
+    })?;
 
     if let Some((repo_root, worktree_root)) = meta.dev.as_ref().and_then(|dev| dev.owned_worktree())
     {
@@ -1761,7 +1767,12 @@ pub(crate) fn remove_environment_locked(
     }
 
     if path_exists(&paths.root) {
-        fs::remove_dir_all(&paths.root).map_err(|error| error.to_string())?;
+        fs::remove_dir_all(&paths.root).map_err(|error| {
+            format!(
+                "could not finish removing {}, part of it may already be gone: {error}",
+                display_path(&paths.root)
+            )
+        })?;
     }
 
     source_service.remove_stopped_source_watch_state_locked(&safe_name)?;
@@ -1773,6 +1784,59 @@ pub(crate) fn remove_environment_locked(
     super::dev_ui_ports::remove(&meta, env, cwd)?;
 
     Ok(meta)
+}
+
+/// Gives the current user full access to each directory it owns under an
+/// environment root before anything is deleted. Tools such as Go leave module
+/// caches read-only, and a recursive delete would otherwise stop partway.
+/// Directories owned by other users are left unchanged.
+#[cfg(unix)]
+fn prepare_environment_root_removal(root: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    // SAFETY: geteuid has no preconditions.
+    let user = unsafe { libc::geteuid() };
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let metadata = match fs::symlink_metadata(&dir) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!("could not inspect {}: {error}", display_path(&dir)));
+            }
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+        let owned = metadata.uid() == user;
+        let mode = metadata.permissions().mode();
+        if owned && mode & 0o700 != 0o700 {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(mode | 0o700)).map_err(
+                |error| format!("could not make {} writable: {error}", display_path(&dir)),
+            )?;
+        }
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            // Another user's directory keeps its permissions; removal reports it.
+            Err(_) if !owned => continue,
+            Err(error) => {
+                return Err(format!("could not read {}: {error}", display_path(&dir)));
+            }
+        };
+        for entry in entries {
+            let entry =
+                entry.map_err(|error| format!("could not read {}: {error}", display_path(&dir)))?;
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                pending.push(entry.path());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn prepare_environment_root_removal(_root: &Path) -> Result<(), String> {
+    Ok(())
 }
 
 pub(crate) fn with_locked_environments<T>(
