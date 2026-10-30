@@ -1443,11 +1443,20 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("Launcher") && line.contains("dev"))
         );
+        // A clear never matches the bind of an entry named like the clear wording.
+        assert_ne!(
+            env_runtime_updated("demo", None, RenderProfile::raw()),
+            env_runtime_updated("demo", Some("cleared"), RenderProfile::raw())
+        );
         let cleared = env_runtime_updated("demo", None, RenderProfile::pretty(false));
+        assert_ne!(
+            cleared,
+            env_runtime_updated("demo", Some("cleared"), RenderProfile::pretty(false))
+        );
         assert!(
             cleared
                 .iter()
-                .any(|line| line.contains("Runtime") && line.contains("cleared")),
+                .any(|line| line.contains("Runtime") && line.contains("(cleared)")),
             "{cleared:?}"
         );
         assert!(
@@ -3180,7 +3189,8 @@ fn env_binding_updated(
             KeyValueRow::accent("Env", name),
             match bound {
                 Some(bound) => KeyValueRow::accent(label, bound),
-                None => KeyValueRow::muted(label, "cleared"),
+                // Parentheses never appear in a registered name.
+                None => KeyValueRow::muted(label, "(cleared)"),
             },
         ],
         profile.color,

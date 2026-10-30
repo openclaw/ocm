@@ -2017,7 +2017,7 @@ pub fn launcher_command_help(cmd: &str, action: &str) -> Option<String> {
                 format!("{cmd} launcher add stable --command openclaw"),
                 format!("{cmd} launcher add dev --command 'pnpm openclaw' --cwd /path/to/openclaw"),
             ],
-            &[],
+            &["`none` is reserved in any letter case because it clears a binding."],
         ),
         "list" => render_leaf(
             "List launchers",
@@ -2080,7 +2080,7 @@ pub fn runtime_command_help(cmd: &str, action: &str) -> Option<String> {
                 ("--json", "Print the runtime record as JSON"),
             ],
             vec![format!("{cmd} runtime add stable --path /path/to/openclaw")],
-            &[],
+            &["`none` is reserved in any letter case because it clears a binding."],
         ),
         "install" => render_leaf(
             "Install a managed runtime",
@@ -2126,6 +2126,7 @@ pub fn runtime_command_help(cmd: &str, action: &str) -> Option<String> {
             ],
             &[
                 "Exactly one install source must be provided.",
+                "`none` is reserved as a runtime name in any letter case because it clears a binding.",
                 "Runtime metadata and install directories must not conflict with another runtime's paths, even with --force. Choose another name if a destination is occupied.",
                 "Official installs use canonical runtime names unless you reuse the same canonical name explicitly.",
                 "Bound runtimes are reused only when the selected release already matches. Use `ocm upgrade <env>` when OpenClaw bytes must change.",

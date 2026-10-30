@@ -4093,7 +4093,7 @@ pub(crate) fn install_runtime_with_context(
     context: InstallContext<'_>,
 ) -> Result<RuntimeMeta, String> {
     let InstallContext { env, cwd, .. } = context;
-    let name = validate_name(&options.name, "Runtime name")?;
+    let name = validate_registration_name(&options.name, "Runtime name")?;
     let target = prepare_runtime_install_target(name, options.force, context)?;
 
     let raw_path = options.path.trim();
@@ -4155,7 +4155,7 @@ pub(crate) fn install_runtime_from_url_with_context(
     options: InstallRuntimeFromUrlOptions,
     context: InstallContext<'_>,
 ) -> Result<RuntimeMeta, String> {
-    let name = validate_name(&options.name, "Runtime name")?;
+    let name = validate_registration_name(&options.name, "Runtime name")?;
     let target = prepare_runtime_install_target(name, options.force, context)?;
 
     let file_name = artifact_file_name_from_url(&options.url)?;
@@ -4176,7 +4176,7 @@ pub(crate) fn install_runtime_from_local_openclaw_build(
     options: BuildLocalRuntimeOptions,
     context: InstallContext<'_>,
 ) -> Result<RuntimeMeta, String> {
-    let name = validate_name(&options.name, "Runtime name")?;
+    let name = validate_registration_name(&options.name, "Runtime name")?;
     let meta_path = runtime_meta_path(&name, context.env, context.cwd)?;
     if path_exists(&meta_path) && !options.force {
         return Err(format!("runtime \"{name}\" already exists"));
@@ -4353,6 +4353,7 @@ pub(crate) fn install_runtime_from_release_with_context(
     context: InstallContext<'_>,
 ) -> Result<RuntimeMeta, String> {
     let InstallContext { env, cwd, .. } = context;
+    validate_registration_name(&options.name, "Runtime name")?;
     let manifest = load_release_manifest(&options.manifest_url)?;
     let release = select_release(
         &manifest,
@@ -4463,7 +4464,7 @@ pub(crate) fn install_runtime_from_official_openclaw_release_with_context(
     context: InstallContext<'_>,
 ) -> Result<RuntimeMeta, String> {
     let env = context.env;
-    let name = validate_name(&options.name, "Runtime name")?;
+    let name = validate_registration_name(&options.name, "Runtime name")?;
     let channel = options
         .channel
         .as_deref()

@@ -77,11 +77,35 @@ fn runtime_and_launcher_registration_reserve_the_clear_keyword() {
     fs::create_dir_all(&cwd).unwrap();
     write_executable_script(&cwd.join("openclaw"), "#!/bin/sh\nprintf '2026.8.1\\n'\n");
     let env = ocm_env(&root);
+    // Sources are unreachable or missing: a refusal must come before any fetch or repo probe.
 
     for name in ["none", "None", "NONE"] {
         for args in [
             vec!["runtime", "add", name, "--path", "./openclaw"],
             vec!["runtime", "install", name, "--path", "./openclaw"],
+            vec![
+                "runtime",
+                "install",
+                name,
+                "--url",
+                "http://127.0.0.1:9/openclaw",
+            ],
+            vec![
+                "runtime",
+                "install",
+                name,
+                "--manifest-url",
+                "http://127.0.0.1:9/releases.json",
+                "--version",
+                "2026.8.1",
+            ],
+            vec![
+                "runtime",
+                "build-local",
+                name,
+                "--repo",
+                "./missing-checkout",
+            ],
         ] {
             let refused = run_ocm(&cwd, &env, &args);
             assert_eq!(refused.status.code(), Some(1), "{args:?}");
