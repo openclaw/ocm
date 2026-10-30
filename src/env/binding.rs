@@ -70,7 +70,8 @@ impl<'a> EnvironmentService<'a> {
             source_root: crate::store::display_path(&source),
         };
         // Register only the new source: the old checkout may no longer exist.
-        let registration = crate::store::DevSourceRegistration::lock_source(
+        let registration = crate::store::DevSourceRegistration::lock_source_holding(
+            name,
             &dev,
             &self.list()?,
             self.env,

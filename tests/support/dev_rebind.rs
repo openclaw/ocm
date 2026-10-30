@@ -187,10 +187,42 @@ fn dev_rebind_refusals_preserve_the_binding_and_policy() {
         assert!(!rebind(root.path(), &env, &target).status.success());
         assert_eq!(fs::read(&registry).unwrap(), unchanged);
     }
+    // A target inside the environment's own root, or a shared clone whose
+    // objects live there, is refused for isolation rather than reported as a
+    // concurrent operation that a retry could clear.
     let overlap = Path::new(&original.root).join("source");
     init_nested_openclaw_repo(&overlap);
-    assert!(!rebind(root.path(), &env, &overlap).status.success());
-    assert_eq!(fs::read(&registry).unwrap(), unchanged);
+    commit_nested_openclaw_repo(&overlap);
+    let shared = root.child("shared-clone");
+    let cloned = Command::new("git")
+        .args(["clone", "-q", "--shared"])
+        .arg(&overlap)
+        .arg(&shared)
+        .output()
+        .unwrap();
+    assert!(
+        cloned.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cloned.stderr)
+    );
+    for refused in [
+        rebind(root.path(), &env, &overlap),
+        rebind(root.path(), &env, &shared),
+        run_ocm(
+            root.path(),
+            &env,
+            &dev_plain(&["demo", "--repo", &path_string(&overlap)]),
+        ),
+    ] {
+        assert!(!refused.status.success());
+        let message = stderr(&refused);
+        assert!(
+            message.contains("overlaps borrowed source or Git metadata for env demo"),
+            "{message}"
+        );
+        assert!(!message.contains("operation in progress"), "{message}");
+        assert_eq!(fs::read(&registry).unwrap(), unchanged);
+    }
     let operation = hold_environment_operation(&root, "demo");
     let busy = rebind(root.path(), &env, &repo);
     assert!(!busy.status.success());
