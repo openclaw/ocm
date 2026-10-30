@@ -77,9 +77,10 @@ fn runtime_and_launcher_registration_reserve_the_clear_keyword() {
     fs::create_dir_all(&cwd).unwrap();
     write_executable_script(&cwd.join("openclaw"), "#!/bin/sh\nprintf '2026.8.1\\n'\n");
     let env = ocm_env(&root);
-    // Sources are unreachable or missing: a refusal must come before any fetch or repo probe.
 
     for name in ["none", "None", "NONE"] {
+        // URL and manifest sources are unreachable and the build-local repo is
+        // missing, so the reserved-name error proves the refusal comes first.
         for args in [
             vec!["runtime", "add", name, "--path", "./openclaw"],
             vec!["runtime", "install", name, "--path", "./openclaw"],

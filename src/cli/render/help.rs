@@ -2126,7 +2126,7 @@ pub fn runtime_command_help(cmd: &str, action: &str) -> Option<String> {
             ],
             &[
                 "Exactly one install source must be provided.",
-                "`none` is reserved as a runtime name in any letter case because it clears a binding.",
+                "`none` is reserved in any letter case because it clears a binding.",
                 "Runtime metadata and install directories must not conflict with another runtime's paths, even with --force. Choose another name if a destination is occupied.",
                 "Official installs use canonical runtime names unless you reuse the same canonical name explicitly.",
                 "Bound runtimes are reused only when the selected release already matches. Use `ocm upgrade <env>` when OpenClaw bytes must change.",
@@ -2191,6 +2191,7 @@ pub fn runtime_command_help(cmd: &str, action: &str) -> Option<String> {
                 "The resulting runtime is installed under OCM's package runtime layout: files/node_modules/openclaw/openclaw.mjs.",
                 "Use this when testing release and upgrade behavior from a local checkout without source/Jiti execution paths.",
                 "A runtime used by an environment, directly or through a registered alias, cannot be replaced directly. Clear dependent bindings first or use `ocm upgrade <env>` for published OpenClaw releases.",
+                "`none` is reserved in any letter case because it clears a binding.",
             ],
         ),
         "update" => render_leaf(
