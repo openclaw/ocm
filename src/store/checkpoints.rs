@@ -12,7 +12,7 @@ use std::sync::{
 
 #[cfg(not(target_os = "macos"))]
 use filetime::{FileTime, set_file_times, set_symlink_file_times};
-use rusqlite::{Connection, ErrorCode, OpenFlags};
+use rusqlite::{Connection, OpenFlags};
 #[cfg(not(target_os = "macos"))]
 use std::io::Write;
 
@@ -20,7 +20,7 @@ use super::common::{ensure_dir, path_exists};
 use super::dev_sources::projected_path_contains;
 use super::layout::display_path;
 use super::openclaw_workspaces::canonicalize_path_allow_missing;
-use crate::infra::sqlite_snapshot::{recover_hot_journal, sqlite_needs_rollback};
+use crate::infra::sqlite_snapshot::{recover_hot_journal, sqlite_is_busy, sqlite_needs_rollback};
 use crate::infra::tree_digest::{inventory_tree, inventory_tree_except};
 
 pub(crate) const STORAGE_APFS_CLONE: &str = "apfs-clone-v1";
@@ -494,13 +494,6 @@ fn sqlite_needs_writable_directory(error: &rusqlite::Error) -> bool {
     error
         .sqlite_error()
         .is_some_and(|error| error.extended_code == rusqlite::ffi::SQLITE_READONLY_DIRECTORY)
-}
-
-fn sqlite_is_busy(error: &rusqlite::Error) -> bool {
-    matches!(
-        error.sqlite_error_code(),
-        Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
-    )
 }
 
 #[cfg(target_os = "macos")]
@@ -2166,7 +2159,7 @@ mod tests {
         let source = tempfile::tempdir().unwrap();
         let database = source.path().join("proj/app.db");
         fs::create_dir_all(database.parent().unwrap()).unwrap();
-        plant_hot_journal(&database);
+        let _ = plant_hot_journal(&database);
         let journal = source.path().join("proj/app.db-journal");
         let before = [fs::read(&database).unwrap(), fs::read(&journal).unwrap()];
         let destination_parent = tempfile::tempdir().unwrap();
@@ -2195,12 +2188,44 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn checkpoint_refuses_a_corrupt_database_behind_hot_journal() {
+        use crate::infra::sqlite_snapshot::{damage_page, plant_hot_journal};
+
+        let source = tempfile::tempdir().unwrap();
+        let database = source.path().join("app.db");
+        let untouched = plant_hot_journal(&database);
+        damage_page(&database, untouched);
+        let before = [
+            fs::read(&database).unwrap(),
+            fs::read(source.path().join("app.db-journal")).unwrap(),
+        ];
+        let destination_parent = tempfile::tempdir().unwrap();
+
+        let error =
+            super::create_tree_checkpoint(source.path(), &destination_parent.path().join("c"))
+                .unwrap_err();
+
+        assert!(
+            error.contains("integrity check failed") || error.contains("malformed"),
+            "{error}"
+        );
+        assert_eq!(
+            [
+                fs::read(&database).unwrap(),
+                fs::read(source.path().join("app.db-journal")).unwrap()
+            ],
+            before
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn checkpoint_refuses_a_journal_copied_from_a_database_in_use() {
         use crate::infra::sqlite_snapshot::plant_hot_journal;
 
         let source = tempfile::tempdir().unwrap();
         let database = source.path().join("app.db");
-        plant_hot_journal(&database);
+        let _ = plant_hot_journal(&database);
         let captured = tempfile::tempdir().unwrap();
         let captured_database = captured.path().join("app.db");
         fs::copy(&database, &captured_database).unwrap();

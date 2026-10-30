@@ -1877,6 +1877,34 @@ fn visit_files(root: &Path, on_file: &mut dyn FnMut(&Path)) {
 }
 
 #[test]
+fn env_clone_captures_committed_rows_behind_a_hot_journal() {
+    let root = TestDir::new("env-clone-hot-journal");
+    let env = ocm_env(&root);
+    let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let state = root.child("ocm-home/envs/source/.openclaw/state");
+    let database = state.join("openclaw-quarantine.sqlite");
+    let committed = support::plant_hot_journal(&database);
+    let journal = state.join("openclaw-quarantine.sqlite-journal");
+    let before = [fs::read(&database).unwrap(), fs::read(&journal).unwrap()];
+
+    let clone = run_ocm(root.path(), &env, &["env", "clone", "source", "target"]);
+    assert!(clone.status.success(), "{}", stderr(&clone));
+
+    // The live database is read, never recovered in place.
+    assert_eq!(
+        [fs::read(&database).unwrap(), fs::read(&journal).unwrap()],
+        before
+    );
+    assert_eq!(
+        support::captured_records(
+            &root.child("ocm-home/envs/target/.openclaw/state/openclaw-quarantine.sqlite")
+        ),
+        committed
+    );
+}
+
+#[test]
 fn env_clone_rolls_back_an_unreadable_sqlite_snapshot() {
     for aliased in [false, true] {
         #[cfg(not(unix))]

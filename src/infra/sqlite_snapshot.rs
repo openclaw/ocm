@@ -43,7 +43,7 @@ pub(crate) fn sqlite_needs_rollback(error: &rusqlite::Error) -> bool {
         .is_some_and(|error| error.extended_code == rusqlite::ffi::SQLITE_READONLY_ROLLBACK)
 }
 
-fn sqlite_is_busy(error: &rusqlite::Error) -> bool {
+pub(crate) fn sqlite_is_busy(error: &rusqlite::Error) -> bool {
     matches!(
         error.sqlite_error_code(),
         Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
@@ -464,9 +464,11 @@ fn backup_database(
 
 /// Leaves `database` with a hot rollback journal over 300 committed rows, as a
 /// writer killed mid-transaction does: the uncommitted change is spilled into
-/// the database file and its original pages are in the journal.
-#[cfg(test)]
-pub(crate) fn plant_hot_journal(database: &Path) {
+/// the database file and its original pages are in the journal. Returns the
+/// byte offset of a page the transaction never touched, so the journal does
+/// not restore it.
+#[cfg(all(test, unix))]
+pub(crate) fn plant_hot_journal(database: &Path) -> u64 {
     let scratch = tempfile::tempdir().unwrap();
     let writer_path = scratch.path().join("writer.sqlite");
     let writer = Connection::open(&writer_path).unwrap();
@@ -476,10 +478,21 @@ pub(crate) fn plant_hot_journal(database: &Path) {
              CREATE TABLE records(id INTEGER PRIMARY KEY, value TEXT NOT NULL);
              WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 299)
              INSERT INTO records(value) SELECT 'committed' || i FROM n;
+             CREATE TABLE untouched(value TEXT NOT NULL);
+             WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 399)
+             INSERT INTO untouched SELECT printf('%.300c', 'u') FROM n;
              PRAGMA cache_size=5;
              BEGIN;
              UPDATE records SET value = value || printf('%.2000c', 'x');
              INSERT INTO records(value) SELECT value FROM records;",
+        )
+        .unwrap();
+    let untouched_page = writer
+        .query_row(
+            "SELECT (rootpage - 1) * (SELECT page_size FROM pragma_page_size())
+             FROM sqlite_schema WHERE name = 'untouched'",
+            [],
+            |row| row.get::<_, i64>(0),
         )
         .unwrap();
     let journal = journal_path(&writer_path);
@@ -487,10 +500,23 @@ pub(crate) fn plant_hot_journal(database: &Path) {
     // Copies carry no locks, so the copied journal is hot.
     std::fs::copy(&writer_path, database).unwrap();
     std::fs::copy(&journal, journal_path(database)).unwrap();
+    u64::try_from(untouched_page).unwrap()
+}
+
+/// Overwrites the start of the page at `offset` so integrity checks fail.
+#[cfg(all(test, unix))]
+pub(crate) fn damage_page(database: &Path, offset: u64) {
+    use std::os::unix::fs::FileExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(database)
+        .unwrap()
+        .write_all_at(&[0xff; 64], offset)
+        .unwrap();
 }
 
 /// The committed rows a read-write open recovers from `database` and its journal.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn recovered_records(database: &Path) -> Vec<String> {
     let scratch = tempfile::tempdir().unwrap();
     let copy = scratch.path().join("copy.sqlite");
@@ -584,7 +610,7 @@ mod tests {
     fn sqlite_snapshot_captures_committed_rows_behind_hot_journal() {
         let source = tempfile::tempdir().unwrap();
         let database = source.path().join("app.db");
-        plant_hot_journal(&database);
+        let _ = plant_hot_journal(&database);
         let committed = (0..300)
             .map(|i| format!("committed{i}"))
             .collect::<Vec<_>>();
@@ -620,11 +646,38 @@ mod tests {
         assert_eq!(entries, ["app.db", "app.db-journal"]);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_snapshot_refuses_a_corrupt_database_behind_hot_journal() {
+        let source = tempfile::tempdir().unwrap();
+        let database = source.path().join("app.db");
+        let untouched = plant_hot_journal(&database);
+        damage_page(&database, untouched);
+        let before = [
+            fs::read(&database).unwrap(),
+            fs::read(journal_path(&database)).unwrap(),
+        ];
+
+        let error = create_sqlite_snapshot(&database).err().unwrap();
+
+        assert!(
+            error.contains("integrity check failed") || error.contains("malformed"),
+            "{error}"
+        );
+        assert_eq!(
+            [
+                fs::read(&database).unwrap(),
+                fs::read(journal_path(&database)).unwrap()
+            ],
+            before
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn sqlite_directory_snapshot_captures_committed_rows_behind_hot_journal() {
         let source = tempfile::tempdir().unwrap();
-        plant_hot_journal(&source.path().join("app.db"));
+        let _ = plant_hot_journal(&source.path().join("app.db"));
         let directory = File::open(source.path()).unwrap();
 
         let snapshot =
@@ -645,7 +698,7 @@ mod tests {
     fn hot_journal_recovery_refuses_a_database_in_use() {
         let source = tempfile::tempdir().unwrap();
         let database = source.path().join("app.db");
-        plant_hot_journal(&database);
+        let _ = plant_hot_journal(&database);
         let recovered = recover_hot_journal(&database).unwrap().unwrap();
         assert!(recovered.matches(&database).unwrap());
 
