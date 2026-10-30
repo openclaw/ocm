@@ -4627,3 +4627,48 @@ fn env_clone_rejects_only_mutating_saved_skill_includes() {
         }
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn env_clone_skips_fifos_and_sockets_without_blocking() {
+    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::net::UnixListener;
+    use std::time::Duration;
+
+    let root = TestDir::new("clone-special-files");
+    let env = ocm_env(&root);
+    let created = run_ocm(root.path(), &env, &["env", "create", "source"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    let workspace = root.child("ocm-home/envs/source/.openclaw/workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::write(workspace.join("notes.txt"), "kept\n").unwrap();
+    std::os::unix::fs::symlink("notes.txt", workspace.join("notes-link")).unwrap();
+    support::make_fifo(&workspace.join("pipe"));
+    let _listener = UnixListener::bind(workspace.join("endpoint.sock")).unwrap();
+
+    let cloned = support::run_ocm_within(
+        root.path(),
+        &env,
+        &["env", "clone", "source", "target"],
+        Duration::from_secs(60),
+    );
+
+    assert!(cloned.status.success(), "{}", stderr(&cloned));
+    let copied = root.child("ocm-home/envs/target/.openclaw/workspace");
+    assert_eq!(
+        fs::read_to_string(copied.join("notes.txt")).unwrap(),
+        "kept\n"
+    );
+    assert_eq!(
+        fs::read_link(copied.join("notes-link")).unwrap(),
+        Path::new("notes.txt")
+    );
+    assert!(fs::symlink_metadata(copied.join("pipe")).is_err());
+    assert!(fs::symlink_metadata(copied.join("endpoint.sock")).is_err());
+    assert!(
+        fs::symlink_metadata(workspace.join("pipe"))
+            .unwrap()
+            .file_type()
+            .is_fifo()
+    );
+}

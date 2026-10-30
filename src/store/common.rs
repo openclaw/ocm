@@ -721,6 +721,11 @@ fn copy_path_inner(
     if file_type.is_socket() {
         return Ok(());
     }
+    // Clone and migration copy only data entries, as environment export does.
+    // FIFOs and device nodes hold none, and opening a FIFO waits for a writer.
+    if copying.is_some() && !file_type.is_file() {
+        return Ok(());
+    }
     if let Some(parent) = destination.parent() {
         ensure_dir(parent)?;
     }
