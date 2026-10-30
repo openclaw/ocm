@@ -610,8 +610,7 @@ impl<'a> EnvironmentService<'a> {
         self.ensure_source_watch_stopped(env_name)?;
         // Resolve once: removing the session can change where the name resolves.
         let path = self.source_watch_state_path(env_name)?;
-        let paths =
-            SourceWatchSessionPaths::from_override(&path, self.gateway_admission_path(env_name)?);
+        let paths = self.source_watch_session_paths_at(env_name, &path)?;
         remove_file_if_present(&paths.session)?;
         remove_file_if_present(&paths.request)?;
         remove_file_if_present(&path)
@@ -680,8 +679,18 @@ impl<'a> EnvironmentService<'a> {
         &self,
         env_name: &str,
     ) -> Result<SourceWatchSessionPaths, String> {
+        self.source_watch_session_paths_at(env_name, &self.source_watch_state_path(env_name)?)
+    }
+
+    // The Gateway admission lock stays on the raw name wherever the rest of
+    // the state lives, so every admission user locks the same file.
+    pub(super) fn source_watch_session_paths_at(
+        &self,
+        env_name: &str,
+        state_path: &Path,
+    ) -> Result<SourceWatchSessionPaths, String> {
         Ok(SourceWatchSessionPaths::from_override(
-            &self.source_watch_state_path(env_name)?,
+            state_path,
             self.gateway_admission_path(env_name)?,
         ))
     }

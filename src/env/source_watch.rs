@@ -615,10 +615,8 @@ impl<'a> EnvironmentService<'a> {
         {
             return Err("source watch generation changed; refusing stale recovery".to_string());
         }
-        let session_paths = SourceWatchSessionPaths::from_override(
-            &override_path,
-            self.gateway_admission_path(&session.env_name)?,
-        );
+        let session_paths =
+            self.source_watch_session_paths_at(&session.env_name, &override_path)?;
         Ok(SourceWatchLease {
             env_name: session.env_name.clone(),
             lease_id: session.lease_id.clone(),
@@ -852,10 +850,7 @@ impl<'a> EnvironmentService<'a> {
             ));
         }
         let override_path = self.source_watch_state_path(&env_name)?;
-        let session_paths = SourceWatchSessionPaths::from_override(
-            &override_path,
-            self.gateway_admission_path(&env_name)?,
-        );
+        let session_paths = self.source_watch_session_paths_at(&env_name, &override_path)?;
         let lock_path = override_path.with_extension("lock");
         if let Ok(meta) = read_json::<SourceWatchOverride>(&override_path)
             && !is_leased_source_watch(&meta)
