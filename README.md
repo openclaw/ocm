@@ -699,9 +699,11 @@ source environment root are left unchanged; external contents are not exported
 and may need separate preparation after moving.
 Import refuses to update a database outside the copied root; internal database
 links are retained.
-Owned file and directory links use relative targets in the archive, and a link
-that names another owned link keeps naming it; external and dangling links
-retain their targets without copying external contents.
+Owned file and directory links use relative targets in the archive. A link that
+names another owned link keeps naming it when every step of its path stays
+inside the environment and is exported; otherwise it points at the resolved
+target. External and dangling links retain their targets without copying
+external contents.
 Import relocates selected Git repositories and linked worktrees to the destination before registering the environment.
 For native bare shared repositories, object alternates relocate to donor storage
 already present in the archive. External or omitted bare donor entries stay

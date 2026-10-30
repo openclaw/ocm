@@ -1240,11 +1240,7 @@ fn owned_archive_link_target(
     // still follows them. Fall back to the resolved target otherwise.
     let named = named_owned_link_target(parent, &root, captured_target, options)
         .unwrap_or_else(|| target.to_path_buf());
-    let common = parent
-        .components()
-        .zip(named.components())
-        .take_while(|(left, right)| left == right)
-        .count();
+    let common = shared_ancestors(parent, &named);
     let mut relative = PathBuf::new();
     for _ in parent.components().skip(common) {
         relative.push("..");
@@ -1270,8 +1266,10 @@ fn named_owned_link_target(
     use std::path::Component;
     let mut components = captured_target.components();
     let mut named = Vec::new();
-    if captured_target.is_absolute() {
-        // Skip the leading part that names the root, possibly through an alias.
+    if let Ok(rest) = captured_target.strip_prefix(root) {
+        components = rest.components();
+    } else if captured_target.is_absolute() {
+        // Skip the leading part that names the root through an alias.
         let mut prefix = PathBuf::new();
         loop {
             let component = components.next()?;
@@ -1307,11 +1305,7 @@ fn named_owned_link_target(
         }
     }
     let named: PathBuf = named.iter().collect();
-    let common = parent
-        .components()
-        .zip(named.components())
-        .take_while(|(left, right)| left == right)
-        .count();
+    let common = shared_ancestors(parent, &named);
     // The shared ancestors are the link's own real directories. Each later
     // step may be a link and must resolve inside the root and be archived.
     let mut step = named.components().take(common).collect::<PathBuf>();
@@ -1327,6 +1321,14 @@ fn named_owned_link_target(
             .ok()?;
     }
     Some(named)
+}
+
+fn shared_ancestors(parent: &Path, named: &Path) -> usize {
+    parent
+        .components()
+        .zip(named.components())
+        .take_while(|(left, right)| left == right)
+        .count()
 }
 
 fn classify_sqlite_children(
