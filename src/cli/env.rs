@@ -1618,12 +1618,19 @@ impl Cli {
                         launcher_name,
                         command,
                         run_dir,
-                    } => run_shell(
-                        &command,
-                        &format!("launcher \"{launcher_name}\""),
-                        &build_openclaw_env(&env, &self.env),
-                        &run_dir,
-                    ),
+                    } => {
+                        // A failed chdir in the child is reported against the
+                        // shell, so name the directory before spawning it.
+                        if let Some(issue) = crate::launcher::working_directory_issue(&run_dir) {
+                            return Err(format!("launcher \"{launcher_name}\" {issue}"));
+                        }
+                        run_shell(
+                            &command,
+                            &format!("launcher \"{launcher_name}\""),
+                            &build_openclaw_env(&env, &self.env),
+                            &run_dir,
+                        )
+                    }
                     crate::env::ResolvedExecution::Runtime {
                         env,
                         program,

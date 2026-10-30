@@ -1769,6 +1769,53 @@ mod tests {
     }
 
     #[test]
+    fn env_status_pretty_suggests_launcher_repair_for_a_broken_working_directory() {
+        let lines = env_status(
+            &EnvStatusSummary {
+                env_name: "demo".to_string(),
+                root: "/tmp/demo".to_string(),
+                gateway_port: Some(18789),
+                gateway_port_source: Some("metadata".to_string()),
+                default_runtime: None,
+                default_launcher: Some("dev".to_string()),
+                resolved_kind: Some("launcher".to_string()),
+                resolved_name: Some("dev".to_string()),
+                binary_path: None,
+                command: Some("pnpm openclaw".to_string()),
+                run_dir: Some("/tmp/checkout".to_string()),
+                runtime_source_kind: None,
+                runtime_release_version: None,
+                runtime_release_channel: None,
+                runtime_health: None,
+                managed_service_state: Some("absent".to_string()),
+                openclaw_state: Some("stopped".to_string()),
+                global_service_state: None,
+                service_definition_drift: None,
+                service_live_exec_unverified: None,
+                service_orphaned_live: None,
+                service_issue: None,
+                issue: Some(
+                    "launcher \"dev\" working directory does not exist: /tmp/checkout".to_string(),
+                ),
+            },
+            RenderProfile::pretty(false),
+            "ocm",
+        );
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("working directory does not exist: /tmp/checkout"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("ocm env set-launcher demo <launcher>"))
+        );
+        assert!(!lines.iter().any(|line| line.contains("ocm @demo")));
+    }
+
+    #[test]
     fn env_resolved_pretty_uses_cards() {
         let lines = env_resolved(
             &ExecutionSummary {
@@ -2442,10 +2489,7 @@ fn env_status_next_steps(status: &EnvStatusSummary, command_example: &str) -> Ve
         }
     }
 
-    if status.resolved_kind.as_deref() == Some("launcher")
-        && status.command.is_none()
-        && status.issue.is_some()
-    {
+    if status.resolved_kind.as_deref() == Some("launcher") && status.issue.is_some() {
         return vec![
             KeyValueRow::accent("List launchers", format!("{command_example} launcher list")),
             KeyValueRow::warning(

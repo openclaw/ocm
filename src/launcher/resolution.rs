@@ -1,4 +1,6 @@
 use super::LauncherMeta;
+use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use crate::env::EnvMeta;
@@ -43,6 +45,33 @@ pub fn resolve_launcher_run_dir(launcher: &LauncherMeta, fallback_cwd: &Path) ->
         .as_deref()
         .map(PathBuf::from)
         .unwrap_or_else(|| fallback_cwd.to_path_buf())
+}
+
+/// Why the launcher's recorded working directory cannot be entered, if it
+/// cannot. A launcher without one runs in the caller's directory.
+pub fn launcher_working_directory_issue(launcher: &LauncherMeta) -> Option<String> {
+    working_directory_issue(Path::new(launcher.cwd.as_deref()?))
+}
+
+/// Why `dir` cannot be a child process's working directory, if it cannot.
+pub fn working_directory_issue(dir: &Path) -> Option<String> {
+    match fs::metadata(dir) {
+        Ok(metadata) if metadata.is_dir() => None,
+        Ok(_) => Some(format!(
+            "working directory is not a directory: {}",
+            dir.display()
+        )),
+        Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+            Some(format!(
+                "working directory does not exist: {}",
+                dir.display()
+            ))
+        }
+        Err(error) => Some(format!(
+            "working directory could not be read: {}: {error}",
+            dir.display()
+        )),
+    }
 }
 
 pub(crate) fn resolve_direct_launcher_command(

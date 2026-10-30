@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use super::{EnvMeta, EnvironmentService, ExecutionBinding, resolve_execution_binding};
+use crate::launcher::launcher_working_directory_issue;
 use crate::store::{
     OpenClawConfigRepair, OpenClawRuntimeStateCleanup, audit_openclaw_config, find_launcher,
     find_runtime, get_runtime, prepare_openclaw_config_repair,
@@ -282,7 +283,16 @@ impl<'a> EnvironmentService<'a> {
 
         let launcher_status = if let Some(launcher_name) = env.default_launcher.clone() {
             match find_launcher(&launcher_name, self.env, self.cwd) {
-                Ok(Some(_)) => "ok".to_string(),
+                Ok(Some(launcher)) => match launcher_working_directory_issue(&launcher) {
+                    Some(issue) => {
+                        push_issue(
+                            &mut issues,
+                            format!("launcher \"{}\" {issue}", launcher.name),
+                        );
+                        "broken".to_string()
+                    }
+                    None => "ok".to_string(),
+                },
                 Ok(None) => {
                     push_issue(
                         &mut issues,

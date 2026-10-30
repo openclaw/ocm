@@ -1,6 +1,8 @@
 mod support;
 
+use std::collections::BTreeMap;
 use std::fs;
+use std::path::Path;
 
 use serde_json::Value;
 
@@ -40,6 +42,109 @@ fn env_doctor_reports_a_healthy_launcher_bound_environment() {
     assert!(output.contains("resolutionStatus: ok"));
     assert!(output.contains("resolvedKind: launcher"));
     assert!(output.contains("resolvedName: shell"));
+}
+
+fn add_launcher_bound_env(
+    cwd: &Path,
+    env: &BTreeMap<String, String>,
+    name: &str,
+    run_dir: &Path,
+) -> String {
+    let add = run_ocm(
+        cwd,
+        env,
+        &[
+            "launcher",
+            "add",
+            name,
+            "--command",
+            "echo launcher-ran",
+            "--cwd",
+            run_dir.to_str().unwrap(),
+        ],
+    );
+    assert!(add.status.success(), "{}", stderr(&add));
+    let create = run_ocm(cwd, env, &["env", "create", name, "--launcher", name]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let show = run_ocm(cwd, env, &["launcher", "show", name, "--json"]);
+    assert!(show.status.success(), "{}", stderr(&show));
+    let launcher: Value = serde_json::from_str(&stdout(&show)).unwrap();
+    launcher["cwd"].as_str().unwrap().to_string()
+}
+
+fn assert_launcher_working_directory_reported(
+    cwd: &Path,
+    env: &BTreeMap<String, String>,
+    name: &str,
+    expected_issue: &str,
+) {
+    let doctor = run_ocm(cwd, env, &["env", "doctor", name, "--json"]);
+    assert!(doctor.status.success(), "{}", stderr(&doctor));
+    let value: Value = serde_json::from_str(&stdout(&doctor)).unwrap();
+    assert_eq!(value["healthy"], false);
+    assert_eq!(value["launcherStatus"], "broken");
+    assert_eq!(value["resolutionStatus"], "error");
+    assert_eq!(value["issues"], serde_json::json!([expected_issue]));
+
+    let status = run_ocm(cwd, env, &["env", "status", name, "--json"]);
+    assert!(status.status.success(), "{}", stderr(&status));
+    let value: Value = serde_json::from_str(&stdout(&status)).unwrap();
+    assert_eq!(value["issue"], expected_issue);
+
+    let run = run_ocm(cwd, env, &["env", "run", name, "--"]);
+    assert!(!run.status.success());
+    let error = stderr(&run);
+    assert!(error.contains(expected_issue), "{error}");
+    assert!(!error.contains("failed to run"), "{error}");
+    assert!(!stdout(&run).contains("launcher-ran"));
+}
+
+#[test]
+fn env_doctor_status_and_run_report_a_missing_launcher_working_directory() {
+    let root = TestDir::new("env-doctor-launcher-missing-cwd");
+    let cwd = root.child("workspace");
+    let checkout = cwd.join("checkout");
+    fs::create_dir_all(&checkout).unwrap();
+    let env = ocm_env(&root);
+    let recorded = add_launcher_bound_env(&cwd, &env, "dev", &checkout);
+
+    let doctor = run_ocm(&cwd, &env, &["env", "doctor", "dev", "--json"]);
+    assert!(doctor.status.success(), "{}", stderr(&doctor));
+    let value: Value = serde_json::from_str(&stdout(&doctor)).unwrap();
+    assert_eq!(value["healthy"], true);
+    assert_eq!(value["launcherStatus"], "ok");
+    let status = run_ocm(&cwd, &env, &["env", "status", "dev", "--json"]);
+    let value: Value = serde_json::from_str(&stdout(&status)).unwrap();
+    assert_eq!(value["issue"], Value::Null);
+    let run = run_ocm(&cwd, &env, &["env", "run", "dev", "--"]);
+    assert!(run.status.success(), "{}", stderr(&run));
+    assert!(stdout(&run).contains("launcher-ran"));
+
+    fs::remove_dir_all(&checkout).unwrap();
+    assert_launcher_working_directory_reported(
+        &cwd,
+        &env,
+        "dev",
+        &format!("launcher \"dev\" working directory does not exist: {recorded}"),
+    );
+}
+
+#[test]
+fn env_doctor_status_and_run_report_a_launcher_working_directory_that_is_a_file() {
+    let root = TestDir::new("env-doctor-launcher-file-cwd");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let file = cwd.join("checkout");
+    fs::write(&file, "").unwrap();
+    let env = ocm_env(&root);
+    let recorded = add_launcher_bound_env(&cwd, &env, "dev", &file);
+
+    assert_launcher_working_directory_reported(
+        &cwd,
+        &env,
+        "dev",
+        &format!("launcher \"dev\" working directory is not a directory: {recorded}"),
+    );
 }
 
 #[test]
