@@ -97,6 +97,13 @@ fn assert_launcher_working_directory_reported(
     assert!(error.contains(expected_issue), "{error}");
     assert!(!error.contains("failed to run"), "{error}");
     assert!(!stdout(&run).contains("launcher-ran"));
+
+    for format in ["--raw", "--json"] {
+        let resolve = run_ocm(cwd, env, &["env", "resolve", name, format]);
+        assert!(!resolve.status.success(), "{}", stdout(&resolve));
+        let error = stderr(&resolve);
+        assert!(error.contains(expected_issue), "{error}");
+    }
 }
 
 #[test]

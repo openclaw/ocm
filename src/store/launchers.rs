@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use crate::launcher::{AddLauncherOptions, LauncherMeta};
+use crate::launcher::{AddLauncherOptions, LauncherMeta, launcher_working_directory_issue};
 
 use super::common::{load_json_files, path_exists, read_json, read_json_if_present, write_json};
 use super::envs::{lock_env_registry, with_locked_environments};
@@ -34,6 +34,21 @@ pub fn get_launcher(
     let safe_name = validate_name(name, "Launcher name")?;
     find_launcher(&safe_name, env, cwd)?
         .ok_or_else(|| format!("launcher \"{safe_name}\" does not exist"))
+}
+
+/// Loads a launcher that is about to run, refusing one whose recorded working
+/// directory cannot be entered so the error names the directory instead of
+/// surfacing later as a spawn failure.
+pub(crate) fn get_launcher_verified(
+    name: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<LauncherMeta, String> {
+    let launcher = get_launcher(name, env, cwd)?;
+    if let Some(issue) = launcher_working_directory_issue(&launcher) {
+        return Err(format!("launcher \"{}\" {issue}", launcher.name));
+    }
+    Ok(launcher)
 }
 
 pub(crate) fn find_launcher(

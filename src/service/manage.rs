@@ -536,9 +536,11 @@ fn ensure_gateway_binding(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<(), String> {
-    EnvironmentService::new(env, cwd)
-        .resolve_gateway_process(name, true)
-        .map(|_| ())
+    let process = EnvironmentService::new(env, cwd).resolve_gateway_process(name, true)?;
+    if process.binding_kind == "launcher" {
+        crate::store::get_launcher_verified(&process.binding_name, env, cwd)?;
+    }
+    Ok(())
 }
 
 fn ensure_supervisor_running_locked(

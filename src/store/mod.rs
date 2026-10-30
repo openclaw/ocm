@@ -65,8 +65,8 @@ pub(crate) use gateway_ports::{
     openclaw_port_family_available, openclaw_port_family_range, resolve_config_gateway_port,
     resolve_effective_gateway_ports,
 };
-pub(crate) use launchers::find_launcher;
 pub use launchers::{add_launcher, get_launcher, list_launchers, remove_launcher};
+pub(crate) use launchers::{find_launcher, get_launcher_verified};
 pub use layout::{
     EnvPaths, StorePaths, clean_path, default_env_root, derive_env_paths, display_path,
     env_registry_path, launcher_meta_path, resolve_absolute_path, resolve_ocm_home,
