@@ -169,6 +169,9 @@ pub fn upgrade_rollback(summary: &UpgradeRollbackSummary, profile: RenderProfile
         return upgrade_rollback_raw(summary);
     }
 
+    // A rollback that failed left the environment where it was: the bound runtime or launcher is
+    // the attempted target, as on the failed forward-upgrade card.
+    let rollback_applied = !matches!(summary.outcome.as_str(), "failed" | "rollback-failed");
     let mut lines = vec![paint(
         &format!("Upgrade Rollback {}", summary.env_name),
         Tone::Strong,
@@ -187,7 +190,11 @@ pub fn upgrade_rollback(summary: &UpgradeRollbackSummary, profile: RenderProfile
                 ),
             ),
             KeyValueRow::plain(
-                "Now using",
+                if rollback_applied {
+                    "Now using"
+                } else {
+                    "Target"
+                },
                 format!("{}:{}", summary.binding_kind, summary.binding_name),
             ),
             KeyValueRow::new("Outcome", &summary.outcome, outcome_tone(&summary.outcome)),
@@ -205,7 +212,14 @@ pub fn upgrade_rollback(summary: &UpgradeRollbackSummary, profile: RenderProfile
     lines.extend(render_key_value_card(
         "History",
         &[
-            KeyValueRow::plain("Rolled back", &summary.transaction_id),
+            KeyValueRow::plain(
+                if rollback_applied {
+                    "Rolled back"
+                } else {
+                    "Attempted"
+                },
+                &summary.transaction_id,
+            ),
             KeyValueRow::plain(
                 "Transaction",
                 summary
@@ -220,7 +234,14 @@ pub fn upgrade_rollback(summary: &UpgradeRollbackSummary, profile: RenderProfile
         lines.push(String::new());
         lines.extend(render_key_value_card(
             "Release",
-            &[KeyValueRow::accent("OpenClaw", version)],
+            &[KeyValueRow::accent(
+                if rollback_applied {
+                    "OpenClaw"
+                } else {
+                    "Target OpenClaw"
+                },
+                version,
+            )],
             profile.color,
         ));
     }
@@ -1004,6 +1025,31 @@ mod tests {
         assert!(!removed.contains("not created"), "{removed}");
         assert!(dry_run.contains("not created"), "{dry_run}");
         assert!(!dry_run.contains("removed"), "{dry_run}");
+    }
+
+    #[test]
+    fn rollback_pretty_failure_names_the_attempted_target_not_a_completed_rollback() {
+        for outcome in ["failed", "rollback-failed"] {
+            let card = upgrade_rollback(&rollback_summary(outcome), RenderProfile::pretty(false))
+                .join("\n");
+
+            assert!(card.contains("Target"), "{outcome}: {card}");
+            assert!(card.contains("runtime:old"), "{outcome}: {card}");
+            assert!(card.contains("Attempted"), "{outcome}: {card}");
+            assert!(card.contains("Target OpenClaw"), "{outcome}: {card}");
+            assert!(!card.contains("Now using"), "{outcome}: {card}");
+            assert!(!card.contains("Rolled back"), "{outcome}: {card}");
+        }
+
+        let rolled_back = upgrade_rollback(
+            &rollback_summary("rolled-back"),
+            RenderProfile::pretty(false),
+        )
+        .join("\n");
+        assert!(rolled_back.contains("Now using"), "{rolled_back}");
+        assert!(rolled_back.contains("Rolled back"), "{rolled_back}");
+        assert!(!rolled_back.contains("Target"), "{rolled_back}");
+        assert!(!rolled_back.contains("Attempted"), "{rolled_back}");
     }
 
     #[test]

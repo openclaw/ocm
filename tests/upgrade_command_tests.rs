@@ -8348,6 +8348,26 @@ fn rollback_refuses_runtime_mutation_when_quiescence_observation_is_lost() {
 }
 
 #[test]
+fn upgrade_rollback_failure_card_does_not_claim_a_completed_rollback() {
+    let root = TestDir::new("upgrade-rollback-failure-card");
+    let fixture = seed_in_place_rollback(&root, "broken-recovery");
+
+    let rollback = run_ocm(
+        &fixture.cwd,
+        &fixture.env,
+        &["upgrade", "rollback", "demo", "--color", "always"],
+    );
+    let card = stdout(&rollback);
+    assert!(!rollback.status.success(), "{card}");
+    assert!(card.contains("failed"), "{card}");
+    assert!(card.contains("Target"), "{card}");
+    assert!(card.contains("Attempted"), "{card}");
+    assert!(card.contains("restored the pre-rollback state"), "{card}");
+    assert!(!card.contains("Now using"), "{card}");
+    assert!(!card.contains("Rolled back"), "{card}");
+}
+
+#[test]
 fn upgrade_rollback_failure_restores_the_pre_rollback_state() {
     let root = TestDir::new("upgrade-explicit-rollback-failure");
     let fixture = seed_in_place_rollback(&root, "broken-recovery");
