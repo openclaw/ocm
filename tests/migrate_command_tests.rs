@@ -4653,3 +4653,140 @@ fn migrate_skips_fifos_in_the_home_and_external_workspaces_without_blocking() {
         assert!(fs::symlink_metadata(pipe).unwrap().file_type().is_fifo());
     }
 }
+
+fn effective_gateway_port(
+    root: &TestDir,
+    env: &std::collections::BTreeMap<String, String>,
+    name: &str,
+) -> u64 {
+    let status = run_ocm(root.path(), env, &["env", "status", name, "--json"]);
+    assert!(status.status.success(), "{}", stderr(&status));
+    serde_json::from_str::<serde_json::Value>(&stdout(&status)).unwrap()["gatewayPort"]
+        .as_u64()
+        .unwrap()
+}
+
+#[test]
+fn migrate_and_adopt_move_an_included_gateway_port() {
+    for adopt in [false, true] {
+        let root = TestDir::new("migrate-included-gateway-port");
+        let env = ocm_env(&root);
+        let created = run_ocm(
+            root.path(),
+            &env,
+            &["env", "create", "occupied", "--port", "19100"],
+        );
+        assert!(created.status.success(), "{}", stderr(&created));
+        let source = root.child("source/plain-home");
+        let config = "{\"gateway\":{\"$include\":\"./gateway/gateway.json\"},\"mcp\":{\"apps\":{\"sandboxPort\":19101}}}";
+        let gateway = "{\"$include\":\"./port.json\",\"bind\":\"loopback\"}";
+        let port = "{\"port\":19100}";
+        support::write_text(&source.join("openclaw.json"), config);
+        support::write_text(&source.join("gateway/gateway.json"), gateway);
+        support::write_text(&source.join("gateway/port.json"), port);
+
+        let mut ports = vec![19_100];
+        for name in ["first", "second"] {
+            let args = if adopt {
+                vec!["adopt", "import", "--name", name, source.to_str().unwrap()]
+            } else {
+                vec!["migrate", name, source.to_str().unwrap()]
+            };
+            let imported = run_ocm(root.path(), &env, &args);
+            assert!(imported.status.success(), "{}", stderr(&imported));
+            let migrated = effective_gateway_port(&root, &env, name);
+            assert!(
+                !ports.contains(&migrated),
+                "{name} reuses {migrated} from {ports:?}"
+            );
+            ports.push(migrated);
+
+            let state = root.child(format!("ocm-home/envs/{name}/.openclaw"));
+            let read = |path: &str| {
+                serde_json::from_str::<serde_json::Value>(
+                    &fs::read_to_string(state.join(path)).unwrap(),
+                )
+                .unwrap()
+            };
+            assert_eq!(
+                read("gateway/port.json"),
+                serde_json::json!({"port": migrated})
+            );
+            assert_eq!(
+                read("gateway/gateway.json"),
+                serde_json::json!({"$include": "./port.json", "bind": "loopback"})
+            );
+            let copied = read("openclaw.json");
+            assert_eq!(
+                copied["gateway"],
+                serde_json::json!({"$include": "./gateway/gateway.json"})
+            );
+            assert_eq!(copied["mcp"]["apps"]["sandboxPort"], migrated + 1);
+        }
+        assert_eq!(effective_gateway_port(&root, &env, "occupied"), 19_100);
+        assert_eq!(
+            fs::read_to_string(source.join("openclaw.json")).unwrap(),
+            config
+        );
+        assert_eq!(
+            fs::read_to_string(source.join("gateway/gateway.json")).unwrap(),
+            gateway
+        );
+        assert_eq!(
+            fs::read_to_string(source.join("gateway/port.json")).unwrap(),
+            port
+        );
+    }
+}
+
+#[test]
+fn migrate_and_adopt_refuse_a_gateway_port_in_a_shared_include() {
+    for adopt in [false, true] {
+        let root = TestDir::new("migrate-shared-gateway-port-include");
+        let env = ocm_env(&root);
+        // A registered port keeps the new environment's port off the shared one.
+        let created = run_ocm(
+            root.path(),
+            &env,
+            &["env", "create", "occupied", "--port", "19100"],
+        );
+        assert!(created.status.success(), "{}", stderr(&created));
+        let source = root.child("source/plain-home");
+        let config = "{\"gateway\":{\"$include\":\"./shared.json\"},\"talk\":{\"$include\":\"./shared.json\"}}";
+        support::write_text(&source.join("openclaw.json"), config);
+        support::write_text(&source.join("shared.json"), "{\"port\":19100}");
+        let args = if adopt {
+            vec![
+                "adopt",
+                "import",
+                "--name",
+                "copied",
+                source.to_str().unwrap(),
+            ]
+        } else {
+            vec!["migrate", "copied", source.to_str().unwrap()]
+        };
+        let imported = run_ocm(root.path(), &env, &args);
+        assert!(!imported.status.success());
+        assert!(
+            stderr(&imported).contains("cannot give the new environment its own Gateway port")
+                && stderr(&imported).contains("shared.json"),
+            "{}",
+            stderr(&imported)
+        );
+        assert!(!root.child("ocm-home/envs/copied").exists());
+        let listing = run_ocm(root.path(), &env, &["env", "list", "--json"]);
+        assert!(listing.status.success(), "{}", stderr(&listing));
+        let listed = serde_json::from_str::<serde_json::Value>(&stdout(&listing)).unwrap();
+        assert_eq!(listed.as_array().unwrap().len(), 1, "{listed}");
+        assert_eq!(listed[0]["name"], "occupied");
+        assert_eq!(
+            fs::read_to_string(source.join("openclaw.json")).unwrap(),
+            config
+        );
+        assert_eq!(
+            fs::read_to_string(source.join("shared.json")).unwrap(),
+            "{\"port\":19100}"
+        );
+    }
+}
