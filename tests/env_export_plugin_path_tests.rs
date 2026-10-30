@@ -145,6 +145,73 @@ fn state_export_preserves_links_without_copying_external_targets() {
     assert!(!target.join("external/value").exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn state_export_keeps_links_that_name_other_owned_links() {
+    use std::os::unix::fs::symlink;
+    use std::path::Path;
+    let root = TestDir::new("export-link-chains");
+    let env = ocm_env(&root);
+    let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let workspace = root.child("ocm-home/envs/source/.openclaw/workspace");
+    write_text(&workspace.join("releases/v1/bin/tool"), "v1");
+    write_text(&workspace.join("releases/v2/bin/tool"), "v2");
+    symlink("releases/v1", workspace.join("current")).unwrap();
+    symlink("current", workspace.join("latest")).unwrap();
+    symlink(workspace.join("current"), workspace.join("absolute")).unwrap();
+    symlink("../current/bin/tool", workspace.join("releases/tool")).unwrap();
+    symlink(workspace.join("releases/v1"), workspace.join("pinned")).unwrap();
+    let outside = root.child("outside");
+    fs::create_dir_all(&outside).unwrap();
+    symlink(&outside, workspace.join("external")).unwrap();
+    symlink("external", workspace.join("external-chain")).unwrap();
+    let export = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "env",
+            "export",
+            "source",
+            "--include-state",
+            "--output",
+            "chains.tar",
+        ],
+    );
+    assert!(export.status.success(), "{}", stderr(&export));
+    let import = run_ocm(
+        root.path(),
+        &env,
+        &["env", "import", "chains.tar", "--name", "target"],
+    );
+    assert!(import.status.success(), "{}", stderr(&import));
+    let target = root.child("ocm-home/envs/target/.openclaw/workspace");
+    for (link, destination) in [
+        ("current", Path::new("releases/v1")),
+        ("latest", Path::new("current")),
+        ("absolute", Path::new("current")),
+        ("releases/tool", Path::new("../current/bin/tool")),
+        ("pinned", Path::new("releases/v1")),
+        ("external", outside.as_path()),
+        ("external-chain", Path::new("external")),
+    ] {
+        assert_eq!(
+            fs::read_link(target.join(link)).unwrap(),
+            destination,
+            "{link}"
+        );
+    }
+    fs::remove_file(target.join("current")).unwrap();
+    symlink("releases/v2", target.join("current")).unwrap();
+    for link in ["latest/bin/tool", "absolute/bin/tool", "releases/tool"] {
+        assert_eq!(fs::read_to_string(target.join(link)).unwrap(), "v2");
+    }
+    assert_eq!(
+        fs::read_to_string(target.join("pinned/bin/tool")).unwrap(),
+        "v1"
+    );
+}
+
 #[test]
 fn state_import_honors_an_explicit_sandbox_origin_and_retains_unresolved_plugin_paths() {
     let root = TestDir::new("state-import-origin");
