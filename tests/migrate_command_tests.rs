@@ -2160,11 +2160,13 @@ fn migrated_launchers_run_openclaw_from_paths_that_need_shell_quoting() {
 #[cfg(unix)]
 #[test]
 fn migrated_launchers_run_openclaw_found_through_relative_path_entries() {
-    for (entry, location, import) in [
-        ("bin", "bin", "migrate"),
-        ("./node_modules/.bin", "node_modules/.bin", "migrate"),
-        (".", "", "adopt"),
-        ("", "", "migrate"),
+    // The last field leaves a launcher from an earlier import of the same program.
+    for (entry, location, import, leftover) in [
+        ("bin", "bin", "migrate", false),
+        ("bin", "bin", "adopt", true),
+        ("./node_modules/.bin", "node_modules/.bin", "migrate", false),
+        (".", "", "adopt", false),
+        ("", "", "migrate", false),
     ] {
         let root = TestDir::new("migrate-relative-launcher");
         let cwd = root.child("project");
@@ -2187,7 +2189,29 @@ fn migrated_launchers_run_openclaw_found_through_relative_path_entries() {
         );
         let path = format!("{entry}:{}", env["PATH"]);
         env.insert("PATH".to_string(), path);
-        let case = format!("{import} through {entry:?}");
+        let case = format!("{import} through {entry:?}, leftover {leftover}");
+        let resolved = path_string(
+            &fs::canonicalize(&cwd)
+                .unwrap()
+                .join(location)
+                .join("openclaw"),
+        );
+        if leftover {
+            let added = run_ocm(
+                &cwd,
+                &env,
+                &[
+                    "launcher",
+                    "add",
+                    "mira.migrated",
+                    "--command",
+                    &resolved,
+                    "--description",
+                    "kept",
+                ],
+            );
+            assert!(added.status.success(), "{case}: {}", stderr(&added));
+        }
 
         let source = source_home.to_string_lossy();
         let args: Vec<&str> = if import == "migrate" {
@@ -2207,15 +2231,10 @@ fn migrated_launchers_run_openclaw_found_through_relative_path_entries() {
         let shown = run_ocm(&cwd, &env, &["launcher", "show", "mira.migrated", "--json"]);
         assert!(shown.status.success(), "{case}: {}", stderr(&shown));
         let launcher: serde_json::Value = serde_json::from_str(&stdout(&shown)).unwrap();
-        let resolved = fs::canonicalize(&cwd)
-            .unwrap()
-            .join(location)
-            .join("openclaw");
-        assert_eq!(
-            launcher["command"],
-            serde_json::json!(path_string(&resolved)),
-            "{case}"
-        );
+        assert_eq!(launcher["command"], serde_json::json!(resolved), "{case}");
+        if leftover {
+            assert_eq!(launcher["description"], serde_json::json!("kept"), "{case}");
+        }
 
         let ran = run_ocm(&elsewhere, &env, &["env", "run", "mira", "--", "status"]);
         assert!(ran.status.success(), "{case}: {}", stderr(&ran));
@@ -2230,11 +2249,13 @@ fn migrated_launchers_run_openclaw_found_through_relative_path_entries() {
             stderr(&supervised)
         );
         let calls = fs::read_to_string(&marker).unwrap();
-        let gateway = calls.lines().nth(1).unwrap_or_default();
+        let mut lines = calls.lines().skip(1);
+        let gateway = lines.next().unwrap_or_default();
         assert!(
             gateway.starts_with("gateway run --port "),
             "{case}: {calls}"
         );
+        assert_eq!(lines.next(), None, "{case}: {calls}");
     }
 }
 
