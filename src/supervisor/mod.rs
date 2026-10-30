@@ -1208,6 +1208,32 @@ impl<'a> SupervisorService<'a> {
     }
 
     fn build_state(&self) -> Result<SupervisorState, String> {
+        // A command run through another spelling of this store keeps the saved
+        // plan's spelling, so the running daemon sees no change of store identity
+        // or child specs. Released daemons compare that spelling as text.
+        if let Some(recorded) = self.recorded_store_spelling()? {
+            let mut env = self.env.clone();
+            env.insert("OCM_HOME".to_string(), recorded);
+            return SupervisorService::new(&env, self.cwd).build_state_as_spelled();
+        }
+        self.build_state_as_spelled()
+    }
+
+    /// The saved plan's OCM_HOME when it is another spelling of the current store.
+    fn recorded_store_spelling(&self) -> Result<Option<String>, String> {
+        let current = display_path(&resolve_ocm_home(self.env, self.cwd)?);
+        let path = supervisor_state_path(self.env, self.cwd)?;
+        Ok(read_json::<SupervisorState>(&path)
+            .ok()
+            .filter(|state| {
+                state.kind == SUPERVISOR_STATE_KIND
+                    && state.ocm_home != current
+                    && same_ocm_home(&state.ocm_home, &current)
+            })
+            .map(|state| state.ocm_home))
+    }
+
+    fn build_state_as_spelled(&self) -> Result<SupervisorState, String> {
         ensure_store(self.env, self.cwd)?;
         let ocm_home = resolve_ocm_home(self.env, self.cwd)?;
         let logs_dir = supervisor_logs_dir(self.env, self.cwd)?;

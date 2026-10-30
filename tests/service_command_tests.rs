@@ -2238,8 +2238,29 @@ fn service_lifecycle_accepts_another_spelling_of_the_same_store() {
             launchd_env(&root)
         };
         setup_launcher_env(&cwd, &env);
-        let started = run_ocm(&cwd, &env, &["service", "start", "demo"]);
-        assert!(started.status.success(), "{}", stderr(&started));
+        let sibling = run_ocm(
+            &cwd,
+            &env,
+            &["env", "create", "sibling", "--launcher", "stable"],
+        );
+        assert!(sibling.status.success(), "{}", stderr(&sibling));
+        for name in ["demo", "sibling"] {
+            let started = run_ocm(&cwd, &env, &["service", "start", name]);
+            assert!(started.status.success(), "{}", stderr(&started));
+        }
+        let state_path = supervisor_state_path(&env, &cwd).unwrap();
+        let saved_plan =
+            || serde_json::from_slice::<Value>(&fs::read(&state_path).unwrap()).unwrap();
+        let sibling_spec = |plan: &Value| {
+            plan["children"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|child| child["envName"] == "sibling")
+                .cloned()
+                .unwrap()
+        };
+        let installed_sibling = sibling_spec(&saved_plan());
 
         // The saved service plan and the running daemon's runtime ownership
         // record both carry the installed spelling of the store.
@@ -2260,13 +2281,19 @@ fn service_lifecycle_accepts_another_spelling_of_the_same_store() {
             "{recovery}"
         );
 
-        for args in [
-            &["start", "demo"][..],
-            &["service", "stop", "demo"],
-            &["service", "uninstall", "demo"],
-        ] {
+        for args in [&["start", "demo"][..], &["service", "stop", "demo"]] {
             let output = run_ocm(&cwd, &alias_env, args);
             assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+        }
+        // A daemon that compares the plan's store as text keeps running, and the
+        // untouched sibling keeps its exact spec.
+        let plan = saved_plan();
+        assert_eq!(plan["ocmHome"], json!(env["OCM_HOME"]), "{plan}");
+        assert_eq!(sibling_spec(&plan), installed_sibling);
+
+        for name in ["demo", "sibling"] {
+            let uninstalled = run_ocm(&cwd, &alias_env, &["service", "uninstall", name]);
+            assert!(uninstalled.status.success(), "{}", stderr(&uninstalled));
         }
         assert!(!managed_service_definition_path(&env, &cwd, "ocm").exists());
     }
