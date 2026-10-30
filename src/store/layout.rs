@@ -363,6 +363,32 @@ pub fn source_watch_override_path(
         .join(format!("{name}.json")))
 }
 
+/// Separate source-watch state for a name whose `source-watch/<name>.*` files
+/// already belong to a case-distinct environment on case-insensitive storage.
+/// Writing each uppercase ASCII letter as `+` and its lowercase form keeps
+/// every accepted name distinct under case folding.
+pub fn source_watch_case_distinct_override_path(
+    name: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<PathBuf, String> {
+    let stores = resolve_store_paths(env, cwd)?;
+    let mut stem = String::with_capacity(name.len() * 2);
+    for character in name.chars() {
+        if character.is_ascii_uppercase() {
+            stem.push('+');
+            stem.push(character.to_ascii_lowercase());
+        } else {
+            stem.push(character);
+        }
+    }
+    Ok(stores
+        .home
+        .join("source-watch")
+        .join("case-distinct")
+        .join(format!("{stem}.json")))
+}
+
 pub fn snapshot_archive_path(
     env_name: &str,
     snapshot_id: &str,

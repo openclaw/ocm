@@ -510,7 +510,10 @@ mod tests {
         use crate::env::source_watch_session::SourceWatchSessionPaths;
         let root = tempfile::tempdir().unwrap();
         let mut session = session(root.path());
-        let paths = SourceWatchSessionPaths::from_override(&root.path().join("watch.json"));
+        let paths = SourceWatchSessionPaths::from_override(
+            &root.path().join("watch.json"),
+            root.path().join("watch.admission"),
+        );
         crate::store::write_json(&paths.session, &session).unwrap();
         let mut server = HandoffServer::bind(&session).unwrap();
         assert!(

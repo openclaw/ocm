@@ -10,7 +10,11 @@ use crate::infra::process_identity::process_group_members;
 use crate::infra::process_identity::{
     ProcessIdentity, current_process_identity, observe_process, process_scope_id,
 };
-use crate::store::{display_path, source_watch_override_path, validate_name, write_json};
+use crate::store::dev_sources::path_identity;
+use crate::store::{
+    display_path, source_watch_case_distinct_override_path, source_watch_override_path,
+    validate_name, write_json,
+};
 
 const LEGACY_SESSION_KIND: &str = "ocm-source-watch-session";
 const WATCH_V2_SESSION_KIND: &str = "ocm-source-watch-session-v2";
@@ -141,12 +145,14 @@ pub(super) struct SourceWatchSessionPaths {
 }
 
 impl SourceWatchSessionPaths {
-    pub(super) fn from_override(path: &Path) -> Self {
+    // Admission is the env's Gateway admission lock, which stays on the raw
+    // name even when its other source-watch state uses a separate location.
+    pub(super) fn from_override(path: &Path, admission: PathBuf) -> Self {
         // Distinct terminal extensions keep dotted env names from colliding
         // with another env's override or inherited source-watch lease.
         Self {
             session: path.with_extension("session"),
-            admission: path.with_extension("admission"),
+            admission,
             request: path.with_extension("stop"),
         }
     }
@@ -602,10 +608,13 @@ impl<'a> EnvironmentService<'a> {
         env_name: &str,
     ) -> Result<(), String> {
         self.ensure_source_watch_stopped(env_name)?;
-        let paths = self.source_watch_session_paths(env_name)?;
+        // Resolve once: removing the session can change where the name resolves.
+        let path = self.source_watch_state_path(env_name)?;
+        let paths =
+            SourceWatchSessionPaths::from_override(&path, self.gateway_admission_path(env_name)?);
         remove_file_if_present(&paths.session)?;
         remove_file_if_present(&paths.request)?;
-        remove_file_if_present(&source_watch_override_path(env_name, self.env, self.cwd)?)
+        remove_file_if_present(&path)
         // Keep lock inodes stable for waiters and later reuse of this env name.
     }
 
@@ -671,9 +680,75 @@ impl<'a> EnvironmentService<'a> {
         &self,
         env_name: &str,
     ) -> Result<SourceWatchSessionPaths, String> {
-        let env_name = validate_name(env_name, "Environment name")?;
         Ok(SourceWatchSessionPaths::from_override(
-            &source_watch_override_path(&env_name, self.env, self.cwd)?,
+            &self.source_watch_state_path(env_name)?,
+            self.gateway_admission_path(env_name)?,
+        ))
+    }
+
+    /// Where one environment's override, lease, session and stop request live.
+    /// On case-insensitive storage `alpha` and `Alpha` share the
+    /// `source-watch/<name>.*` files. The environment whose session already
+    /// occupies them keeps them, and a case-distinct peer uses its own
+    /// location for as long as its session record exists there. Removing either
+    /// environment therefore never moves state the other one is using.
+    pub(super) fn source_watch_state_path(&self, env_name: &str) -> Result<PathBuf, String> {
+        let env_name = validate_name(env_name, "Environment name")?;
+        let separate = source_watch_case_distinct_override_path(&env_name, self.env, self.cwd)?;
+        let separate_session = separate.with_extension("session");
+        if separate_session.try_exists().map_err(|error| {
+            format!(
+                "failed inspecting {}: {error}",
+                display_path(&separate_session)
+            )
+        })? {
+            return Ok(separate);
+        }
+        let shared = source_watch_override_path(&env_name, self.env, self.cwd)?;
+        if self.session_belongs_to_case_distinct_peer(&shared, &env_name)? {
+            return Ok(separate);
+        }
+        Ok(shared)
+    }
+
+    // Only a record whose owner's own session path is this same file proves
+    // case-insensitive aliasing. A malformed or unrelated record stays at the
+    // name's path, where exact-owner validation still refuses it.
+    fn session_belongs_to_case_distinct_peer(
+        &self,
+        shared: &Path,
+        env_name: &str,
+    ) -> Result<bool, String> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct SessionOwner {
+            env_name: String,
+        }
+        let session = shared.with_extension("session");
+        let bytes = match fs::read(&session) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(format!(
+                    "failed reading {}: {error}",
+                    display_path(&session)
+                ));
+            }
+        };
+        let Ok(SessionOwner { env_name: owner }) = serde_json::from_slice(&bytes) else {
+            return Ok(false);
+        };
+        if owner == env_name
+            || !owner.eq_ignore_ascii_case(env_name)
+            || validate_name(&owner, "Environment name").as_deref() != Ok(owner.as_str())
+        {
+            return Ok(false);
+        }
+        let owner_session =
+            source_watch_override_path(&owner, self.env, self.cwd)?.with_extension("session");
+        Ok(matches!(
+            (path_identity(&session), path_identity(&owner_session)),
+            (Ok(session), Ok(owner_session)) if session == owner_session
         ))
     }
 }

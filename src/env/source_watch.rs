@@ -456,7 +456,7 @@ impl<'a> EnvironmentService<'a> {
         {
             return Ok(None);
         }
-        let path = source_watch_override_path(&env.name, self.env, self.cwd)?;
+        let path = self.source_watch_state_path(&env.name)?;
         let watch = if source_watch_metadata_exists(&path)? {
             let watch = read_json::<SourceWatchOverride>(&path)?;
             if !is_valid_source_watch_structure(&watch, &env.name)
@@ -533,8 +533,9 @@ impl<'a> EnvironmentService<'a> {
         env_name: &str,
     ) -> Result<Option<SourceWatchLeaseObservation>, String> {
         let env_name = validate_name(env_name, "Environment name")?;
-        let lock_path =
-            source_watch_override_path(&env_name, self.env, self.cwd)?.with_extension("lock");
+        let lock_path = self
+            .source_watch_state_path(&env_name)?
+            .with_extension("lock");
         let mut file = match OpenOptions::new().read(true).open(&lock_path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -590,7 +591,7 @@ impl<'a> EnvironmentService<'a> {
         &self,
         session: SourceWatchSession,
     ) -> Result<SourceWatchLease, String> {
-        let override_path = source_watch_override_path(&session.env_name, self.env, self.cwd)?;
+        let override_path = self.source_watch_state_path(&session.env_name)?;
         let lock_path = override_path.with_extension("lock");
         let mut lock_file = OpenOptions::new()
             .read(true)
@@ -614,7 +615,10 @@ impl<'a> EnvironmentService<'a> {
         {
             return Err("source watch generation changed; refusing stale recovery".to_string());
         }
-        let session_paths = SourceWatchSessionPaths::from_override(&override_path);
+        let session_paths = SourceWatchSessionPaths::from_override(
+            &override_path,
+            self.gateway_admission_path(&session.env_name)?,
+        );
         Ok(SourceWatchLease {
             env_name: session.env_name.clone(),
             lease_id: session.lease_id.clone(),
@@ -635,7 +639,7 @@ impl<'a> EnvironmentService<'a> {
         lease_id: &str,
     ) -> Result<(), String> {
         let env_name = validate_name(env_name, "Environment name")?;
-        let path = source_watch_override_path(&env_name, self.env, self.cwd)?;
+        let path = self.source_watch_state_path(&env_name)?;
         if !path.try_exists().map_err(|error| {
             format!(
                 "failed inspecting source watch override {}: {error}",
@@ -666,8 +670,10 @@ impl<'a> EnvironmentService<'a> {
         try_lock_file(&self.gateway_admission_path(env_name)?, "gateway admission")
     }
 
-    fn gateway_admission_path(&self, env_name: &str) -> Result<PathBuf, String> {
+    pub(super) fn gateway_admission_path(&self, env_name: &str) -> Result<PathBuf, String> {
         let env_name = validate_name(env_name, "Environment name")?;
+        // Admission only excludes. Case-distinct names that share this file on
+        // case-insensitive storage wait for each other, as with operation locks.
         Ok(source_watch_override_path(&env_name, self.env, self.cwd)?.with_extension("admission"))
     }
 
@@ -845,8 +851,11 @@ impl<'a> EnvironmentService<'a> {
                 "dev env {env_name} is already running in the background; stop it first or rerun with --watch --force to take it over temporarily"
             ));
         }
-        let override_path = source_watch_override_path(&env_name, self.env, self.cwd)?;
-        let session_paths = SourceWatchSessionPaths::from_override(&override_path);
+        let override_path = self.source_watch_state_path(&env_name)?;
+        let session_paths = SourceWatchSessionPaths::from_override(
+            &override_path,
+            self.gateway_admission_path(&env_name)?,
+        );
         let lock_path = override_path.with_extension("lock");
         if let Ok(meta) = read_json::<SourceWatchOverride>(&override_path)
             && !is_leased_source_watch(&meta)
@@ -971,7 +980,7 @@ impl<'a> EnvironmentService<'a> {
         ui: Option<SourceWatchUiEndpoint>,
     ) -> Result<SourceWatchOverride, String> {
         let env_name = validate_name(&options.env_name, "Environment name")?;
-        let path = source_watch_override_path(&env_name, self.env, self.cwd)?;
+        let path = self.source_watch_state_path(&env_name)?;
         if let Some(parent) = path.parent() {
             ensure_dir(parent)?;
         }
@@ -997,7 +1006,7 @@ impl<'a> EnvironmentService<'a> {
 
     pub fn clear_source_watch_override(&self, env_name: &str, token: &str) -> Result<bool, String> {
         let env_name = validate_name(env_name, "Environment name")?;
-        let path = source_watch_override_path(&env_name, self.env, self.cwd)?;
+        let path = self.source_watch_state_path(&env_name)?;
         if !path.exists() {
             return Ok(false);
         }
@@ -1050,7 +1059,7 @@ impl<'a> EnvironmentService<'a> {
                 ));
             }
         }
-        let path = source_watch_override_path(&env_name, self.env, self.cwd)?;
+        let path = self.source_watch_state_path(&env_name)?;
         let lock_path = path.with_extension("lock");
         let lock_file = match OpenOptions::new().read(true).open(&lock_path) {
             Ok(lock_file) => lock_file,
