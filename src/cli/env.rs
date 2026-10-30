@@ -1674,10 +1674,9 @@ impl Cli {
                 self.print_json(&meta)?;
                 return Ok(0);
             }
-            let default_runtime = meta.default_runtime.unwrap_or_else(|| "none".to_string());
             self.stdout_lines(render::env::env_runtime_updated(
                 &meta.name,
-                &default_runtime,
+                meta.default_runtime.as_deref(),
                 profile,
             ));
             return Ok(0);
@@ -1719,10 +1718,9 @@ impl Cli {
             self.print_json(&meta)?;
             return Ok(0);
         }
-        let default_runtime = meta.default_runtime.unwrap_or_else(|| "none".to_string());
         self.stdout_lines(render::env::env_runtime_updated(
             &meta.name,
-            &default_runtime,
+            meta.default_runtime.as_deref(),
             profile,
         ));
         Ok(0)
@@ -1785,10 +1783,9 @@ impl Cli {
             self.print_json(&meta)?;
             return Ok(0);
         }
-        let default_launcher = meta.default_launcher.unwrap_or_else(|| "none".to_string());
         self.stdout_lines(render::env::env_launcher_updated(
             &meta.name,
-            &default_launcher,
+            meta.default_launcher.as_deref(),
             profile,
         ));
         Ok(0)

@@ -36,7 +36,8 @@ fn env_set_launcher_updates_and_clears_the_default_launcher() {
 
     let clear = run_ocm(&cwd, &env, &["env", "set-launcher", "demo", "none"]);
     assert!(clear.status.success(), "{}", stderr(&clear));
-    assert!(stdout(&clear).contains("Updated env demo: defaultLauncher=none"));
+    assert!(stdout(&clear).contains("Updated env demo: defaultLauncher cleared"));
+    assert!(!stdout(&clear).contains("defaultLauncher=none"));
 
     let show_cleared = run_ocm(&cwd, &env, &["env", "show", "demo"]);
     assert!(show_cleared.status.success(), "{}", stderr(&show_cleared));

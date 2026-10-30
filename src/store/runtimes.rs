@@ -38,7 +38,7 @@ use super::common::{
 use super::envs::get_environment;
 use super::layout::{
     clean_path, derive_env_paths, display_path, resolve_absolute_path, runtime_install_root,
-    runtime_meta_path, validate_name,
+    runtime_meta_path, validate_name, validate_registration_name,
 };
 use super::now_utc;
 use super::openclaw_state::installed_plugin_index_ids;
@@ -3187,6 +3187,7 @@ fn prepare_runtime_install_target_with_lock(
     cwd: &Path,
     lock: Arc<RuntimeMutationGuard>,
 ) -> Result<RuntimeInstallTarget, String> {
+    validate_registration_name(&name, "Runtime name")?;
     let final_meta_path = runtime_meta_path(&name, env, cwd)?;
     let final_install_root = runtime_install_root(&name, env, cwd)?;
     check_runtime_publication_paths(&name, &final_meta_path, Some(&final_install_root))?;
@@ -3974,7 +3975,7 @@ pub(crate) fn add_runtime_with_context(
     context: InstallContext<'_>,
 ) -> Result<RuntimeMeta, String> {
     let InstallContext { env, cwd, .. } = context;
-    let name = validate_name(&options.name, "Runtime name")?;
+    let name = validate_registration_name(&options.name, "Runtime name")?;
     let _lock = context.lock_runtime(&name)?;
     let meta_path = runtime_meta_path(&name, env, cwd)?;
     let _namespace_locks = lock_runtime_publication_paths(&name, &meta_path, false)?;
