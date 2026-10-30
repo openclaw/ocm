@@ -357,14 +357,25 @@ impl<'a> EnvironmentService<'a> {
                     None,
                 )
             }
-            Ok(ExecutionBinding::Dev) => (
-                "ok".to_string(),
-                Some("dev".to_string()),
-                Some("dev".to_string()),
-                None,
-                None,
-                None,
-            ),
+            Ok(ExecutionBinding::Dev) => {
+                // Validate the recorded checkout exactly as env resolve and env run do.
+                let resolution_status =
+                    match env.dev.as_ref().map(|dev| dev.execution_source_root()) {
+                        Some(Err(error)) => {
+                            push_issue(&mut issues, error);
+                            "error".to_string()
+                        }
+                        _ => "ok".to_string(),
+                    };
+                (
+                    resolution_status,
+                    Some("dev".to_string()),
+                    Some("dev".to_string()),
+                    None,
+                    None,
+                    None,
+                )
+            }
             Err(error) => {
                 push_issue(&mut issues, error);
                 ("unbound".to_string(), None, None, None, None, None)

@@ -5073,6 +5073,106 @@ fn env_remove_refuses_a_clean_replacement_at_a_stale_registered_path() {
     );
 }
 
+#[cfg(unix)]
+fn assert_dev_checkout_health(
+    cwd: &Path,
+    env: &std::collections::BTreeMap<String, String>,
+    name: &str,
+    expected_issue_prefix: Option<&str>,
+) {
+    let doctor = run_ocm(cwd, env, &["env", "doctor", name, "--json"]);
+    assert!(doctor.status.success(), "{}", stderr(&doctor));
+    let doctor: Value = serde_json::from_str(&stdout(&doctor)).unwrap();
+    let status = run_ocm(cwd, env, &["env", "status", name, "--json"]);
+    assert!(status.status.success(), "{}", stderr(&status));
+    let status: Value = serde_json::from_str(&stdout(&status)).unwrap();
+    let resolve = run_ocm(cwd, env, &["env", "resolve", name]);
+    let run = run_ocm(cwd, env, &["env", "run", name, "--", "status"]);
+    assert_eq!(doctor["resolvedKind"], "dev");
+
+    let Some(prefix) = expected_issue_prefix else {
+        assert_eq!(doctor["healthy"], true, "{doctor}");
+        assert_eq!(doctor["resolutionStatus"], "ok");
+        assert_eq!(doctor["issues"], serde_json::json!([]));
+        assert_eq!(status["issue"], Value::Null);
+        assert!(resolve.status.success(), "{}", stderr(&resolve));
+        assert!(run.status.success(), "{}", stderr(&run));
+        return;
+    };
+
+    assert_eq!(doctor["healthy"], false, "{doctor}");
+    assert_eq!(doctor["resolutionStatus"], "error");
+    let issues = doctor["issues"].as_array().unwrap();
+    assert_eq!(issues.len(), 1, "{doctor}");
+    let issue = issues[0].as_str().unwrap();
+    assert!(issue.starts_with(prefix), "{issue}");
+    assert_eq!(status["issue"], issue);
+    assert!(!resolve.status.success());
+    assert!(stderr(&resolve).contains(issue), "{}", stderr(&resolve));
+    assert!(!run.status.success());
+    assert!(stderr(&run).contains(issue), "{}", stderr(&run));
+}
+
+#[cfg(unix)]
+#[test]
+fn env_doctor_and_status_report_an_unusable_dev_checkout() {
+    let root = TestDir::new("dev-command-doctor-checkout");
+    let repo = init_openclaw_repo(&root);
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    install_fake_dev_runners(&root, &mut env);
+    let bind = run_ocm(
+        &cwd,
+        &env,
+        &dev_plain(&["demo", "--repo", &path_string(&repo)]),
+    );
+    assert!(bind.status.success(), "{}", stderr(&bind));
+    let status = run_ocm(&cwd, &env, &["env", "status", "demo", "--json"]);
+    let status: Value = serde_json::from_str(&stdout(&status)).unwrap();
+    let recorded = PathBuf::from(status["runDir"].as_str().unwrap());
+    let moved = recorded.with_file_name("moved");
+    assert_dev_checkout_health(&cwd, &env, "demo", None);
+
+    fs::rename(&recorded, &moved).unwrap();
+    assert_dev_checkout_health(
+        &cwd,
+        &env,
+        "demo",
+        Some(&format!(
+            "failed to resolve OpenClaw source {}: ",
+            path_string(&recorded)
+        )),
+    );
+
+    fs::create_dir(&recorded).unwrap();
+    assert_dev_checkout_health(
+        &cwd,
+        &env,
+        "demo",
+        Some(&format!(
+            "OpenClaw checkout not found at {}",
+            path_string(&recorded)
+        )),
+    );
+
+    fs::remove_dir(&recorded).unwrap();
+    std::os::unix::fs::symlink(&moved, &recorded).unwrap();
+    assert_dev_checkout_health(
+        &cwd,
+        &env,
+        "demo",
+        Some(&format!(
+            "saved dev source {} now resolves to a different checkout",
+            path_string(&recorded)
+        )),
+    );
+
+    fs::remove_file(&recorded).unwrap();
+    fs::rename(&moved, &recorded).unwrap();
+    assert_dev_checkout_health(&cwd, &env, "demo", None);
+}
+
 #[test]
 fn dev_command_can_onboard_then_watch() {
     let root = TestDir::new("dev-command-watch");

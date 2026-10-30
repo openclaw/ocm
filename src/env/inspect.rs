@@ -165,6 +165,8 @@ impl<'a> EnvironmentService<'a> {
                     summary.command = Some("pnpm openclaw".to_string());
                     summary.binary_path = Some("pnpm".to_string());
                     summary.run_dir = Some(dev.source_root().to_string());
+                    // Report the checkout env resolve and env run would refuse.
+                    summary.issue = dev.execution_source_root().err();
                 } else {
                     summary.issue = Some(format!(
                         "environment \"{}\" is missing its dev binding",
