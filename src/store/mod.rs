@@ -53,7 +53,8 @@ pub use envs::{
 };
 pub(crate) use envs::{
     clone_environment_for_simulation, clone_environment_with_sandbox_origin,
-    create_environment_with_validated_runtime, import_environment_with_sandbox_origin,
+    create_environment_beside_plain_home, create_environment_with_validated_runtime,
+    import_environment_with_sandbox_origin,
 };
 pub(crate) use envs::{
     save_environment_with_dev_registration, save_environment_with_runtime_guard,

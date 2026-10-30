@@ -459,17 +459,21 @@ fn migrate_plain_openclaw_home_inner(
     // Keep custody of the provisional target through import and rollback.
     // Otherwise a failed copy could remove a replacement registered under its name.
     let _operation = service.lock_operation(&env_name)?;
-    let created = service.create(CreateEnvironmentOptions {
-        name: env_name,
-        root: Some(target_root_string),
-        gateway_port: None,
-        service_enabled: false,
-        service_running: false,
-        default_runtime: None,
-        default_launcher: None,
-        dev: None,
-        protected: false,
-    })?;
+    // Keep the copy's automatic port clear of the source home's own ports.
+    let created = service.create_beside_plain_home(
+        CreateEnvironmentOptions {
+            name: env_name,
+            root: Some(target_root_string),
+            gateway_port: None,
+            service_enabled: false,
+            service_running: false,
+            default_runtime: None,
+            default_launcher: None,
+            dev: None,
+            protected: false,
+        },
+        &source_home.join("openclaw.json"),
+    )?;
     let created_name = created.name.clone();
     let target_paths = derive_env_paths(Path::new(&created.root));
 

@@ -77,6 +77,20 @@ pub(crate) fn choose_available_gateway_port(
     choose_unclaimed_gateway_port(preferred_port, claimed, allocation_error, &[], env)
 }
 
+/// Selects a port as `choose_available_gateway_port` does, also keeping clear
+/// of the port family configured in a plain OpenClaw home's `config_path`, as
+/// the default `~/.openclaw` home's family is kept clear.
+pub(crate) fn choose_available_gateway_port_beside_plain_home(
+    preferred_port: u32,
+    envs: &[EnvMeta],
+    config_path: &Path,
+    env: &BTreeMap<String, String>,
+) -> Result<u32, String> {
+    let (mut claimed, allocation_error) = registered_port_claims(envs, env);
+    reserve_configured_port_family(config_path, &mut claimed);
+    choose_unclaimed_gateway_port(preferred_port, claimed, allocation_error, &[], env)
+}
+
 /// Keeps `port` unless one of `envs` claims part of its port family, and
 /// otherwise selects the next available port the way allocation does, also
 /// avoiding `reserved` ports. Only registered environments decide whether the
@@ -145,7 +159,11 @@ fn reserve_foreign_openclaw_port_family(
     let config_path = resolve_user_home(env)
         .join(".openclaw")
         .join("openclaw.json");
-    if let Some(port) = read_gateway_port_from_config(&config_path) {
+    reserve_configured_port_family(&config_path, claimed);
+}
+
+fn reserve_configured_port_family(config_path: &Path, claimed: &mut BTreeSet<u32>) {
+    if let Some(port) = read_gateway_port_from_config(config_path) {
         reserve_openclaw_port_family(port, claimed);
     }
 }
@@ -270,6 +288,36 @@ mod tests {
         }
         assert!(next_available_gateway_port(65_536, &BTreeSet::new()).is_err());
         assert!(next_available_gateway_port(u32::MAX, &BTreeSet::new()).is_err());
+    }
+
+    #[test]
+    fn plain_home_allocation_avoids_the_homes_included_port_family() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("legacy/.openclaw");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("openclaw.json"),
+            "{ \"gateway\": { \"$include\": \"./gw.json\" } }\n",
+        )
+        .unwrap();
+        std::fs::write(source.join("gw.json"), "{ \"port\": 18850 }\n").unwrap();
+        let env = BTreeMap::from([(
+            "HOME".to_string(),
+            root.path().join("home").display().to_string(),
+        )]);
+
+        let port = choose_available_gateway_port_beside_plain_home(
+            DEFAULT_GATEWAY_PORT,
+            &[],
+            &source.join("openclaw.json"),
+            &env,
+        )
+        .unwrap();
+        let (start, end) = openclaw_port_family_range(port);
+        assert!(
+            end < 18_850 || start > 18_960,
+            "{port} overlaps 18850..=18960"
+        );
     }
 
     #[test]

@@ -928,6 +928,45 @@ fn migrate_resets_or_replaces_a_copied_public_sandbox_origin() {
 }
 
 #[test]
+fn migrate_and_adopt_keep_an_explicit_source_homes_gateway_ports_free() {
+    let root = TestDir::new("migrate-explicit-source-port");
+    let cwd = root.child("workspace");
+    let source_home = root.child("legacy/.openclaw");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(&source_home).unwrap();
+    // 18850's family overlaps 18789's, the first automatic candidate.
+    let source_config = "{ \"gateway\": { \"port\": 18850 } }\n";
+    fs::write(source_home.join("openclaw.json"), source_config).unwrap();
+    let env = ocm_env(&root);
+    let source = source_home.to_string_lossy();
+
+    for (name, args) in [
+        ("moved", vec!["migrate", "moved", source.as_ref()]),
+        (
+            "adopted",
+            vec!["adopt", "import", "--name", "adopted", source.as_ref()],
+        ),
+    ] {
+        let output = run_ocm(&cwd, &env, &args);
+        assert!(output.status.success(), "{}", stderr(&output));
+        let show = run_ocm(&cwd, &env, &["env", "show", name, "--json"]);
+        assert!(show.status.success(), "{}", stderr(&show));
+        let port =
+            serde_json::from_str::<serde_json::Value>(&stdout(&show)).unwrap()["gatewayPort"]
+                .as_u64()
+                .unwrap();
+        assert!(
+            port + 110 < 18_850 || port > 18_960,
+            "{name} got {port}, inside the source home's port family"
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(source_home.join("openclaw.json")).unwrap(),
+        source_config
+    );
+}
+
+#[test]
 fn migrate_rejects_include_owned_sandbox_configuration_before_creating_the_target() {
     let root = TestDir::new("migrate-include-owned-sandbox-origin");
     let cwd = root.child("workspace");

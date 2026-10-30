@@ -12,10 +12,11 @@ use crate::openclaw_repo::{
 use crate::runtime::RuntimeService;
 use crate::store::{
     EnvironmentOperationLock, clone_environment, clone_environment_for_simulation,
-    create_environment_with_validated_runtime, export_environment, get_environment,
-    get_runtime_for_binding, import_environment, list_environments, lock_environment_operation,
-    now_utc, remove_environment_locked, resolve_config_gateway_port,
-    resolve_effective_gateway_ports, save_environment, set_environment_service_policy,
+    create_environment_beside_plain_home, create_environment_with_validated_runtime,
+    export_environment, get_environment, get_runtime_for_binding, import_environment,
+    list_environments, lock_environment_operation, now_utc, remove_environment_locked,
+    resolve_config_gateway_port, resolve_effective_gateway_ports, save_environment,
+    set_environment_service_policy,
 };
 use crate::supervisor::sync_supervisor_env_if_present;
 
@@ -396,6 +397,19 @@ impl<'a> EnvironmentService<'a> {
 
     pub fn create(&self, options: CreateEnvironmentOptions) -> Result<EnvMeta, String> {
         let meta = create_environment_with_validated_runtime(options, self.env, self.cwd)?;
+        sync_supervisor_env_if_present(self.env, self.cwd, &meta.name)?;
+        Ok(meta)
+    }
+
+    /// Creates an environment for a copy of the plain OpenClaw home configured
+    /// at `plain_home_config`; an automatic port avoids that home's ports.
+    pub(crate) fn create_beside_plain_home(
+        &self,
+        options: CreateEnvironmentOptions,
+        plain_home_config: &Path,
+    ) -> Result<EnvMeta, String> {
+        let meta =
+            create_environment_beside_plain_home(options, plain_home_config, self.env, self.cwd)?;
         sync_supervisor_env_if_present(self.env, self.cwd, &meta.name)?;
         Ok(meta)
     }
