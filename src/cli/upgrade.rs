@@ -418,6 +418,9 @@ enum UpgradeSimulationScenario {
 struct UpgradeOptions {
     dry_run: bool,
     rollback_enabled: bool,
+    // Set only by `upgrade --all`, which skips envs it cannot upgrade; a
+    // named env without a binding is still refused.
+    skip_unbound: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -674,6 +677,7 @@ impl Cli {
             UpgradeOptions {
                 dry_run: false,
                 rollback_enabled: true,
+                skip_unbound: false,
             },
         )
     }
@@ -738,6 +742,7 @@ impl Cli {
         let options = UpgradeOptions {
             dry_run,
             rollback_enabled: !no_rollback,
+            skip_unbound: all_flag,
         };
 
         if all_flag {
@@ -879,6 +884,7 @@ impl Cli {
         let preflight_options = UpgradeOptions {
             dry_run: true,
             rollback_enabled: options.failure_policy == UpgradeFleetFailurePolicy::Rollback,
+            skip_unbound: false,
         };
         let mut preflight = Vec::with_capacity(options.env_names.len());
         for env_name in &options.env_names {
@@ -994,6 +1000,7 @@ impl Cli {
                     UpgradeOptions {
                         dry_run: false,
                         rollback_enabled: failure_policy == UpgradeFleetFailurePolicy::Rollback,
+                        skip_unbound: false,
                     },
                     &worker_locks[env_name].operation,
                 );
@@ -2777,6 +2784,10 @@ impl Cli {
             && !target.is_explicit()
         {
             return Ok(dev_checkout_summary(name));
+        }
+        // `upgrade --all` has nothing to update in an env without a binding.
+        if env.default_runtime.is_none() && env.default_launcher.is_none() && options.skip_unbound {
+            return Ok(unbound_summary(name));
         }
 
         if !options.dry_run {
@@ -6855,8 +6866,29 @@ fn is_failed_upgrade_outcome(outcome: &str) -> bool {
 pub(crate) fn is_skipped_upgrade_outcome(outcome: &str) -> bool {
     matches!(
         outcome,
-        "pinned" | "local-command" | "manual-runtime" | "dev-checkout"
+        "pinned" | "local-command" | "manual-runtime" | "dev-checkout" | "unbound"
     )
+}
+
+fn unbound_summary(env_name: &str) -> UpgradeEnvSummary {
+    UpgradeEnvSummary {
+        source: None,
+        env_name: env_name.to_string(),
+        previous_binding_kind: "none".to_string(),
+        previous_binding_name: "—".to_string(),
+        binding_kind: "none".to_string(),
+        binding_name: "—".to_string(),
+        outcome: "unbound".to_string(),
+        runtime_release_version: None,
+        runtime_release_channel: None,
+        service_action: None,
+        snapshot_id: None,
+        rollback: None,
+        note: Some(
+            "this env has no runtime or launcher binding; use start or env set-runtime/set-launcher to include it"
+                .to_string(),
+        ),
+    }
 }
 
 fn dev_checkout_summary(env_name: &str) -> UpgradeEnvSummary {

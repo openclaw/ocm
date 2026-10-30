@@ -553,6 +553,7 @@ impl Cli {
             UpgradeOptions {
                 dry_run: false,
                 rollback_enabled: true,
+                skip_unbound: false,
             },
         );
         record = self.read_upgrade_job(name, id)?;
