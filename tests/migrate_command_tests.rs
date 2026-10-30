@@ -993,6 +993,31 @@ fn migrate_and_adopt_keep_an_explicit_source_homes_gateway_ports_free() {
         port + 110 < 18_850 || port > 18_960,
         "included got {port}, inside the source home's port family"
     );
+
+    // Control: migrating the default home without a path still keeps clear
+    // of its family.
+    let default_root = TestDir::new("migrate-default-source-port");
+    let default_cwd = default_root.child("workspace");
+    fs::create_dir_all(&default_cwd).unwrap();
+    let default_home = default_root.child("home/.openclaw");
+    fs::create_dir_all(&default_home).unwrap();
+    fs::write(default_home.join("openclaw.json"), source_config).unwrap();
+    let default_env = ocm_env(&default_root);
+    let output = run_ocm(&default_cwd, &default_env, &["migrate", "home"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let show = run_ocm(
+        &default_cwd,
+        &default_env,
+        &["env", "show", "home", "--json"],
+    );
+    assert!(show.status.success(), "{}", stderr(&show));
+    let port = serde_json::from_str::<serde_json::Value>(&stdout(&show)).unwrap()["gatewayPort"]
+        .as_u64()
+        .unwrap();
+    assert!(
+        port + 110 < 18_850 || port > 18_960,
+        "home got {port}, inside the default home's port family"
+    );
 }
 
 #[test]
