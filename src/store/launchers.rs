@@ -5,7 +5,7 @@ use std::path::Path;
 use crate::launcher::{AddLauncherOptions, LauncherMeta};
 
 use super::common::{load_json_files, path_exists, read_json, read_json_if_present, write_json};
-use super::envs::with_locked_environments;
+use super::envs::{lock_env_registry, with_locked_environments};
 use super::layout::{display_path, launcher_meta_path, resolve_absolute_path, validate_name};
 use super::now_utc;
 
@@ -50,6 +50,10 @@ pub fn add_launcher(
 ) -> Result<LauncherMeta, String> {
     let name = validate_name(&options.name, "Launcher name")?;
     let meta_path = launcher_meta_path(&name, env, cwd)?;
+    // Hold the registry lock that launcher removal also takes from the
+    // existence check through the write, so concurrent adds of one name
+    // create it once and the others refuse instead of replacing it.
+    let _registry_lock = lock_env_registry(env, cwd)?;
     if path_exists(&meta_path) {
         return Err(format!("launcher \"{name}\" already exists"));
     }
