@@ -1,6 +1,8 @@
 mod support;
 
 use std::fs;
+use std::sync::Barrier;
+use std::thread;
 
 use crate::support::{TestDir, ocm_env, run_ocm, stderr, stdout};
 use serde_json::Value;
@@ -49,6 +51,64 @@ fn launcher_add_and_list_use_launcher_storage() {
     let output = stdout(&show_json);
     assert!(output.contains("\"name\": \"stable\""));
     assert!(output.contains("\"description\": \"launcher alias\""));
+}
+
+#[test]
+fn concurrent_launcher_adds_of_one_name_create_it_once() {
+    const CALLERS: usize = 8;
+    const ROUNDS: usize = 3;
+
+    for round in 0..ROUNDS {
+        let root = TestDir::new(&format!("launcher-add-concurrent-{round}"));
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let env = ocm_env(&root);
+        let start = Barrier::new(CALLERS);
+
+        let outputs = thread::scope(|scope| {
+            let callers = (0..CALLERS)
+                .map(|caller| {
+                    let (cwd, env, start) = (&cwd, &env, &start);
+                    scope.spawn(move || {
+                        let command = format!("cmd{caller}");
+                        start.wait();
+                        let output = run_ocm(
+                            cwd,
+                            env,
+                            &["launcher", "add", "race", "--command", &command],
+                        );
+                        (command, output)
+                    })
+                })
+                .collect::<Vec<_>>();
+            callers
+                .into_iter()
+                .map(|caller| caller.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        let added = outputs
+            .iter()
+            .filter(|(_, output)| output.status.success())
+            .map(|(command, _)| command.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(added.len(), 1, "round {round}: added by {added:?}");
+        for (_, output) in outputs
+            .iter()
+            .filter(|(_, output)| !output.status.success())
+        {
+            assert!(
+                stderr(output).contains("launcher \"race\" already exists"),
+                "round {round}: {}",
+                stderr(output)
+            );
+        }
+
+        let show = run_ocm(&cwd, &env, &["launcher", "show", "race", "--json"]);
+        assert!(show.status.success(), "{}", stderr(&show));
+        let stored: Value = serde_json::from_str(&stdout(&show)).unwrap();
+        assert_eq!(stored["command"], added[0], "round {round}");
+    }
 }
 
 #[test]
