@@ -7,6 +7,7 @@ use crate::env::{CreateEnvironmentOptions, EnvMeta};
 use crate::infra::terminal::{KeyValueRow, Tone, paint, render_key_value_card};
 use crate::launcher::AddLauncherOptions;
 use crate::migrate::{inspect_migration_source, with_rollback_error};
+use crate::runtime::RuntimeService;
 use crate::service::service_backend_support_error;
 use crate::store::{
     MinimumLocalConfig, derive_env_paths, display_path, prepare_minimum_local_openclaw_config,
@@ -176,16 +177,27 @@ impl Cli {
             )?;
         }
 
-        let (desired_binding, created_launcher) = self.resolve_start_binding(
-            &request.name,
-            existing.as_ref(),
-            request.runtime_name.clone(),
-            request.launcher_name.clone(),
-            request.version.clone(),
-            request.channel.clone(),
-            request.command.clone(),
-            request.cwd.clone(),
-        )?;
+        // Moving a bound env to another runtime is a runtime transition. It
+        // takes the guarded path `env set-runtime` uses instead of a rebind.
+        let runtime_switch = existing
+            .as_ref()
+            .map(|meta| self.start_runtime_switch_target(meta, &request))
+            .transpose()?
+            .flatten();
+        let (desired_binding, created_launcher) = if runtime_switch.is_some() {
+            (None, None)
+        } else {
+            self.resolve_start_binding(
+                &request.name,
+                existing.as_ref(),
+                request.runtime_name.clone(),
+                request.launcher_name.clone(),
+                request.version.clone(),
+                request.channel.clone(),
+                request.command.clone(),
+                request.cwd.clone(),
+            )?
+        };
         // Until the env is created or rebound, a refusal must not leave behind
         // the launcher this start created.
         let discard_launcher = |error: String| {
@@ -200,12 +212,16 @@ impl Cli {
 
         // Resolve required settings before a binding update can synchronize a
         // running supervisor. Unknown configuration must not launch a new child.
-        let minimum = if !onboarding_planned {
+        let prospective_binding = runtime_switch
+            .clone()
+            .map(StartBinding::Runtime)
+            .or_else(|| desired_binding.clone());
+        let mut minimum = if !onboarding_planned {
             existing
                 .as_ref()
                 .map(|meta| {
                     let mut prospective = meta.clone();
-                    match desired_binding.as_ref() {
+                    match prospective_binding.as_ref() {
                         Some(StartBinding::Runtime(name)) => {
                             prospective.default_runtime = Some(name.clone());
                             prospective.default_launcher = None;
@@ -226,6 +242,21 @@ impl Cli {
         } else {
             None
         };
+
+        if let Some(target) = runtime_switch {
+            // The transition takes the environment's operation lock itself and
+            // refuses a same-name env created after start read this one.
+            self.replace_env_binding_with_runtime(
+                &request.name,
+                request.version.clone(),
+                request.channel.clone(),
+                request.runtime_name.is_some().then_some(target),
+                existing.as_ref(),
+            )?;
+            // Finalization can rewrite the configuration read above, so minimum
+            // setup is prepared again from the switched env.
+            minimum = None;
+        }
 
         // `env remove` deletes the root and registry entry under this lock.
         // Hold it from the registry recheck through the minimum config write
@@ -397,6 +428,33 @@ impl Cli {
             None => true,
             Some(env) => env.default_runtime.is_none() && env.default_launcher.is_none(),
         }
+    }
+
+    /// Names the runtime a start request moves a bound existing env to, or
+    /// `None` when the request keeps the env's runtime or selects none.
+    fn start_runtime_switch_target(
+        &self,
+        meta: &EnvMeta,
+        request: &StartRequest,
+    ) -> Result<Option<String>, String> {
+        // An unbound env gains its first binding directly, as with
+        // `env set-runtime`.
+        if meta.default_runtime.is_none() && meta.default_launcher.is_none() {
+            return Ok(None);
+        }
+        let target = match request.runtime_name.as_deref() {
+            Some(runtime_name) => validate_name(runtime_name, "Runtime name")?,
+            None if request.version.is_some() || request.channel.is_some() => {
+                RuntimeService::canonical_official_openclaw_runtime_name(
+                    request.version.as_deref(),
+                    request.channel.as_deref(),
+                )?
+            }
+            None => return Ok(None),
+        };
+        let unchanged = meta.default_launcher.is_none()
+            && meta.default_runtime.as_deref() == Some(target.as_str());
+        Ok((!unchanged).then_some(target))
     }
 
     // The caller holds the environment operation lock.

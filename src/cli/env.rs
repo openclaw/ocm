@@ -1715,15 +1715,7 @@ impl Cli {
             let runtime = runtime_name
                 .map(|runtime| validate_name(&runtime, "Runtime name"))
                 .transpose()?;
-            let summary = self.upgrade_env_to_runtime_target(name, version, channel, runtime)?;
-            if matches!(
-                summary.outcome.as_str(),
-                "failed" | "rolled-back" | "rollback-failed"
-            ) {
-                return Err(summary.note.unwrap_or_else(|| {
-                    format!("runtime transition failed with outcome {}", summary.outcome)
-                }));
-            }
+            self.replace_env_binding_with_runtime(name, version, channel, runtime, None)?;
             let meta = self.environment_service().get(name)?;
             if json_flag {
                 self.print_json(&meta)?;

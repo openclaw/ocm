@@ -2813,6 +2813,21 @@ fn upgrade_rejects_downgrade_before_snapshot_or_target_download() {
     assert!(error.contains("SQLite state"), "{error}");
     assert!(older_server.requests().is_empty());
 
+    let start_older = run_ocm(
+        &cwd,
+        &env,
+        &["start", "demo", "--version", older_version, "--no-service"],
+    );
+    assert_eq!(start_older.status.code(), Some(1));
+    assert!(
+        stderr(&start_older).contains(&format!(
+            "refusing to downgrade env \"demo\" from OpenClaw {newer_version} to {older_version}"
+        )),
+        "{}",
+        stderr(&start_older)
+    );
+    assert!(older_server.requests().is_empty());
+
     let environment = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
     assert!(environment.status.success(), "{}", stderr(&environment));
     let environment: Value = serde_json::from_str(&stdout(&environment)).unwrap();
@@ -9696,6 +9711,190 @@ fn env_set_runtime_uses_the_transactional_upgrade_path_for_existing_bindings() {
     assert!(show.status.success(), "{}", stderr(&show));
     let env_json: Value = serde_json::from_str(&stdout(&show)).unwrap();
     assert_eq!(env_json["defaultRuntime"], "old-local");
+}
+
+#[test]
+fn start_moves_an_existing_env_to_another_runtime_through_the_transactional_upgrade_path() {
+    let root = TestDir::new("start-runtime-switch-transactional-upgrade");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let command_log = root.child("runtime-commands.log");
+
+    let mut env = ocm_env(&root);
+    env.insert(
+        "OCM_TEST_COMMAND_LOG".to_string(),
+        path_string(&command_log),
+    );
+    for (name, version) in [("old-local", "2026.6.11"), ("new-local", "2026.6.33")] {
+        let runtime = root.child(name);
+        write_executable_script(&runtime, &recording_openclaw_script(version));
+        let add = run_ocm(
+            &cwd,
+            &env,
+            &["runtime", "add", name, "--path", &path_string(&runtime)],
+        );
+        assert!(add.status.success(), "{}", stderr(&add));
+    }
+    let launcher_command = root.child("launcher-openclaw");
+    write_executable_script(&launcher_command, "#!/bin/sh\nexit 0\n");
+    let launcher = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "launcher",
+            "add",
+            "local",
+            "--command",
+            &path_string(&launcher_command),
+        ],
+    );
+    assert!(launcher.status.success(), "{}", stderr(&launcher));
+
+    let binding = |name: &str| {
+        let show = run_ocm(&cwd, &env, &["env", "show", name, "--json"]);
+        assert!(show.status.success(), "{}", stderr(&show));
+        let meta: Value = serde_json::from_str(&stdout(&show)).unwrap();
+        (
+            meta["defaultRuntime"].clone(),
+            meta["defaultLauncher"].clone(),
+        )
+    };
+    let snapshot_labels = |name: &str| {
+        let snapshots = run_ocm(&cwd, &env, &["env", "snapshot", "list", name, "--json"]);
+        assert!(snapshots.status.success(), "{}", stderr(&snapshots));
+        let snapshots: Value = serde_json::from_str(&stdout(&snapshots)).unwrap();
+        snapshots
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|snapshot| snapshot["label"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+    let finalize_calls = || {
+        fs::read_to_string(&command_log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.starts_with("update finalize"))
+            .count()
+    };
+    let start = |args: &[&str], env: &BTreeMap<String, String>| {
+        let _ = fs::remove_file(&command_log);
+        run_ocm(&cwd, env, args)
+    };
+
+    for name in ["demo", "failing", "launcher-control"] {
+        let create = start(
+            &["start", name, "--runtime", "old-local", "--no-service"],
+            &env,
+        );
+        assert!(create.status.success(), "{}", stderr(&create));
+    }
+
+    // Starting again on the current runtime stays a plain start.
+    let same = start(
+        &["start", "demo", "--runtime", "old-local", "--no-service"],
+        &env,
+    );
+    assert!(same.status.success(), "{}", stderr(&same));
+    assert_eq!(finalize_calls(), 0);
+    assert!(snapshot_labels("demo").is_empty());
+
+    // A launcher change is a plain rebind, as with env set-launcher.
+    let to_launcher = start(
+        &[
+            "start",
+            "launcher-control",
+            "--launcher",
+            "local",
+            "--no-service",
+        ],
+        &env,
+    );
+    assert!(to_launcher.status.success(), "{}", stderr(&to_launcher));
+    assert_eq!(finalize_calls(), 0);
+    assert!(snapshot_labels("launcher-control").is_empty());
+    assert_eq!(
+        binding("launcher-control"),
+        (Value::Null, Value::from("local"))
+    );
+
+    // Leaving a launcher for a runtime replaces an existing binding too.
+    let from_launcher = start(
+        &[
+            "start",
+            "launcher-control",
+            "--runtime",
+            "new-local",
+            "--no-service",
+        ],
+        &env,
+    );
+    assert!(from_launcher.status.success(), "{}", stderr(&from_launcher));
+    assert_eq!(finalize_calls(), 1);
+    assert_eq!(
+        snapshot_labels("launcher-control"),
+        vec!["pre-upgrade".to_string()]
+    );
+    assert_eq!(
+        binding("launcher-control"),
+        (Value::from("new-local"), Value::Null)
+    );
+
+    let switch = start(
+        &[
+            "start",
+            "demo",
+            "--runtime",
+            "new-local",
+            "--no-service",
+            "--json",
+        ],
+        &env,
+    );
+    assert!(switch.status.success(), "{}", stderr(&switch));
+    let summary: Value = serde_json::from_str(&stdout(&switch)).unwrap();
+    assert_eq!(summary["defaultRuntime"], "new-local");
+    assert_eq!(finalize_calls(), 1);
+    assert_eq!(snapshot_labels("demo"), vec!["pre-upgrade".to_string()]);
+    assert_eq!(binding("demo"), (Value::from("new-local"), Value::Null));
+    let history = run_ocm(&cwd, &env, &["upgrade", "history", "demo", "--json"]);
+    assert!(history.status.success(), "{}", stderr(&history));
+    let history: Value = serde_json::from_str(&stdout(&history)).unwrap();
+    assert_eq!(history[0]["source"]["name"], "old-local", "{history}");
+    assert_eq!(history[0]["target"]["name"], "new-local", "{history}");
+    assert_eq!(
+        history[0]["finalization"]["status"], "completed",
+        "{history}"
+    );
+
+    let downgrade = start(
+        &["start", "demo", "--runtime", "old-local", "--no-service"],
+        &env,
+    );
+    assert_eq!(downgrade.status.code(), Some(1), "{}", stdout(&downgrade));
+    assert!(
+        stderr(&downgrade)
+            .contains("refusing to downgrade env \"demo\" from OpenClaw 2026.6.33 to 2026.6.11"),
+        "{}",
+        stderr(&downgrade)
+    );
+    assert_eq!(finalize_calls(), 0);
+    assert_eq!(snapshot_labels("demo"), vec!["pre-upgrade".to_string()]);
+    assert_eq!(binding("demo"), (Value::from("new-local"), Value::Null));
+
+    let mut failing_env = env.clone();
+    failing_env.insert("OCM_TEST_FAIL_UPDATE_FINALIZE".to_string(), "1".to_string());
+    let failed = start(
+        &["start", "failing", "--runtime", "new-local", "--no-service"],
+        &failing_env,
+    );
+    assert!(!failed.status.success(), "{}", stdout(&failed));
+    assert!(
+        stderr(&failed).contains("restored the pre-upgrade snapshot"),
+        "{}",
+        stderr(&failed)
+    );
+    assert_eq!(binding("failing"), (Value::from("old-local"), Value::Null));
 }
 
 #[test]

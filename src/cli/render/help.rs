@@ -600,6 +600,7 @@ pub fn start_help(cmd: &str) -> String {
         ],
         &[
             "If an environment already exists, start reuses it and only adjusts binding/protection when you asked for it.",
+            "Moving an existing env from its runtime or launcher to a different runtime uses the same transition as `env set-runtime`: a downgrade is refused, and OpenClaw update finalization runs with snapshot-backed rollback before the new runtime is published.",
             "Start writes the minimum local config by default so the env can boot immediately. Use `--onboard` for the interactive setup flow.",
             "A new root must not equal, contain, or sit inside any registered environment root, including aliases. Protection flags do not permit overlap.",
             "Start installs and starts the env service by default. Use `--no-service` when you do not want a background process.",

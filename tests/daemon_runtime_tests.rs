@@ -5,8 +5,9 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::{Mutex, MutexGuard};
-use std::thread::sleep;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread::{self, sleep};
 use std::time::{Duration, Instant};
 
 use fs2::FileExt;
@@ -2379,6 +2380,23 @@ fn daemon_revalidates_binding_after_capability_probe() {
             }
         }
     }
+    enum Setter {
+        Command(Daemon),
+        Direct(Arc<AtomicU8>),
+    }
+    impl Setter {
+        fn exited(&mut self) -> Option<bool> {
+            match self {
+                Setter::Command(child) => {
+                    child.0.try_wait().unwrap().map(|status| status.success())
+                }
+                Setter::Direct(state) => match state.load(Ordering::SeqCst) {
+                    0 => None,
+                    state => Some(state == 1),
+                },
+            }
+        }
+    }
     for (binding, change, reconciled) in [
         ("runtime", "clear", false),
         ("runtime", "clear", true),
@@ -2503,14 +2521,7 @@ fn daemon_revalidates_binding_after_capability_probe() {
         let args = match change {
             "clear" => Some(vec!["env", setter, "alpha", "none", "--json"]),
             "stop" => Some(vec!["service", "stop", "alpha", "--json"]),
-            "runtime" => Some(vec![
-                "start",
-                "alpha",
-                "--runtime",
-                "replacement",
-                "--no-service",
-                "--json",
-            ]),
+            "runtime" => Some(Vec::new()),
             "launcher" => Some(vec![
                 "env",
                 "set-launcher",
@@ -2530,17 +2541,32 @@ fn daemon_revalidates_binding_after_capability_probe() {
                 .open(root.child("ocm-home/source-watch/alpha.admission"))
                 .unwrap();
             admission.lock_exclusive().unwrap();
-            let mut changed = Daemon(
-                Command::new(ocm_test_binary_path())
-                    .current_dir(&cwd)
-                    .args(&args)
-                    .env_clear()
-                    .envs(&env)
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn()
-                    .unwrap(),
-            );
+            let mut changed = if change == "runtime" {
+                // `start` and `env set-runtime` move a bound env to another
+                // runtime through the guarded transition, which quiesces the
+                // service before publishing. A pending probe can race only a
+                // direct rebind, which the binding service's setter makes.
+                let state = Arc::new(AtomicU8::new(0));
+                let (setter_env, setter_cwd, done) = (env.clone(), cwd.clone(), Arc::clone(&state));
+                thread::spawn(move || {
+                    let rebound = EnvironmentService::new(&setter_env, &setter_cwd)
+                        .set_runtime("alpha", "replacement");
+                    done.store(if rebound.is_ok() { 1 } else { 2 }, Ordering::SeqCst);
+                });
+                Setter::Direct(state)
+            } else {
+                Setter::Command(Daemon(
+                    Command::new(ocm_test_binary_path())
+                        .current_dir(&cwd)
+                        .args(&args)
+                        .env_clear()
+                        .envs(&env)
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                        .unwrap(),
+                ))
+            };
             let operation = fs::OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -2556,17 +2582,11 @@ fn daemon_revalidates_binding_after_capability_probe() {
                     Instant::now() < deadline,
                     "setter did not take operation lock"
                 );
-                assert!(
-                    changed.0.try_wait().unwrap().is_none(),
-                    "setter bypassed admission"
-                );
+                assert!(changed.exited().is_none(), "setter bypassed admission");
                 sleep(Duration::from_millis(10));
             }
             sleep(Duration::from_millis(100));
-            assert!(
-                changed.0.try_wait().unwrap().is_none(),
-                "setter bypassed admission"
-            );
+            assert!(changed.exited().is_none(), "setter bypassed admission");
             let registry = fs::OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -2580,8 +2600,8 @@ fn daemon_revalidates_binding_after_capability_probe() {
             drop(admission);
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
-                if let Some(status) = changed.0.try_wait().unwrap() {
-                    assert!(status.success(), "binding setter failed: {args:?}");
+                if let Some(success) = changed.exited() {
+                    assert!(success, "binding setter failed: {change}");
                     break;
                 }
                 assert!(Instant::now() < deadline, "binding setter deadlocked");
