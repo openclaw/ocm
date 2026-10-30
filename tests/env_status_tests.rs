@@ -567,38 +567,56 @@ fn env_and_service_status_do_not_wait_for_private_node_installation() {
         .unwrap();
     lock.lock_exclusive().unwrap();
 
-    for args in [
-        ["env", "status", "demo", "--json"],
-        ["service", "status", "demo", "--json"],
-    ] {
-        let mut child = Command::new(support::ocm_test_binary_path())
-            .current_dir(&cwd)
-            .env_clear()
-            .envs(&env)
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while child.try_wait().unwrap().is_none() {
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("{args:?} waited for the private Node.js install lock");
+    let status_issues = || {
+        [
+            ["env", "status", "demo", "--json"],
+            ["service", "status", "demo", "--json"],
+        ]
+        .map(|args| {
+            let mut child = Command::new(support::ocm_test_binary_path())
+                .current_dir(&cwd)
+                .env_clear()
+                .envs(&env)
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while child.try_wait().unwrap().is_none() {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("{args:?} waited for the private Node.js install lock");
+                }
+                std::thread::sleep(Duration::from_millis(20));
             }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        let output = child.wait_with_output().unwrap();
-        assert!(output.status.success(), "{}", stderr(&output));
-        let value: Value = serde_json::from_str(&stdout(&output)).unwrap();
-        let issue = if args[0] == "env" {
-            &value["serviceIssue"]
-        } else {
-            &value["issue"]
-        };
-        assert_eq!(issue, &Value::Null, "{value}");
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success(), "{}", stderr(&output));
+            let value: Value = serde_json::from_str(&stdout(&output)).unwrap();
+            let key = if args[0] == "env" {
+                "serviceIssue"
+            } else {
+                "issue"
+            };
+            value[key].as_str().map(str::to_string)
+        })
+    };
+
+    // A valid private Node.js is used without waiting for the installer.
+    assert_eq!(status_issues(), [None, None]);
+
+    // A missing private Node.js is reported without waiting or installing.
+    fs::remove_dir_all(lock_path.with_file_name(
+        lock_path.file_name().unwrap().to_string_lossy()[1..].trim_end_matches(".lock"),
+    ))
+    .unwrap();
+    for issue in status_issues() {
+        assert!(
+            issue
+                .is_some_and(|issue| issue.contains("compatible managed Node.js is not installed")),
+        );
     }
     FileExt::unlock(&lock).unwrap();
     assert_eq!(managed_node_server.requests().len(), 1);
