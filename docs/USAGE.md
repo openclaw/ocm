@@ -1913,16 +1913,16 @@ environments, name reuse clears only their separate `.<env>.stdout.log` and
 
 An environment that owns a Git worktree, such as a temporary environment from
 `upgrade simulate --to <local repo>`, has that worktree removed with it. After the
-worktree passes the clean check, OCM marks it with an untracked `.ocm-removing`
-file and deletes its files while Git still registers it, then lets Git remove the
-emptied worktree. If deleting fails, for example on a read-only directory, an
-immutable file or while another process is still writing there, the command exits
-with an error that names the worktree, which stays registered and marked, and the
-environment stays listed. Re-run the same command after fixing the cause to finish
-the removal; a marked worktree is not checked for local changes again, because it
-passed that check before OCM deleted anything. Until then, `ocm dev` and new
-simulations refuse to reuse the marked worktree. Removal still refuses a directory
-at the worktree path that is not registered to the OpenClaw checkout.
+worktree passes the clean check, OCM deletes its files while Git still registers
+it, ignored `node_modules` output first and tracked files last, then lets Git
+remove the emptied worktree. If deleting fails, for example on a read-only
+directory, an immutable file or while another process is still writing there, the
+command exits with an error that names the worktree, which stays registered, and
+the environment stays listed. Re-run the same command after fixing the cause to
+finish the removal. The clean check accepts tracked files that are only missing,
+because their content is still in the commit, and still refuses modified,
+untracked and other ignored files. Removal still refuses a directory at the
+worktree path that is not registered to the OpenClaw checkout, unless it is empty.
 
 For legacy layouts created before overlapping roots were rejected, removal refuses
 to delete another registered environment's root or a link needed to reach it,
