@@ -1756,7 +1756,7 @@ pub(crate) fn remove_environment_locked(
     before_remove(&meta)?;
     prepare_environment_root_removal(&paths.root).map_err(|error| {
         format!(
-            "cannot remove environment \"{}\": {error}; no files were removed",
+            "cannot remove environment \"{}\": {error}; no files were removed; give your user access to that path, or ask its owner to remove it, then retry",
             meta.name
         )
     })?;
@@ -1769,7 +1769,7 @@ pub(crate) fn remove_environment_locked(
     if path_exists(&paths.root) {
         fs::remove_dir_all(&paths.root).map_err(|error| {
             format!(
-                "could not finish removing {}, part of it may already be gone: {error}",
+                "could not finish removing {}, part of it may already be gone: {error}; give your user access to what remains there, or ask its owner to remove it, then retry",
                 display_path(&paths.root)
             )
         })?;
@@ -1789,49 +1789,117 @@ pub(crate) fn remove_environment_locked(
 /// Gives the current user full access to each directory it owns under an
 /// environment root before anything is deleted. Tools such as Go leave module
 /// caches read-only, and a recursive delete would otherwise stop partway.
-/// Directories owned by other users are left unchanged.
+///
+/// Each directory is reached through its parent's open descriptor without
+/// following links, and its identity is checked before it is read, so a
+/// directory replaced during the walk cannot redirect the change outside the
+/// root. The change is owner-only (0700), so it never grants anyone else
+/// access. Directories owned by other users are left unchanged.
 #[cfg(unix)]
 fn prepare_environment_root_removal(root: &Path) -> Result<(), String> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::rc::Rc;
 
+    let (Some(parent), Some(name)) = (root.parent(), root.file_name()) else {
+        return Ok(());
+    };
+    // The root's parent is the OCM-owned layout, so it is opened by path.
+    let parent = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(parent)
+    {
+        Ok(parent) => parent,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!("could not read {}: {error}", display_path(parent)));
+        }
+    };
     // SAFETY: geteuid has no preconditions.
     let user = unsafe { libc::geteuid() };
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(dir) = pending.pop() {
-        let metadata = match fs::symlink_metadata(&dir) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(format!("could not inspect {}: {error}", display_path(&dir)));
+    let mut pending = vec![(Rc::new(parent), name.to_os_string(), root.to_path_buf())];
+    while let Some((parent, name, path)) = pending.pop() {
+        let name = CString::new(name.as_bytes()).map_err(|error| error.to_string())?;
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: the descriptor is open, the name is NUL-terminated and stat is writable.
+        if unsafe {
+            libc::fstatat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::NotFound {
+                continue;
             }
-        };
-        if !metadata.is_dir() {
+            return Err(format!(
+                "could not inspect {}: {error}",
+                display_path(&path)
+            ));
+        }
+        // SAFETY: fstatat succeeded and initialized stat.
+        let stat = unsafe { stat.assume_init() };
+        if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
             continue;
         }
-        let owned = metadata.uid() == user;
-        let mode = metadata.permissions().mode();
-        if owned && mode & 0o700 != 0o700 {
-            fs::set_permissions(&dir, fs::Permissions::from_mode(mode | 0o700)).map_err(
-                |error| format!("could not make {} writable: {error}", display_path(&dir)),
-            )?;
+        let owned = stat.st_uid == user;
+        if owned && stat.st_mode & 0o700 != 0o700 {
+            // SAFETY: as for fstatat above; the link itself is never followed.
+            if unsafe {
+                libc::fchmodat(
+                    parent.as_raw_fd(),
+                    name.as_ptr(),
+                    0o700,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } != 0
+            {
+                return Err(format!(
+                    "could not make {} writable: {}",
+                    display_path(&path),
+                    std::io::Error::last_os_error()
+                ));
+            }
         }
-        let entries = match fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            // Another user's directory keeps its permissions; removal reports it.
-            Err(_) if !owned => continue,
-            Err(error) => {
-                return Err(format!("could not read {}: {error}", display_path(&dir)));
-            }
+        // SAFETY: as for fstatat above.
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
         };
-        for entry in entries {
-            let entry =
-                entry.map_err(|error| format!("could not read {}: {error}", display_path(&dir)))?;
-            let kind = entry.file_type().map_err(|error| {
-                format!("could not inspect {}: {error}", display_path(&entry.path()))
-            })?;
-            if kind.is_dir() {
-                pending.push(entry.path());
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            // Another user's directory keeps its permissions; removal reports it.
+            if error.kind() == std::io::ErrorKind::NotFound || !owned {
+                continue;
             }
+            return Err(format!("could not read {}: {error}", display_path(&path)));
+        }
+        // SAFETY: openat returned a new descriptor that nothing else owns.
+        let directory = unsafe { fs::File::from_raw_fd(fd) };
+        let opened = directory
+            .metadata()
+            .map_err(|error| format!("could not inspect {}: {error}", display_path(&path)))?;
+        if opened.dev() != stat.st_dev as u64 || opened.ino() != stat.st_ino as u64 {
+            return Err(format!(
+                "{} changed while preparing removal",
+                display_path(&path)
+            ));
+        }
+        let names = crate::infra::archive::archive_directory_names(&directory)
+            .map_err(|error| format!("could not read {}: {error}", display_path(&path)))?;
+        let directory = Rc::new(directory);
+        for child in names {
+            let child_path = path.join(&child);
+            pending.push((Rc::clone(&directory), child, child_path));
         }
     }
     Ok(())

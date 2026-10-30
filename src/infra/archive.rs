@@ -1083,7 +1083,7 @@ fn archive_identity_matches(expected: &fs::Metadata, actual: &fs::Metadata) -> b
 }
 
 #[cfg(unix)]
-fn archive_directory_names(directory: &File) -> io::Result<Vec<std::ffi::OsString>> {
+pub(crate) fn archive_directory_names(directory: &File) -> io::Result<Vec<std::ffi::OsString>> {
     use std::ffi::{CStr, OsString};
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStringExt;

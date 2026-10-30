@@ -2518,7 +2518,10 @@ fn env_remove_reports_a_directory_it_cannot_make_writable_before_deleting_anythi
         )),
         "{error}"
     );
-    assert!(error.contains("no files were removed"), "{error}");
+    assert!(
+        error.contains("no files were removed; give your user access to that path"),
+        "{error}"
+    );
     assert!(get_environment("locked", &env, cwd).is_ok());
     for (file, contents) in [
         (".openclaw/openclaw.json", "{}\n"),
