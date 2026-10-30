@@ -367,8 +367,11 @@ impl<'a> EnvironmentService<'a> {
         if let Some(runtime_name) = runtime_name {
             let _admission =
                 crate::store::try_lock_runtime_binding(&runtime_name, self.env, self.cwd)?;
-            get_runtime_for_binding(&runtime_name, self.env, self.cwd)?;
-            return Ok(Some(runtime_name));
+            // Case-insensitive storage accepts any spelling of a registered
+            // name; callers bind and compare the registered one.
+            return Ok(Some(
+                get_runtime_for_binding(&runtime_name, self.env, self.cwd)?.name,
+            ));
         }
 
         match (version, channel) {

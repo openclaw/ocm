@@ -443,7 +443,16 @@ impl Cli {
             return Ok(None);
         }
         let target = match request.runtime_name.as_deref() {
-            Some(runtime_name) => validate_name(runtime_name, "Runtime name")?,
+            Some(runtime_name) => {
+                let runtime_name = validate_name(runtime_name, "Runtime name")?;
+                if meta.default_runtime.as_deref() == Some(runtime_name.as_str()) {
+                    runtime_name
+                } else {
+                    // Case-insensitive storage accepts any spelling of a
+                    // registered name; compare with the registered one.
+                    self.runtime_service().show(&runtime_name)?.name
+                }
+            }
             None if request.version.is_some() || request.channel.is_some() => {
                 RuntimeService::canonical_official_openclaw_runtime_name(
                     request.version.as_deref(),
