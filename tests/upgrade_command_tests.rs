@@ -4113,6 +4113,7 @@ fn assert_interrupted_simulation_removes_its_clone_and_runtime(
     signal: libc::c_int,
     signal_process_group: bool,
     scenario: Option<&str>,
+    hold_runtime_install: bool,
 ) {
     use std::os::unix::process::CommandExt;
 
@@ -4175,16 +4176,32 @@ fn assert_interrupted_simulation_removes_its_clone_and_runtime(
     let start = run_ocm(&cwd, &env, &["start", "demo", "--no-service"]);
     assert!(start.status.success(), "{}", stderr(&start));
 
-    let status_started = root.child("gateway-status.started");
-    let status_release = root.child("gateway-status.release");
-    env.insert(
-        "OCM_TEST_GATEWAY_STATUS_STARTED".to_string(),
-        path_string(&status_started),
-    );
-    env.insert(
-        "OCM_TEST_GATEWAY_STATUS_RELEASE".to_string(),
-        path_string(&status_release),
-    );
+    let status_started = root.child("hold.started");
+    let status_release = root.child("hold.release");
+    if hold_runtime_install {
+        let probe = root.child("npm-install-hold");
+        write_executable_script(
+            &probe,
+            &format!(
+                "#!/bin/sh\n: > '{}'\nwhile [ ! -e '{}' ]; do sleep 0.01; done\n",
+                path_string(&status_started),
+                path_string(&status_release)
+            ),
+        );
+        env.insert(
+            "OCM_TEST_NPM_LIFECYCLE_PROBE".to_string(),
+            path_string(&probe),
+        );
+    } else {
+        env.insert(
+            "OCM_TEST_GATEWAY_STATUS_STARTED".to_string(),
+            path_string(&status_started),
+        );
+        env.insert(
+            "OCM_TEST_GATEWAY_STATUS_RELEASE".to_string(),
+            path_string(&status_release),
+        );
+    }
     let listed = |args: &[&str], keep: fn(&str) -> bool| -> Vec<String> {
         let list = run_ocm(&cwd, &env, args);
         assert!(list.status.success(), "{}", stderr(&list));
@@ -4231,8 +4248,11 @@ fn assert_interrupted_simulation_removes_its_clone_and_runtime(
         );
         sleep(Duration::from_millis(25));
     }
-    assert_eq!(simulation_envs().len(), 1);
-    assert_eq!(simulation_runtimes().len(), 1);
+    // A held install has only staged the runtime; a held check runs in a
+    // registered clone bound to the registered temporary runtime.
+    let registered = usize::from(!hold_runtime_install);
+    assert_eq!(simulation_envs().len(), registered);
+    assert_eq!(simulation_runtimes().len(), registered);
 
     // A terminal delivers Ctrl-C to the whole foreground group, including the
     // running check; a service manager or `kill` may signal only OCM.
@@ -4242,39 +4262,55 @@ fn assert_interrupted_simulation_removes_its_clone_and_runtime(
         simulation.0.id() as i32
     };
     assert_eq!(unsafe { libc::kill(target, signal) }, 0);
+    if hold_runtime_install {
+        // Staging is not fenced, so OCM must stop without waiting for the
+        // held install step to finish.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while simulation.0.try_wait().unwrap().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "simulation kept running after the signal during runtime staging"
+            );
+            sleep(Duration::from_millis(25));
+        }
+    }
     fs::write(&status_release, "").unwrap();
     let status = simulation.0.wait().unwrap();
     let output = fs::read_to_string(&output_path).unwrap();
     let errors = fs::read_to_string(&error_path).unwrap();
-    assert_eq!(
-        status.code(),
-        Some(1),
-        "stdout:\n{output}\nstderr:\n{errors}"
-    );
-
-    let json: Value = serde_json::from_str(&output).unwrap();
-    let results = match json.get("results") {
-        Some(results) => results.as_array().unwrap().clone(),
-        None => vec![json.clone()],
-    };
-    assert_eq!(
-        results.len(),
-        1,
-        "remaining scenarios must not run: {output}"
-    );
-    let result = &results[0];
-    assert_eq!(result["outcome"], "failed", "{output}");
-    assert_eq!(result["cleanup"], "cleaned", "{output}");
-    let checks = result["checks"].as_array().unwrap();
-    assert!(
-        checks
-            .iter()
-            .any(|check| check["name"] == "openclaw gateway status"),
-        "{output}"
-    );
-    let last = checks.last().unwrap();
-    assert_eq!(last["name"], "interrupted", "{output}");
-    assert_eq!(last["status"], "failed", "{output}");
+    if hold_runtime_install {
+        // Staging still ends at the signal, before anything is registered.
+        assert!(!status.success(), "stdout:\n{output}\nstderr:\n{errors}");
+    } else {
+        assert_eq!(
+            status.code(),
+            Some(1),
+            "stdout:\n{output}\nstderr:\n{errors}"
+        );
+        let json: Value = serde_json::from_str(&output).unwrap();
+        let results = match json.get("results") {
+            Some(results) => results.as_array().unwrap().clone(),
+            None => vec![json.clone()],
+        };
+        assert_eq!(
+            results.len(),
+            1,
+            "remaining scenarios must not run: {output}"
+        );
+        let result = &results[0];
+        assert_eq!(result["outcome"], "failed", "{output}");
+        assert_eq!(result["cleanup"], "cleaned", "{output}");
+        let checks = result["checks"].as_array().unwrap();
+        assert!(
+            checks
+                .iter()
+                .any(|check| check["name"] == "openclaw gateway status"),
+            "{output}"
+        );
+        let last = checks.last().unwrap();
+        assert_eq!(last["name"], "interrupted", "{output}");
+        assert_eq!(last["status"], "failed", "{output}");
+    }
 
     assert!(simulation_envs().is_empty(), "{:?}", simulation_envs());
     assert!(
@@ -4296,6 +4332,7 @@ fn interrupted_upgrade_simulate_removes_its_clone_and_runtime_on_sigint() {
         libc::SIGINT,
         true,
         None,
+        false,
     );
 }
 
@@ -4307,6 +4344,7 @@ fn interrupted_upgrade_simulate_removes_its_clone_and_runtime_on_sigterm() {
         libc::SIGTERM,
         false,
         None,
+        false,
     );
 }
 
@@ -4318,6 +4356,19 @@ fn interrupted_upgrade_simulate_skips_remaining_scenarios() {
         libc::SIGINT,
         true,
         Some("all"),
+        false,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn interrupted_upgrade_simulate_during_runtime_install_registers_nothing() {
+    assert_interrupted_simulation_removes_its_clone_and_runtime(
+        "upgrade-simulate-interrupt-install",
+        libc::SIGTERM,
+        false,
+        None,
+        true,
     );
 }
 
