@@ -1210,7 +1210,7 @@ Clone retains shared managed skills under `.openclaw/skills` and their global Cl
 Clone and upgrade simulation preserve supported internal OpenClaw `$include` graphs, including nested absolute directives and shared include arrays. Absolute directives select the copied files; relative directives and source files stay unchanged. Includes must remain inside the configuration directory. Ordinary clone retains its restrictions on include-owned agent workspaces and sandbox origins, while simulation retains its identity overlay.
 Agent directories remain separate from workspaces; external locations and paths reached through symlinks are rejected by these copy operations.
 Upgrade simulation rejects an identity-dependent agent directory supplied by an include shared with unrelated configuration fields; give those consumers separate include files before retrying.
-Git repositories whose administrative directories are already contained in retained workspaces rebase owned core.worktree and include paths to the destination.
+Git repositories whose administrative directories are already contained in retained workspaces, or in the other retained environment directories clone inspects for native checkouts (below), rebase owned core.worktree and include paths to the destination.
 Copied configuration referenced by these repositories survives cleanup without retaining unrelated siblings or acquiring external files.
 Git continues to select conditional includes, and authored predicates, repeated-entry order, comments and unrelated signing/remote settings remain intact.
 Relative values keep Git's containing-file or Git-directory context; external references and inactive missing or invalid includes remain unchanged unless their path maps to copied content.
@@ -1302,6 +1302,15 @@ object alternates whose donor storage is already inside the copied footprint.
 Their copied history remains usable without the source when all required donors
 are included. External or omitted bare donor paths retain their existing values;
 these operations do not acquire additional donor storage.
+Clone looks for these native linked and shared checkouts everywhere the copied
+environment keeps them, not only in workspaces: configured agent directories,
+top-level directories of the environment such as `projects`, and the retained
+`.openclaw` roots (`state`, `extensions`, `plugins`, `npm`, `git`, `skills` and
+`.clawhub`), as `env import` does for an extracted archive. Extension runtime
+dependencies that clone clears are not inspected. A checkout the relocation
+cannot make self-contained, such as one whose Git directory import also refuses,
+fails the clone and removes the provisional target instead of leaving the copy
+attached to the source.
 Clone refuses an active database that resolves to protected history, including through directory aliases, and removes the partial clone before registration.
 The same active-state ownership check applies to migration and its existing import rollback.
 

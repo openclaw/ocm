@@ -10,7 +10,8 @@ use crate::openclaw_repo::{
 };
 
 use super::{
-    copied_history_state_roots, is_copied_git_entry, is_integrity_protected_history_destination,
+    copied_history_state_roots, is_copied_git_entry, is_durable_openclaw_state_root,
+    is_integrity_protected_history_destination, openclaw_extension_runtime_debris_roots,
     with_owner_write_permission,
 };
 use crate::store::layout::{EnvPaths, display_path};
@@ -214,7 +215,12 @@ pub(in crate::store) struct CopiedGitRepositories {
     pub contexts: Vec<CopiedGitConfigContext>,
 }
 
-pub(in crate::store) fn copied_workspace_git_repositories(
+/// Clone keeps every top-level directory of the environment, the durable
+/// OpenClaw state roots and the configured workspace and agent directories.
+/// Discover Git layouts in all of them, as import does in its extracted tree.
+/// Extension runtime debris is skipped because cleanup removes it, and
+/// protected history is not a durable root.
+pub(in crate::store) fn copied_environment_git_repositories(
     source: &EnvPaths,
     target: &EnvPaths,
     workspaces: &OpenClawWorkspaceInventory,
@@ -224,15 +230,47 @@ pub(in crate::store) fn copied_workspace_git_repositories(
         (source.root.clone(), target.root.clone()),
         (canonical_source, target.root.clone()),
     ];
-    let roots = workspaces
+    let mut roots = workspaces
         .workspace_roots()
-        .filter_map(|path| project(path, &mappings));
-    copied_destination_git_repositories(target, roots)
+        .chain(workspaces.agent_directory_roots())
+        .filter_map(|path| project(path, &mappings))
+        .collect::<Vec<_>>();
+    for entry in fs::read_dir(&target.root).map_err(|e| e.to_string())? {
+        let path = entry.map_err(|e| e.to_string())?.path();
+        if path != target.state_dir && path.file_name() != Some(std::ffi::OsStr::new(".git")) {
+            roots.push(path);
+        }
+    }
+    match fs::read_dir(&target.state_dir) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry.map_err(|e| e.to_string())?;
+                if is_durable_openclaw_state_root(&entry.file_name()) {
+                    roots.push(entry.path());
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.to_string()),
+    }
+    let excluded = openclaw_extension_runtime_debris_roots(&target.state_dir)?
+        .into_iter()
+        .map(|relative| target.state_dir.join(relative))
+        .collect();
+    discover_destination_git_repositories(target, roots, &excluded)
 }
 
 pub(in crate::store) fn copied_destination_git_repositories(
     target: &EnvPaths,
     roots: impl IntoIterator<Item = PathBuf>,
+) -> Result<CopiedGitRepositories, String> {
+    discover_destination_git_repositories(target, roots, &BTreeSet::new())
+}
+
+fn discover_destination_git_repositories(
+    target: &EnvPaths,
+    roots: impl IntoIterator<Item = PathBuf>,
+    excluded: &BTreeSet<PathBuf>,
 ) -> Result<CopiedGitRepositories, String> {
     let mut pending = roots.into_iter().collect::<Vec<_>>();
     let mut seen = BTreeSet::new();
@@ -246,7 +284,11 @@ pub(in crate::store) fn copied_destination_git_repositories(
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e.to_string()),
         };
-        if !metadata.is_dir() || metadata_roots.contains(&path) || !seen.insert(path.clone()) {
+        if !metadata.is_dir()
+            || metadata_roots.contains(&path)
+            || excluded.contains(&path)
+            || !seen.insert(path.clone())
+        {
             continue;
         }
         let entry = path.join(".git");

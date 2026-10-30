@@ -902,7 +902,7 @@ fn clone_environment_with_policy(
         let canonical_source_root =
             fs::canonicalize(&source_paths.root).map_err(|error| error.to_string())?;
         let git_repositories =
-            super::openclaw_state::git_config::copied_workspace_git_repositories(
+            super::openclaw_state::git_config::copied_environment_git_repositories(
                 &source_paths,
                 &target_paths,
                 &source_workspaces,
