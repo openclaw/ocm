@@ -388,7 +388,7 @@ fn env_run_preserves_skip_bootstrap_without_onboarding() {
 "#,
         path_string(&workspace)
     );
-    let commands: [&[&str]; 14] = [
+    let commands: [&[&str]; 15] = [
         &["env", "run", "demo", "--", "onboard", "--skip-bootstrap"],
         &["@demo", "--", "setup", "--baseline", "--skip-bootstrap"],
         &["@demo", "--", "onboard", "--help"],
@@ -401,6 +401,7 @@ fn env_run_preserves_skip_bootstrap_without_onboarding() {
         &["@demo", "--", "--log-level", "debug", "setup", "--baseline"],
         &["@demo", "--", "--log-level", "--help", "onboard"],
         &["@demo", "--", "onboard", "recommendations", "--json"],
+        &["@demo", "--", "onboard", "--json", "recommendations"],
         &["@demo", "--", "setup", "-m", "status"],
         &["@demo", "--", "--log-level", "debug", "setup", "--yes"],
     ];

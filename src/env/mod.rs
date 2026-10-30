@@ -20,7 +20,7 @@ pub use execution::{
 };
 pub(crate) use execution::{
     config_read_context_for_binding, openclaw_command_words, openclaw_options,
-    resolve_config_read_context, source_watch_openclaw_program_args,
+    openclaw_root_option_tokens, resolve_config_read_context, source_watch_openclaw_program_args,
 };
 pub use health::{
     EnvCleanupActionSummary, EnvCleanupBatchSummary, EnvCleanupSummary, EnvDoctorSummary,

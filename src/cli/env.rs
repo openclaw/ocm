@@ -17,7 +17,7 @@ use crate::env::{
     CloneEnvironmentOptions, CreateEnvSnapshotOptions, CreateEnvironmentOptions, EnvMeta,
     EnvSnapshotSummary, EnvSummary, ExportEnvironmentOptions, ImportEnvironmentOptions,
     RemoveEnvSnapshotOptions, RestoreEnvSnapshotOptions, SourceWatchSession, SourceWatchState,
-    openclaw_command_words, openclaw_options,
+    openclaw_command_words, openclaw_options, openclaw_root_option_tokens,
 };
 use crate::infra::process::{run_direct, run_shell};
 use crate::infra::process_identity::ProcessIdentity;
@@ -120,13 +120,9 @@ fn should_clear_skip_bootstrap_for_openclaw_args(args: &[String]) -> bool {
     let Some(command @ ("onboard" | "setup")) = openclaw_command_words(args).next() else {
         return false;
     };
-    // Only `onboard recommendations` names the subcommand: after an option, the
-    // word can be that option's value, as in `onboard --workspace recommendations`.
-    let recommendations = command == "onboard"
-        && args
-            .windows(2)
-            .any(|pair| pair[0] == "onboard" && pair[1] == "recommendations");
-    if recommendations || args.iter().any(|arg| arg == "--skip-bootstrap") {
+    if (command == "onboard" && names_onboard_recommendations(args))
+        || args.iter().any(|arg| arg == "--skip-bootstrap")
+    {
         return false;
     }
 
@@ -149,6 +145,31 @@ fn should_clear_skip_bootstrap_for_openclaw_args(args: &[String]) -> bool {
         }
     }
     !(command == "setup" && system_agent_request && !onboarding_option)
+}
+
+/// Tells whether `onboard` is followed by its `recommendations` subcommand,
+/// after only OpenClaw's root options and the parent options that subcommand
+/// accepts (`--json` and `--agent <id>`). After any other option the word can
+/// be that option's value, as in `onboard --workspace recommendations`.
+fn names_onboard_recommendations(args: &[String]) -> bool {
+    let Some(start) = args.iter().position(|arg| arg == "onboard") else {
+        return false;
+    };
+    let mut index = start + 1;
+    while let Some(arg) = args.get(index).map(String::as_str) {
+        let skipped = match arg {
+            "recommendations" => return true,
+            "--json" => 1,
+            "--agent" => 2,
+            _ if arg.starts_with("--agent=") => 1,
+            _ => openclaw_root_option_tokens(args, index),
+        };
+        if skipped == 0 {
+            return false;
+        }
+        index += skipped;
+    }
+    false
 }
 
 impl Cli {
@@ -2317,7 +2338,7 @@ mod tests {
 
     #[test]
     fn skip_bootstrap_clears_only_for_onboarding_runs() {
-        let cases: [(&[&str], bool); 23] = [
+        let cases: [(&[&str], bool); 28] = [
             (&["onboard"], true),
             (&["--log-level", "debug", "setup", "--workspace", "w"], true),
             (&["--no-color", "onboard", "--flow", "quickstart"], true),
@@ -2344,6 +2365,26 @@ mod tests {
             (&["setup", "--json"], true),
             (&["setup", "-mstatus"], false),
             (&["onboard", "--workspace", "recommendations"], true),
+            (&["onboard", "--json", "recommendations"], false),
+            (
+                &["onboard", "--agent", "main", "recommendations", "refresh"],
+                false,
+            ),
+            (
+                &["onboard", "--agent=main", "recommendations", "acknowledge"],
+                false,
+            ),
+            (&["onboard", "--no-color", "recommendations"], false),
+            (
+                &[
+                    "onboard",
+                    "--log-level",
+                    "debug",
+                    "--json",
+                    "recommendations",
+                ],
+                false,
+            ),
         ];
         for (forwarded, expected) in cases {
             let forwarded: Vec<String> = forwarded.iter().map(|arg| arg.to_string()).collect();
