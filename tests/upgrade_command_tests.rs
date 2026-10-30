@@ -10738,9 +10738,9 @@ fn assert_unbound_skip(result: &Value, name: &str) {
     assert_eq!(result["envName"], name, "{result}");
     assert_eq!(result["outcome"], "unbound", "{result}");
     assert_eq!(result["previousBindingKind"], "none", "{result}");
-    assert_eq!(result["previousBindingName"], "—", "{result}");
+    assert_eq!(result["previousBindingName"], "none", "{result}");
     assert_eq!(result["bindingKind"], "none", "{result}");
-    assert_eq!(result["bindingName"], "—", "{result}");
+    assert_eq!(result["bindingName"], "none", "{result}");
     assert_eq!(result["note"], UNBOUND_NOTE, "{result}");
     assert!(result["snapshotId"].is_null(), "{result}");
 }
@@ -10806,6 +10806,8 @@ fn upgrade_all_reports_unbound_envs_as_skipped_and_still_fails_real_failures() {
     assert!(text.status.success(), "{}", stderr(&text));
     let text = stdout(&text);
     assert!(text.contains("unbound"), "{text}");
+    assert!(text.contains("none:none"), "{text}");
+    assert!(!text.contains("unknown"), "{text}");
     assert!(!text.contains(UNBOUND_REFUSAL), "{text}");
 
     // Naming an unbound env is still refused, with or without --dry-run.

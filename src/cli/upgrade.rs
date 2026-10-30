@@ -2776,18 +2776,16 @@ impl Cli {
         let operation_lock = &command_locks;
         let env = self.environment_service().get(name)?;
 
-        // A dev env runs its checkout, which OCM never updates. Report it before
-        // the dev-session mutation guard because the skip changes nothing.
-        if env.default_runtime.is_none()
-            && env.default_launcher.is_none()
-            && env.dev.is_some()
-            && !target.is_explicit()
-        {
-            return Ok(dev_checkout_summary(name));
-        }
-        // `upgrade --all` has nothing to update in an env without a binding.
-        if env.default_runtime.is_none() && env.default_launcher.is_none() && options.skip_unbound {
-            return Ok(unbound_summary(name));
+        // Report skips before the dev-session mutation guard because they change nothing.
+        if env.default_runtime.is_none() && env.default_launcher.is_none() {
+            // A dev env runs its checkout, which OCM never updates.
+            if env.dev.is_some() && !target.is_explicit() {
+                return Ok(dev_checkout_summary(name));
+            }
+            // `upgrade --all` has nothing to update in an env without a binding.
+            if options.skip_unbound {
+                return Ok(unbound_summary(name, &env));
+            }
         }
 
         if !options.dry_run {
@@ -6870,14 +6868,15 @@ pub(crate) fn is_skipped_upgrade_outcome(outcome: &str) -> bool {
     )
 }
 
-fn unbound_summary(env_name: &str) -> UpgradeEnvSummary {
+fn unbound_summary(env_name: &str, env: &crate::env::EnvMeta) -> UpgradeEnvSummary {
+    let (binding_kind, binding_name) = source_binding(env);
     UpgradeEnvSummary {
         source: None,
         env_name: env_name.to_string(),
-        previous_binding_kind: "none".to_string(),
-        previous_binding_name: "—".to_string(),
-        binding_kind: "none".to_string(),
-        binding_name: "—".to_string(),
+        previous_binding_kind: binding_kind.clone(),
+        previous_binding_name: binding_name.clone(),
+        binding_kind,
+        binding_name,
         outcome: "unbound".to_string(),
         runtime_release_version: None,
         runtime_release_channel: None,
