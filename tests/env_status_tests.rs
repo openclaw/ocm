@@ -250,6 +250,53 @@ fn env_status_reports_a_broken_runtime_without_failing() {
     assert!(output.contains("issue: runtime \"stable\" binary path does not exist:"));
 }
 
+#[cfg(unix)]
+#[test]
+fn env_status_reports_a_runtime_binary_the_current_user_cannot_execute() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = TestDir::new("env-status-runtime-not-executable");
+    let cwd = root.child("workspace");
+    let bin_dir = cwd.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let runtime_path = bin_dir.join("stable");
+    write_executable_script(&runtime_path, "#!/bin/sh\nexit 0\n");
+    let env = ocm_env(&root);
+
+    let add = run_ocm(
+        &cwd,
+        &env,
+        &["runtime", "add", "stable", "--path", "./bin/stable"],
+    );
+    assert!(add.status.success(), "{}", stderr(&add));
+    let create = run_ocm(
+        &cwd,
+        &env,
+        &["env", "create", "demo", "--runtime", "stable"],
+    );
+    assert!(create.status.success(), "{}", stderr(&create));
+
+    let status = run_ocm(&cwd, &env, &["env", "status", "demo", "--json"]);
+    assert!(status.status.success(), "{}", stderr(&status));
+    let value: Value = serde_json::from_str(&stdout(&status)).unwrap();
+    assert_eq!(value["runtimeHealth"], "ok");
+    assert_eq!(value["issue"], Value::Null);
+
+    fs::set_permissions(&runtime_path, fs::Permissions::from_mode(0o644)).unwrap();
+
+    let status = run_ocm(&cwd, &env, &["env", "status", "demo", "--json"]);
+    assert!(status.status.success(), "{}", stderr(&status));
+    let value: Value = serde_json::from_str(&stdout(&status)).unwrap();
+    assert_eq!(value["runtimeHealth"], "broken");
+    assert!(
+        value["issue"]
+            .as_str()
+            .unwrap()
+            .contains("runtime \"stable\" binary path is not executable by the current user:"),
+        "{value}"
+    );
+}
+
 #[test]
 fn env_status_reports_when_an_environment_has_no_binding() {
     let root = TestDir::new("env-status-unbound");

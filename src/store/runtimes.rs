@@ -4922,6 +4922,31 @@ fn runtime_companion_integrity_issue(
     None
 }
 
+// Health reports a binary the current user cannot execute. Launch-time lookups
+// (`runtime show`, `which`, `env resolve`, `env run`) keep their existing checks.
+#[cfg(unix)]
+fn runtime_permission_issue(meta: &RuntimeMeta, paths: &RuntimeReadPaths) -> Option<String> {
+    let binary_path = Path::new(&meta.binary_path);
+    // The execution check has already reported a path that cannot be resolved.
+    let actual_binary_path = paths.resolve(binary_path).ok()?;
+    match super::common::check_executable_access(&actual_binary_path) {
+        Ok(()) => None,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => Some(format!(
+            "binary path is not executable by the current user: {}",
+            display_path(binary_path)
+        )),
+        Err(error) => Some(format!(
+            "binary path execute permission could not be checked: {}: {error}",
+            display_path(binary_path)
+        )),
+    }
+}
+
+#[cfg(not(unix))]
+fn runtime_permission_issue(_meta: &RuntimeMeta, _paths: &RuntimeReadPaths) -> Option<String> {
+    None
+}
+
 pub(crate) fn runtime_operational_issue(
     meta: &RuntimeMeta,
     env: &BTreeMap<String, String>,
@@ -4935,6 +4960,9 @@ fn runtime_operational_issue_with_paths(
     paths: &RuntimeReadPaths,
 ) -> Option<String> {
     if let Some(issue) = runtime_execution_issue_with_paths(meta, env, paths) {
+        return Some(issue);
+    }
+    if let Some(issue) = runtime_permission_issue(meta, paths) {
         return Some(issue);
     }
     if let Some(issue) = runtime_companion_integrity_issue(meta, paths) {
