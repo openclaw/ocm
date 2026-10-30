@@ -1756,7 +1756,7 @@ pub(crate) fn remove_environment_locked(
     before_remove(&meta)?;
     prepare_environment_root_removal(&paths.root).map_err(|error| {
         format!(
-            "cannot remove environment \"{}\": {error}; no files were removed; give your user access to that path, or ask its owner to remove it, then retry",
+            "cannot remove environment \"{}\": {error}; no files were removed",
             meta.name
         )
     })?;
@@ -1768,8 +1768,13 @@ pub(crate) fn remove_environment_locked(
 
     if path_exists(&paths.root) {
         fs::remove_dir_all(&paths.root).map_err(|error| {
+            let hint = if error.kind() == std::io::ErrorKind::PermissionDenied {
+                "; give your user access to what remains there, or ask its owner to remove it, then retry"
+            } else {
+                ""
+            };
             format!(
-                "could not finish removing {}, part of it may already be gone: {error}; give your user access to what remains there, or ask its owner to remove it, then retry",
+                "could not finish removing {}, part of it may already be gone: {error}{hint}",
                 display_path(&paths.root)
             )
         })?;
@@ -1806,10 +1811,17 @@ fn prepare_environment_root_removal(root: &Path) -> Result<(), String> {
     let (Some(parent), Some(name)) = (root.parent(), root.file_name()) else {
         return Ok(());
     };
-    // The root's parent is the OCM-owned layout, so it is opened by path.
+    // Removal needs only search permission on the root's parent, so open it
+    // for search alone; the walk below never resolves a path through it.
+    #[cfg(target_os = "linux")]
+    let search = libc::O_PATH;
+    #[cfg(target_vendor = "apple")]
+    let search = libc::O_SEARCH;
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+    let search = libc::O_RDONLY;
     let parent = match fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | search)
         .open(parent)
     {
         Ok(parent) => parent,
@@ -1861,7 +1873,7 @@ fn prepare_environment_root_removal(root: &Path) -> Result<(), String> {
             } != 0
             {
                 return Err(format!(
-                    "could not make {} writable: {}",
+                    "could not make {} writable: {}; remove any lock or immutable flag on it, then retry",
                     display_path(&path),
                     std::io::Error::last_os_error()
                 ));

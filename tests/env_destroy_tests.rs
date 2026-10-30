@@ -2420,6 +2420,34 @@ fn env_remove_deletes_read_only_directories_without_following_links() {
 
 #[cfg(unix)]
 #[test]
+fn env_remove_needs_only_search_permission_on_the_root_parent() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = TestDir::new("env-remove-search-only-parent");
+    let cwd = root.path();
+    let env = ocm_env(&root);
+    let parent = root.child("search-only");
+    fs::create_dir_all(&parent).unwrap();
+    let env_root = parent.join("custom");
+    let created = run_ocm(
+        cwd,
+        &env,
+        &["env", "create", "custom", "--root", &path_string(&env_root)],
+    );
+    assert!(created.status.success(), "{}", stderr(&created));
+    add_read_only_module_cache(&env_root);
+    // Deleting an entry needs write and search on its parent, not read.
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o311)).unwrap();
+
+    let removed = run_ocm(cwd, &env, &["env", "remove", "custom"]);
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(removed.status.success(), "{}", stderr(&removed));
+    assert!(!env_root.exists());
+    assert!(get_environment("custom", &env, cwd).is_err());
+}
+
+#[cfg(unix)]
+#[test]
 fn env_prune_removes_previewed_environments_with_read_only_directories() {
     let root = TestDir::new("env-prune-read-only-dirs");
     let cwd = root.path();
@@ -2519,7 +2547,8 @@ fn env_remove_reports_a_directory_it_cannot_make_writable_before_deleting_anythi
         "{error}"
     );
     assert!(
-        error.contains("no files were removed; give your user access to that path"),
+        error
+            .contains("remove any lock or immutable flag on it, then retry; no files were removed"),
         "{error}"
     );
     assert!(get_environment("locked", &env, cwd).is_ok());
