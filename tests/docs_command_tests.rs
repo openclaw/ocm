@@ -126,8 +126,12 @@ fn is_word(token: &str) -> bool {
 /// subcommand by its words alone, so only its listed groups are checked.
 fn check_command(help: &mut Help, tokens: &[String]) -> Result<(), String> {
     let mut index = 0;
-    while tokens.get(index).map(String::as_str) == Some("--color") {
-        index += 2;
+    while let Some(option) = tokens.get(index) {
+        match option.as_str() {
+            "--color" => index += 2,
+            option if option.starts_with("--color=") => index += 1,
+            _ => break,
+        }
     }
     let Some(first) = tokens.get(index) else {
         return Ok(());
@@ -411,6 +415,7 @@ fn command_check_rejects_removed_commands_and_accepts_current_ones() {
         &["dev", "shaks", "--no-ui"],
         &["upgrade", "simulate", "mira", "--to", "beta"],
         &["--color", "always", "runtime", "list"],
+        &["--color=never", "runtime", "list"],
         &["--version"],
         &["@mira", "--", "status"],
         &["help", "service", "recover"],
