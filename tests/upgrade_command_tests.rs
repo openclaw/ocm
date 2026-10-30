@@ -9898,6 +9898,105 @@ fn start_moves_an_existing_env_to_another_runtime_through_the_transactional_upgr
 }
 
 #[test]
+fn start_with_a_case_variant_of_the_bound_runtime_stays_a_plain_start() {
+    let root = TestDir::new("start-case-variant-bound-runtime");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let command_log = root.child("runtime-commands.log");
+    fs::write(root.child("CaseProbe"), "").unwrap();
+    let case_insensitive = root.child("caseprobe").exists();
+
+    let mut env = ocm_env(&root);
+    env.insert(
+        "OCM_TEST_COMMAND_LOG".to_string(),
+        path_string(&command_log),
+    );
+    for (name, version) in [("old-local", "2026.6.11"), ("new-local", "2026.6.33")] {
+        let runtime = root.child(name);
+        write_executable_script(&runtime, &recording_openclaw_script(version));
+        let add = run_ocm(
+            &cwd,
+            &env,
+            &["runtime", "add", name, "--path", &path_string(&runtime)],
+        );
+        assert!(add.status.success(), "{}", stderr(&add));
+    }
+    let json = |args: &[&str]| -> Value {
+        let output = run_ocm(&cwd, &env, args);
+        assert!(output.status.success(), "{}", stderr(&output));
+        serde_json::from_str(&stdout(&output)).unwrap()
+    };
+    let finalize_calls = || {
+        fs::read_to_string(&command_log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.starts_with("update finalize"))
+            .count()
+    };
+    let start = |args: &[&str]| {
+        let _ = fs::remove_file(&command_log);
+        run_ocm(&cwd, &env, args)
+    };
+
+    for name in ["demo", "other"] {
+        let create = start(&["start", name, "--runtime", "old-local", "--no-service"]);
+        assert!(create.status.success(), "{}", stderr(&create));
+    }
+
+    let same = start(&["start", "demo", "--runtime", "OLD-LOCAL", "--no-service"]);
+    if case_insensitive {
+        // The bound runtime under another spelling is a plain start.
+        assert!(same.status.success(), "{}", stderr(&same));
+    } else {
+        assert_eq!(same.status.code(), Some(1), "{}", stdout(&same));
+        assert!(
+            stderr(&same).contains("runtime \"OLD-LOCAL\" does not exist"),
+            "{}",
+            stderr(&same)
+        );
+    }
+    assert_eq!(finalize_calls(), 0);
+    assert_eq!(
+        json(&["env", "snapshot", "list", "demo", "--json"]),
+        serde_json::json!([])
+    );
+    assert_eq!(
+        json(&["upgrade", "history", "demo", "--json"]),
+        serde_json::json!([])
+    );
+    assert_eq!(
+        json(&["env", "show", "demo", "--json"])["defaultRuntime"],
+        "old-local"
+    );
+
+    // Another runtime under another spelling is still a runtime transition.
+    let switch = start(&["start", "other", "--runtime", "NEW-LOCAL", "--no-service"]);
+    if !case_insensitive {
+        assert_eq!(switch.status.code(), Some(1), "{}", stdout(&switch));
+        assert!(
+            stderr(&switch).contains("runtime \"NEW-LOCAL\" does not exist"),
+            "{}",
+            stderr(&switch)
+        );
+        assert_eq!(finalize_calls(), 0);
+        assert_eq!(
+            json(&["env", "show", "other", "--json"])["defaultRuntime"],
+            "old-local"
+        );
+        return;
+    }
+    assert!(switch.status.success(), "{}", stderr(&switch));
+    assert_eq!(finalize_calls(), 1);
+    assert_eq!(
+        json(&["env", "show", "other", "--json"])["defaultRuntime"],
+        "new-local"
+    );
+    let history = json(&["upgrade", "history", "other", "--json"]);
+    assert_eq!(history[0]["source"]["name"], "old-local", "{history}");
+    assert_eq!(history[0]["target"]["name"], "new-local", "{history}");
+}
+
+#[test]
 fn upgrade_rejects_blocking_finalizer_receipts_before_binding_publication() {
     for receipt in [
         serde_json::json!({"status": "error", "mode": "finalize"}),
