@@ -24,6 +24,8 @@ use time::OffsetDateTime;
 use crate::env::EnvMeta;
 use crate::env::EnvSummary;
 pub(crate) use checkpoints::CheckpointCleanup;
+#[cfg(unix)]
+pub(crate) use common::check_executable_access;
 pub(crate) use common::{
     ExclusiveFileLock, ExclusiveFileLockSet, FileWriteError, FileWriteOperation,
     OpenClawDirectoryCopy, copy_dir_preserving_modes, ensure_dir, load_json_files, lock_file,

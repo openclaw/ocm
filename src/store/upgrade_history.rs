@@ -720,6 +720,16 @@ mod tests {
         let recovery_install_root = recovery_root.join("install-root");
         std::fs::create_dir_all(recovery_install_root.join("files/bin")).unwrap();
         std::fs::write(recovery_install_root.join(&relative_binary), b"openclaw").unwrap();
+        // Recovery moves the installed tree, so its binary keeps the installer's mode.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                recovery_install_root.join(&relative_binary),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
         let created_at = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
         let meta = RuntimeMeta {
             kind: "ocm-runtime".to_string(),

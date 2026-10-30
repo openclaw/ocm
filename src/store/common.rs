@@ -22,6 +22,24 @@ pub(crate) fn path_exists(path: &Path) -> bool {
     path.exists()
 }
 
+/// Checks whether the current process may execute `path`.
+///
+/// `access` applies the current process identity and the relevant owner,
+/// group, or other permission class instead of accepting any execute bit.
+#[cfg(unix)]
+pub(crate) fn check_executable_access(path: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    if unsafe { libc::access(path.as_ptr(), libc::X_OK) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 pub(crate) fn ensure_dir(path: &Path) -> Result<(), String> {
     fs::create_dir_all(path).map_err(|error| error.to_string())
 }

@@ -4902,22 +4902,20 @@ fn runtime_companion_integrity_issue(
 // (`runtime show`, `which`, `env resolve`, `env run`) keep their existing checks.
 #[cfg(unix)]
 fn runtime_permission_issue(meta: &RuntimeMeta, paths: &RuntimeReadPaths) -> Option<String> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
     let binary_path = Path::new(&meta.binary_path);
     // The execution check has already reported a path that cannot be resolved.
     let actual_binary_path = paths.resolve(binary_path).ok()?;
-    let path = CString::new(actual_binary_path.as_os_str().as_bytes()).ok()?;
-    // `access` applies the current process identity and the relevant owner,
-    // group, or other permission class instead of accepting any execute bit.
-    if unsafe { libc::access(path.as_ptr(), libc::X_OK) } == 0 {
-        return None;
+    match super::common::check_executable_access(&actual_binary_path) {
+        Ok(()) => None,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => Some(format!(
+            "binary path is not executable by the current user: {}",
+            display_path(binary_path)
+        )),
+        Err(error) => Some(format!(
+            "binary path execute permission could not be checked: {}: {error}",
+            display_path(binary_path)
+        )),
     }
-    Some(format!(
-        "binary path is not executable by the current user: {}",
-        display_path(binary_path)
-    ))
 }
 
 #[cfg(not(unix))]

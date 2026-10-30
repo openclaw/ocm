@@ -979,19 +979,7 @@ fn resolve_executable_on_path(command: &str, env: &BTreeMap<String, String>) -> 
 
 #[cfg(unix)]
 fn is_executable_file(path: &Path) -> bool {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    if !path.is_file() {
-        return false;
-    }
-    let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
-        return false;
-    };
-
-    // `access` applies the current process identity and the relevant owner,
-    // group, or other permission class instead of accepting any execute bit.
-    unsafe { libc::access(path.as_ptr(), libc::X_OK) == 0 }
+    path.is_file() && crate::store::check_executable_access(path).is_ok()
 }
 
 #[cfg(all(not(unix), not(windows)))]
