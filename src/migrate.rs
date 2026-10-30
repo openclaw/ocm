@@ -967,15 +967,15 @@ fn may_brace_expand(path: &str) -> bool {
 
 /// The launcher runs from other directories than this one, so a relative
 /// `PATH` entry is resolved against `cwd` here, as the lookup sees it now.
-/// On Unix this drops `.` components but keeps `..`, which the lookup resolves
-/// through symlinks; on Windows it also resolves a drive-relative entry such
-/// as `C:tools`, which `join` leaves relative. Absolute entries keep their spelling.
+/// Joining drops `.` components but keeps `..`, which the lookup resolves
+/// through symlinks. Absolute entries keep their spelling.
+#[cfg(not(windows))]
 fn path_entry_dir(dir: PathBuf, cwd: &Path) -> PathBuf {
     if dir.is_absolute() {
-        return dir;
+        dir
+    } else {
+        cwd.join(dir).components().collect()
     }
-    let joined = cwd.join(dir);
-    std::path::absolute(&joined).unwrap_or(joined)
 }
 
 #[cfg(not(windows))]
@@ -991,11 +991,14 @@ fn resolve_executable_on_path(
         .map(|candidate| display_path(&candidate))
 }
 
+/// Windows keeps the path as found: recipes run through `cmd`, which
+/// `migrated_launcher_command` does not quote for, so prefixing a relative
+/// entry with a directory that contains spaces would break the recipe.
 #[cfg(windows)]
 fn resolve_executable_on_path(
     command: &str,
     env: &BTreeMap<String, String>,
-    cwd: &Path,
+    _cwd: &Path,
 ) -> Option<String> {
     let path_value = env.get("PATH")?;
     let extensions = env
@@ -1022,7 +1025,7 @@ fn resolve_executable_on_path(
                 .collect()
         });
 
-    for dir in std::env::split_paths(path_value).map(|dir| path_entry_dir(dir, cwd)) {
+    for dir in std::env::split_paths(path_value) {
         if let Some(extension) = Path::new(command)
             .extension()
             .and_then(|value| value.to_str())
