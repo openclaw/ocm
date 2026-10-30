@@ -615,7 +615,9 @@ fn env_and_service_status_do_not_wait_for_private_node_installation() {
     for issue in status_issues() {
         assert!(
             issue
+                .as_deref()
                 .is_some_and(|issue| issue.contains("compatible managed Node.js is not installed")),
+            "{issue:?}"
         );
     }
     FileExt::unlock(&lock).unwrap();
