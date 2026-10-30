@@ -1669,6 +1669,10 @@ root is captured as a coherent committed snapshot, including uncheckpointed WAL
 writes; raw database sidecars are omitted. Databases and other files are not
 captured in one atomic transaction.
 
+Both export modes leave out Unix sockets, FIFOs and device files, such as a Git
+filesystem monitor socket in a workspace repository. They hold no data; the
+source keeps them, and their owning processes recreate them when needed.
+
 Default export accepts configured workspaces under an aliased environment root using either the accepted root spelling or its canonical path.
 On Windows, ordinary and extended-length prefixes are equivalent representations of those same roots.
 Equivalent spellings select the same owned content and omit each workspace's `.openclaw/tmp` runtime debris.

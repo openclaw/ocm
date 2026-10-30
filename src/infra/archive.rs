@@ -625,10 +625,10 @@ fn append_env_root(
                 .map_err(EnvArchiveWriteError::from_entry_io)?;
             continue;
         }
+        // Under the capture only sockets, FIFOs and device files reach here.
+        // They hold no data and are left out, as the copy paths leave them out.
         if capture.is_some() {
-            return Err(EnvArchiveWriteError::EntryDisappeared(
-                "archive entry changed type".to_string(),
-            ));
+            continue;
         }
 
         builder
