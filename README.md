@@ -449,7 +449,8 @@ to the host runtime. Verification checks integrity; use native plugin runtime
 inspection to check loading.
 
 `upgrade simulate` clones the source env, leaves the real env untouched, and
-cleans temporary simulation envs and runtimes when the run finishes. Runtime
+cleans temporary simulation envs and runtimes when the run finishes, including
+when Ctrl-C or SIGTERM stops it after the check in progress. Runtime
 cleanup checks the original registration lifetime: removing a temporary runtime
 and independently reinstalling its name preserves the new installation and
 reports cleanup failure. Updating the existing temporary runtime does not

@@ -255,6 +255,8 @@ impl Drop for UpgradeInterruptFence {
 
 const UPGRADE_INTERRUPTED_ERROR: &str =
     "upgrade interrupted by SIGINT or SIGTERM; restoring the pre-upgrade state";
+const UPGRADE_SIMULATION_INTERRUPTED_ERROR: &str =
+    "upgrade simulation interrupted by SIGINT or SIGTERM before any simulation env was created";
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1920,15 +1922,22 @@ impl Cli {
 
         let target = self.resolve_simulation_target(&to)?;
         self.validate_simulation_target(&target)?;
+        // From the first simulation-owned registration until cleanup, SIGINT
+        // and SIGTERM stop the run at the next check instead of ending OCM.
+        let interrupt_fence = UpgradeInterruptFence::enter()?;
         let prepared_runtime = self.prepare_shared_simulation_runtime(source_name, &target)?;
         let mut summaries = Vec::with_capacity(scenarios.len());
         for scenario in scenarios {
+            if interrupt_fence.requested() {
+                break;
+            }
             match self.upgrade_simulate_one(
                 source_name,
                 &target,
                 prepared_runtime.as_ref(),
                 scenario,
                 options,
+                &interrupt_fence,
             ) {
                 Ok(summary) => summaries.push(summary),
                 Err(error) => {
@@ -1941,7 +1950,24 @@ impl Cli {
                 }
             }
         }
+        if summaries.is_empty() {
+            // Only an interruption stops the run before its first clone.
+            let mut error = UPGRADE_SIMULATION_INTERRUPTED_ERROR.to_string();
+            if let Err(cleanup_error) =
+                self.remove_temporary_simulation_runtime(prepared_runtime.as_ref(), options)
+            {
+                error.push_str(&format!(
+                    "; cleanup simulation runtime failed: {cleanup_error}"
+                ));
+            }
+            return Err(error);
+        }
         self.finish_shared_simulation_runtime(&mut summaries, prepared_runtime.as_ref(), options)?;
+        if interrupt_fence.requested() {
+            if let Some(summary) = summaries.last_mut() {
+                record_simulation_interrupted(summary);
+            }
+        }
         Ok(summaries)
     }
 
@@ -1952,6 +1978,7 @@ impl Cli {
         prepared_runtime: Option<&PreparedSimulationRuntime>,
         scenario: UpgradeSimulationScenario,
         options: UpgradeSimulationOptions,
+        interrupt_fence: &UpgradeInterruptFence,
     ) -> Result<UpgradeSimulationSummary, String> {
         let source = self.environment_service().get(source_name)?;
         let (from_binding_kind, from_binding_name) = source_binding(&source);
@@ -1988,70 +2015,69 @@ impl Cli {
         let mut to_binding_kind = "unknown".to_string();
         let mut to_binding_name = "unknown".to_string();
 
-        let scenario_check = self.apply_simulation_scenario(&cloned, scenario);
-        let scenario_failed = scenario_check.status == "failed";
-        checks.push(scenario_check);
-        if scenario_failed {
-            let summary = self.build_simulation_summary(
-                source_name,
-                &cloned.name,
-                from_binding_kind,
-                from_binding_name,
-                to_binding_kind,
-                to_binding_name,
-                scenario,
-                target.display(),
-                checks,
-            );
-            return self.finish_simulation_summary(summary, &cloned, options);
-        }
-        checks.push(self.run_update_plan_check(&cloned, target));
-
-        match self.apply_simulation_target(&cloned, target, prepared_runtime) {
-            Ok((kind, name, note)) => {
-                to_binding_kind = kind;
-                to_binding_name = name;
-                checks.push(UpgradeSimulationCheck::passed("prepare target", note));
+        // Each check finishes before an interruption is observed; the remaining
+        // checks are skipped and the clone goes through the normal cleanup.
+        'checks: {
+            if interrupt_fence.requested() {
+                break 'checks;
             }
-            Err(error) => {
-                checks.push(UpgradeSimulationCheck::failed("prepare target", error));
-                let summary = self.build_simulation_summary(
-                    source_name,
-                    &cloned.name,
-                    from_binding_kind,
-                    from_binding_name,
-                    to_binding_kind,
-                    to_binding_name,
-                    scenario,
-                    target.display(),
-                    checks,
-                );
-                return self.finish_simulation_summary(summary, &cloned, options);
+            let scenario_check = self.apply_simulation_scenario(&cloned, scenario);
+            let scenario_failed = scenario_check.status == "failed";
+            checks.push(scenario_check);
+            if scenario_failed || interrupt_fence.requested() {
+                break 'checks;
+            }
+            checks.push(self.run_update_plan_check(&cloned, target));
+            if interrupt_fence.requested() {
+                break 'checks;
+            }
+
+            match self.apply_simulation_target(&cloned, target, prepared_runtime) {
+                Ok((kind, name, note)) => {
+                    to_binding_kind = kind;
+                    to_binding_name = name;
+                    checks.push(UpgradeSimulationCheck::passed("prepare target", note));
+                }
+                Err(error) => {
+                    checks.push(UpgradeSimulationCheck::failed("prepare target", error));
+                    break 'checks;
+                }
+            }
+
+            if matches!(target, UpgradeSimulationTarget::LocalRepo { .. }) {
+                for (name, script) in [("pnpm build", "build"), ("pnpm ui:build", "ui:build")] {
+                    if interrupt_fence.requested() {
+                        break 'checks;
+                    }
+                    checks.push(self.run_local_repo_script_check(&cloned, name, script));
+                }
+            }
+
+            let openclaw_checks: [(&str, &[&str], &[(&str, &str)]); 4] = [
+                ("openclaw --version", &["--version"], &[]),
+                (
+                    "openclaw doctor",
+                    &["doctor", "--non-interactive", "--fix"],
+                    &[("OPENCLAW_UPDATE_IN_PROGRESS", "1")],
+                ),
+                (
+                    "openclaw plugins update",
+                    &["plugins", "update", "--all", "--dry-run"],
+                    &[],
+                ),
+                (
+                    "openclaw gateway status",
+                    &["gateway", "status", "--deep", "--json"],
+                    &[],
+                ),
+            ];
+            for (name, args, extra_env) in openclaw_checks {
+                if interrupt_fence.requested() {
+                    break 'checks;
+                }
+                checks.push(self.run_simulation_check_with_env(&cloned, name, args, extra_env));
             }
         }
-
-        if matches!(target, UpgradeSimulationTarget::LocalRepo { .. }) {
-            checks.push(self.run_local_repo_script_check(&cloned, "pnpm build", "build"));
-            checks.push(self.run_local_repo_script_check(&cloned, "pnpm ui:build", "ui:build"));
-        }
-
-        checks.push(self.run_simulation_check(&cloned, "openclaw --version", &["--version"]));
-        checks.push(self.run_simulation_check_with_env(
-            &cloned,
-            "openclaw doctor",
-            &["doctor", "--non-interactive", "--fix"],
-            &[("OPENCLAW_UPDATE_IN_PROGRESS", "1")],
-        ));
-        checks.push(self.run_simulation_check(
-            &cloned,
-            "openclaw plugins update",
-            &["plugins", "update", "--all", "--dry-run"],
-        ));
-        checks.push(self.run_simulation_check(
-            &cloned,
-            "openclaw gateway status",
-            &["gateway", "status", "--deep", "--json"],
-        ));
 
         let summary = self.build_simulation_summary(
             source_name,
@@ -2655,31 +2681,34 @@ impl Cli {
         prepared_runtime: Option<&PreparedSimulationRuntime>,
         options: UpgradeSimulationOptions,
     ) -> Result<(), String> {
+        if let Err(error) = self.remove_temporary_simulation_runtime(prepared_runtime, options) {
+            // The shared target belongs to every scenario, including one
+            // whose preparation failed before recording a target binding.
+            for summary in summaries {
+                record_simulation_cleanup_failure(
+                    summary,
+                    "cleanup simulation runtime",
+                    error.clone(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_temporary_simulation_runtime(
+        &self,
+        prepared_runtime: Option<&PreparedSimulationRuntime>,
+        options: UpgradeSimulationOptions,
+    ) -> Result<(), String> {
         let Some(prepared_runtime) = prepared_runtime else {
             return Ok(());
         };
         if options.keep_envs || !prepared_runtime.temporary {
             return Ok(());
         }
-
-        match self
-            .runtime_service()
+        self.runtime_service()
             .remove_simulation(&prepared_runtime.meta)
-        {
-            Ok(_) => Ok(()),
-            Err(error) => {
-                // The shared target belongs to every scenario, including one
-                // whose preparation failed before recording a target binding.
-                for summary in summaries {
-                    record_simulation_cleanup_failure(
-                        summary,
-                        "cleanup simulation runtime",
-                        error.clone(),
-                    );
-                }
-                Ok(())
-            }
-        }
+            .map(|_| ())
     }
 
     fn upgrade_env(
@@ -6461,6 +6490,14 @@ fn build_simulation_batch_summary(
 
 fn simulation_requires_attention(summary: &UpgradeSimulationSummary) -> bool {
     summary.outcome == "failed" || summary.cleanup == "failed"
+}
+
+fn record_simulation_interrupted(summary: &mut UpgradeSimulationSummary) {
+    summary.outcome = "failed".to_string();
+    summary.checks.push(UpgradeSimulationCheck::failed(
+        "interrupted",
+        "stopped by SIGINT or SIGTERM; remaining checks and scenarios did not run".to_string(),
+    ));
 }
 
 fn record_simulation_cleanup_failure(

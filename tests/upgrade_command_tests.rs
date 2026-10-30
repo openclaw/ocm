@@ -4107,6 +4107,220 @@ fn upgrade_simulate_runs_openclaw_update_contract_checks_for_published_targets()
     );
 }
 
+#[cfg(unix)]
+fn assert_interrupted_simulation_removes_its_clone_and_runtime(
+    label: &str,
+    signal: libc::c_int,
+    signal_process_group: bool,
+    scenario: Option<&str>,
+) {
+    use std::os::unix::process::CommandExt;
+
+    struct SimulationChild(std::process::Child);
+    impl Drop for SimulationChild {
+        fn drop(&mut self) {
+            if matches!(self.0.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            unsafe { libc::kill(-(self.0.id() as i32), libc::SIGKILL) };
+            let _ = self.0.wait();
+        }
+    }
+
+    let root = TestDir::new(label);
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+
+    let old_tarball =
+        openclaw_package_tarball(&recording_openclaw_script("2026.3.24"), "2026.3.24");
+    let old_integrity = sha512_integrity(&old_tarball);
+    let old_tarball_server = TestHttpServer::serve_bytes_times(
+        "/openclaw-2026.3.24.tgz",
+        "application/octet-stream",
+        &old_tarball,
+        10,
+    );
+    let new_tarball =
+        openclaw_package_tarball(&recording_openclaw_script("2026.3.25"), "2026.3.25");
+    let new_integrity = sha512_integrity(&new_tarball);
+    let new_tarball_server = TestHttpServer::serve_bytes_times(
+        "/openclaw-2026.3.25.tgz",
+        "application/octet-stream",
+        &new_tarball,
+        10,
+    );
+    let initial_packument = format!(
+        "{{\"dist-tags\":{{\"latest\":\"2026.3.24\"}},\"versions\":{{\"2026.3.24\":{{\"version\":\"2026.3.24\",\"dist\":{{\"tarball\":\"{}\",\"integrity\":\"{}\"}}}}}},\"time\":{{\"2026.3.24\":\"2026-03-25T16:35:52.000Z\"}}}}",
+        old_tarball_server.url(),
+        old_integrity
+    );
+    let updated_packument = format!(
+        "{{\"dist-tags\":{{\"latest\":\"2026.3.25\"}},\"versions\":{{\"2026.3.24\":{{\"version\":\"2026.3.24\",\"dist\":{{\"tarball\":\"{}\",\"integrity\":\"{}\"}}}},\"2026.3.25\":{{\"version\":\"2026.3.25\",\"dist\":{{\"tarball\":\"{}\",\"integrity\":\"{}\"}}}}}},\"time\":{{\"2026.3.24\":\"2026-03-25T16:35:52.000Z\",\"2026.3.25\":\"2026-03-26T09:00:00.000Z\"}}}}",
+        old_tarball_server.url(),
+        old_integrity,
+        new_tarball_server.url(),
+        new_integrity
+    );
+    let mut packuments = vec![initial_packument.into_bytes()];
+    packuments.extend(std::iter::repeat_n(updated_packument.into_bytes(), 6));
+    let packument_server =
+        TestHttpServer::serve_bytes_sequence("/openclaw", "application/json", packuments);
+
+    let mut env = ocm_env(&root);
+    install_fake_node_and_npm(&root, &mut env, "22.22.3");
+    env.insert(
+        "OCM_INTERNAL_OPENCLAW_RELEASES_URL".to_string(),
+        packument_server.url(),
+    );
+    let start = run_ocm(&cwd, &env, &["start", "demo", "--no-service"]);
+    assert!(start.status.success(), "{}", stderr(&start));
+
+    let status_started = root.child("gateway-status.started");
+    let status_release = root.child("gateway-status.release");
+    env.insert(
+        "OCM_TEST_GATEWAY_STATUS_STARTED".to_string(),
+        path_string(&status_started),
+    );
+    env.insert(
+        "OCM_TEST_GATEWAY_STATUS_RELEASE".to_string(),
+        path_string(&status_release),
+    );
+    let listed = |args: &[&str], keep: fn(&str) -> bool| -> Vec<String> {
+        let list = run_ocm(&cwd, &env, args);
+        assert!(list.status.success(), "{}", stderr(&list));
+        let entries: Value = serde_json::from_str(&stdout(&list)).unwrap();
+        entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry["name"].as_str())
+            .filter(|name| keep(name))
+            .map(str::to_string)
+            .collect()
+    };
+    let simulation_envs = || listed(&["env", "list", "--json"], |name| name.contains("-sim-"));
+    let simulation_runtimes = || {
+        listed(&["runtime", "list", "--json"], |name| {
+            name.starts_with("ocm-sim-runtime-")
+        })
+    };
+
+    let output_path = root.child("simulation.out");
+    let error_path = root.child("simulation.err");
+    let mut command = Command::new(support::ocm_test_binary_path());
+    command
+        .args(["upgrade", "simulate", "demo", "--to", "2026.3.25", "--json"])
+        .current_dir(&cwd)
+        .env_clear()
+        .envs(&env)
+        .stdin(Stdio::null())
+        .stdout(fs::File::create(&output_path).unwrap())
+        .stderr(fs::File::create(&error_path).unwrap())
+        .process_group(0);
+    if let Some(scenario) = scenario {
+        command.args(["--scenario", scenario]);
+    }
+    let mut simulation = SimulationChild(command.spawn().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !status_started.exists() {
+        assert!(
+            simulation.0.try_wait().unwrap().is_none() && Instant::now() < deadline,
+            "simulation did not reach the gateway status check: {:?}; {:?}",
+            fs::read_to_string(&output_path),
+            fs::read_to_string(&error_path)
+        );
+        sleep(Duration::from_millis(25));
+    }
+    assert_eq!(simulation_envs().len(), 1);
+    assert_eq!(simulation_runtimes().len(), 1);
+
+    // A terminal delivers Ctrl-C to the whole foreground group, including the
+    // running check; a service manager or `kill` may signal only OCM.
+    let target = if signal_process_group {
+        -(simulation.0.id() as i32)
+    } else {
+        simulation.0.id() as i32
+    };
+    assert_eq!(unsafe { libc::kill(target, signal) }, 0);
+    fs::write(&status_release, "").unwrap();
+    let status = simulation.0.wait().unwrap();
+    let output = fs::read_to_string(&output_path).unwrap();
+    let errors = fs::read_to_string(&error_path).unwrap();
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "stdout:\n{output}\nstderr:\n{errors}"
+    );
+
+    let json: Value = serde_json::from_str(&output).unwrap();
+    let results = match json.get("results") {
+        Some(results) => results.as_array().unwrap().clone(),
+        None => vec![json.clone()],
+    };
+    assert_eq!(
+        results.len(),
+        1,
+        "remaining scenarios must not run: {output}"
+    );
+    let result = &results[0];
+    assert_eq!(result["outcome"], "failed", "{output}");
+    assert_eq!(result["cleanup"], "cleaned", "{output}");
+    let checks = result["checks"].as_array().unwrap();
+    assert!(
+        checks
+            .iter()
+            .any(|check| check["name"] == "openclaw gateway status"),
+        "{output}"
+    );
+    let last = checks.last().unwrap();
+    assert_eq!(last["name"], "interrupted", "{output}");
+    assert_eq!(last["status"], "failed", "{output}");
+
+    assert!(simulation_envs().is_empty(), "{:?}", simulation_envs());
+    assert!(
+        simulation_runtimes().is_empty(),
+        "{:?}",
+        simulation_runtimes()
+    );
+    let source = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
+    assert!(source.status.success(), "{}", stderr(&source));
+    let source: Value = serde_json::from_str(&stdout(&source)).unwrap();
+    assert_eq!(source["defaultRuntime"], "stable");
+}
+
+#[cfg(unix)]
+#[test]
+fn interrupted_upgrade_simulate_removes_its_clone_and_runtime_on_sigint() {
+    assert_interrupted_simulation_removes_its_clone_and_runtime(
+        "upgrade-simulate-sigint",
+        libc::SIGINT,
+        true,
+        None,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn interrupted_upgrade_simulate_removes_its_clone_and_runtime_on_sigterm() {
+    assert_interrupted_simulation_removes_its_clone_and_runtime(
+        "upgrade-simulate-sigterm",
+        libc::SIGTERM,
+        false,
+        None,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn interrupted_upgrade_simulate_skips_remaining_scenarios() {
+    assert_interrupted_simulation_removes_its_clone_and_runtime(
+        "upgrade-simulate-interrupt-all",
+        libc::SIGINT,
+        true,
+        Some("all"),
+    );
+}
+
 #[test]
 fn upgrade_simulate_all_scenarios_reports_plugin_specific_failures() {
     let root = TestDir::new("upgrade-simulate-scenarios");
