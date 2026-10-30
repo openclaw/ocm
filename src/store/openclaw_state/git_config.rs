@@ -10,9 +10,9 @@ use crate::openclaw_repo::{
 };
 
 use super::{
-    copied_history_state_roots, is_copied_git_entry, is_durable_openclaw_state_root,
-    is_integrity_protected_history_destination, openclaw_extension_runtime_debris_roots,
-    with_owner_write_permission,
+    IntegrityProtectedLibraryPaths, copied_history_state_roots, is_copied_git_entry,
+    is_durable_openclaw_state_root, is_integrity_protected_history_destination,
+    openclaw_extension_runtime_debris_roots, with_owner_write_permission,
 };
 use crate::store::layout::{EnvPaths, display_path};
 use crate::store::openclaw_workspaces::OpenClawWorkspaceInventory;
@@ -217,9 +217,9 @@ pub(in crate::store) struct CopiedGitRepositories {
 
 /// Clone keeps every top-level directory of the environment, the durable
 /// OpenClaw state roots and the configured workspace and agent directories.
-/// Discover Git layouts in all of them, as import does in its extracted tree.
-/// Extension runtime debris is skipped because cleanup removes it, and
-/// protected history is not a durable root.
+/// Discover Git layouts in all of them, and in the environment root itself,
+/// as import does in its extracted tree. Extension runtime debris is skipped
+/// because cleanup removes it, and protected history payloads as import does.
 pub(in crate::store) fn copied_environment_git_repositories(
     source: &EnvPaths,
     target: &EnvPaths,
@@ -253,24 +253,34 @@ pub(in crate::store) fn copied_environment_git_repositories(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.to_string()),
     }
-    let excluded = openclaw_extension_runtime_debris_roots(&target.state_dir)?
+    let mut excluded = openclaw_extension_runtime_debris_roots(&target.state_dir)?
         .into_iter()
         .map(|relative| target.state_dir.join(relative))
-        .collect();
-    discover_destination_git_repositories(target, roots, &excluded)
+        .collect::<BTreeSet<_>>();
+    excluded.extend(IntegrityProtectedLibraryPaths::new(&target.state_dir)?.roots);
+    // The root may itself be a checkout. Unless a workspace is the root,
+    // inspect it without walking the state that cleanup removes.
+    let unwalked = if roots.contains(&target.root) {
+        None
+    } else {
+        roots.push(target.root.clone());
+        Some(target.root.as_path())
+    };
+    discover_destination_git_repositories(target, roots, &excluded, unwalked)
 }
 
 pub(in crate::store) fn copied_destination_git_repositories(
     target: &EnvPaths,
     roots: impl IntoIterator<Item = PathBuf>,
 ) -> Result<CopiedGitRepositories, String> {
-    discover_destination_git_repositories(target, roots, &BTreeSet::new())
+    discover_destination_git_repositories(target, roots, &BTreeSet::new(), None)
 }
 
 fn discover_destination_git_repositories(
     target: &EnvPaths,
     roots: impl IntoIterator<Item = PathBuf>,
     excluded: &BTreeSet<PathBuf>,
+    unwalked: Option<&Path>,
 ) -> Result<CopiedGitRepositories, String> {
     let mut pending = roots.into_iter().collect::<Vec<_>>();
     let mut seen = BTreeSet::new();
@@ -322,6 +332,9 @@ fn discover_destination_git_repositories(
             if !entry.exists() {
                 continue; // A native bare repository is administrative storage.
             }
+        }
+        if unwalked == Some(path.as_path()) {
+            continue;
         }
         for entry in fs::read_dir(path).map_err(|e| e.to_string())? {
             let entry = entry.map_err(|e| e.to_string())?;
