@@ -5556,12 +5556,15 @@ fn runtime_update_reuses_the_official_release_selector() {
     assert!(stdout(&show).contains("releaseVersion: 2026.3.25"));
 }
 
-/// Installs the official `stable` channel runtime at 2026.3.24, moves the
-/// channel to 2026.3.25, runs `change_args`, and returns the runtime's
-/// `releaseVersion` and `description` from `runtime show --json`.
+/// Installs the official `stable` channel runtime at 2026.3.24, optionally
+/// replaces its stored description with `stored_description` (the state an
+/// earlier OCM update could leave behind), moves the channel to 2026.3.25,
+/// runs `change_args`, and returns the runtime's `releaseVersion` and
+/// `description` from `runtime show --json`.
 fn official_stable_after_release_change(
     test_name: &str,
     install_args: &[&str],
+    stored_description: Option<&str>,
     change_args: &[&str],
 ) -> (Value, Value) {
     let root = TestDir::new(test_name);
@@ -5608,6 +5611,13 @@ fn official_stable_after_release_change(
 
     let install = run_ocm(&cwd, &env, install_args);
     assert!(install.status.success(), "{}", stderr(&install));
+    if let Some(stored_description) = stored_description {
+        let meta_path = runtime_meta_path("stable", &env, &cwd).unwrap();
+        let mut meta: Value =
+            serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+        meta["description"] = Value::String(stored_description.to_string());
+        fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+    }
     let change = run_ocm(&cwd, &env, change_args);
     assert!(change.status.success(), "{}", stderr(&change));
 
@@ -5622,6 +5632,7 @@ fn runtime_update_regenerates_the_generated_official_release_description() {
     let (version, description) = official_stable_after_release_change(
         "runtime-update-official-generated-description",
         &["runtime", "install", "stable", "--channel", "stable"],
+        None,
         &["runtime", "update", "stable"],
     );
     assert_eq!(version, "2026.3.25");
@@ -5633,10 +5644,39 @@ fn runtime_install_replacement_regenerates_the_generated_official_release_descri
     let (version, description) = official_stable_after_release_change(
         "runtime-reinstall-official-generated-description",
         &["runtime", "install", "stable", "--channel", "stable"],
+        None,
         &["runtime", "install", "stable", "--channel", "stable"],
     );
     assert_eq!(version, "2026.3.25");
     assert_eq!(description, "Official OpenClaw release 2026.3.25");
+}
+
+#[test]
+fn runtime_update_replaces_a_generated_description_left_for_an_older_release() {
+    // An update before this behavior existed kept the first release's text.
+    let (version, description) = official_stable_after_release_change(
+        "runtime-update-official-stale-generated-description",
+        &["runtime", "install", "stable", "--channel", "stable"],
+        Some("Official OpenClaw release 2026.3.23"),
+        &["runtime", "update", "stable"],
+    );
+    assert_eq!(version, "2026.3.25");
+    assert_eq!(description, "Official OpenClaw release 2026.3.25");
+}
+
+#[test]
+fn runtime_update_keeps_a_user_description_that_extends_the_generated_text() {
+    let (version, description) = official_stable_after_release_change(
+        "runtime-update-official-extended-description",
+        &["runtime", "install", "stable", "--channel", "stable"],
+        Some("Official OpenClaw release 2026.3.24 for staging"),
+        &["runtime", "update", "stable"],
+    );
+    assert_eq!(version, "2026.3.25");
+    assert_eq!(
+        description,
+        "Official OpenClaw release 2026.3.24 for staging"
+    );
 }
 
 #[test]
@@ -5652,6 +5692,7 @@ fn runtime_update_keeps_a_user_supplied_official_runtime_description() {
             "--description",
             "team baseline",
         ],
+        None,
         &["runtime", "update", "stable"],
     );
     assert_eq!(version, "2026.3.25");
@@ -5671,6 +5712,7 @@ fn runtime_install_replacement_keeps_a_user_supplied_official_runtime_descriptio
             "--description",
             "team baseline",
         ],
+        None,
         &["runtime", "install", "stable", "--channel", "stable"],
     );
     assert_eq!(version, "2026.3.25");

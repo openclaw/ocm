@@ -56,10 +56,20 @@ fn trim_description(description: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+const OFFICIAL_OPENCLAW_RELEASE_DESCRIPTION_PREFIX: &str = "Official OpenClaw release ";
+
 /// The description OCM records for an official OpenClaw release installed
 /// without `--description`.
 pub(crate) fn official_openclaw_release_description(version: &str) -> String {
-    format!("Official OpenClaw release {version}")
+    format!("{OFFICIAL_OPENCLAW_RELEASE_DESCRIPTION_PREFIX}{version}")
+}
+
+/// Whether `description` is the text OCM records for some official OpenClaw
+/// release, including one an earlier update left behind for an older release.
+pub(crate) fn is_official_openclaw_release_description(description: &str) -> bool {
+    description
+        .strip_prefix(OFFICIAL_OPENCLAW_RELEASE_DESCRIPTION_PREFIX)
+        .is_some_and(|version| !version.is_empty() && !version.contains(char::is_whitespace))
 }
 
 fn installed_openclaw_binary_path(install_files: &Path) -> PathBuf {

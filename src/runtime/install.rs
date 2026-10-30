@@ -12,7 +12,7 @@ use crate::store::{
     install_runtime_from_local_openclaw_build,
     install_runtime_from_official_openclaw_release_with_context,
     install_runtime_from_release_with_context, install_runtime_from_url_with_context,
-    install_runtime_with_context, list_runtimes, official_openclaw_release_description,
+    install_runtime_with_context, is_official_openclaw_release_description, list_runtimes,
     prepare_runtime_from_selected_official_openclaw_release, prepare_runtime_from_selected_release,
     runtime_integrity_issue,
 };
@@ -91,11 +91,11 @@ pub(crate) struct ResolvedRuntimeUpdate {
     description: Option<String>,
 }
 
-/// Returns the description a runtime keeps when it moves to another release.
-/// `previous_release_description` is the text OCM records for the runtime's
-/// current release when no `--description` is given; that text describes only
-/// that release, so it is dropped. Any other description was supplied by the
-/// user and is kept.
+/// Returns the description a manifest-backed runtime keeps when it moves to
+/// another release. `previous_release_description` is the manifest's text for
+/// the runtime's current release, which OCM copied when no `--description` was
+/// given; it describes only that release, so it is dropped. Any other
+/// description was supplied by the user and is kept.
 fn description_kept_across_releases(
     existing: &RuntimeMeta,
     previous_release_description: Option<&str>,
@@ -106,12 +106,15 @@ fn description_kept_across_releases(
         .filter(|description| Some(description.as_str()) != previous_release_description)
 }
 
+/// Returns the description an official runtime keeps when it moves to another
+/// release. OCM's `Official OpenClaw release <version>` text names one release,
+/// so it is dropped whichever release it names, including text an earlier
+/// update carried over; any other description was supplied by the user.
 fn official_description_kept_across_releases(existing: &RuntimeMeta) -> Option<String> {
-    let previous = existing
-        .release_version
-        .as_deref()
-        .map(official_openclaw_release_description);
-    description_kept_across_releases(existing, previous.as_deref())
+    existing
+        .description
+        .clone()
+        .filter(|description| !is_official_openclaw_release_description(description))
 }
 
 impl ResolvedRuntimeUpdate {
