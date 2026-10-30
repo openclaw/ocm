@@ -1559,6 +1559,132 @@ fn env_import_relocates_native_bare_and_ordinary_git_includes() {
 }
 
 #[test]
+fn env_import_relocates_separate_git_directory_repositories() {
+    for include_state in [false, true] {
+        let fixture = TestDir::new("import-separate-git-dir");
+        let root = fs::canonicalize(fixture.path()).unwrap();
+        let env = ocm_env(&fixture);
+        let source = root.join("source");
+        let target = root.join("target");
+        let created = run_ocm(
+            &root,
+            &env,
+            &[
+                "env",
+                "create",
+                "source",
+                "--root",
+                source.to_str().unwrap(),
+            ],
+        );
+        assert!(created.status.success(), "{}", stderr(&created));
+        let workspace = source.join(".openclaw/workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let settings = workspace.join("settings.ini");
+        fs::write(&settings, "[fixture]\n value = retained\n").unwrap();
+        let layouts = [("beside", "beside-git"), ("inside", "inside/.git-data")];
+        for (checkout, git_dir) in layouts {
+            let checkout = workspace.join(checkout);
+            fs::create_dir(&checkout).unwrap();
+            import_git(
+                &checkout,
+                &env,
+                &[
+                    "init",
+                    "-q",
+                    "--separate-git-dir",
+                    workspace.join(git_dir).to_str().unwrap(),
+                ],
+            );
+            import_git(
+                &checkout,
+                &env,
+                &["config", "include.path", settings.to_str().unwrap()],
+            );
+            fs::write(checkout.join("file"), "authored content\n").unwrap();
+            import_git(&checkout, &env, &["add", "file"]);
+            import_git(
+                &checkout,
+                &env,
+                &[
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-qm",
+                    "fixture",
+                ],
+            );
+        }
+        let statuses = layouts.map(|(checkout, _)| {
+            import_git(&workspace.join(checkout), &env, &["status", "--porcelain"])
+        });
+        let archive = root.join("source.tar");
+        let mut args = vec![
+            "env",
+            "export",
+            "source",
+            "--output",
+            archive.to_str().unwrap(),
+        ];
+        if include_state {
+            args.push("--include-state");
+        }
+        let exported = run_ocm(&root, &env, &args);
+        assert!(exported.status.success(), "{}", stderr(&exported));
+        fs::rename(&source, root.join("offline")).unwrap();
+        let imported = run_ocm(
+            &root,
+            &env,
+            &[
+                "env",
+                "import",
+                archive.to_str().unwrap(),
+                "--name",
+                "target",
+                "--root",
+                target.to_str().unwrap(),
+            ],
+        );
+        assert!(imported.status.success(), "{}", stderr(&imported));
+        let copied_workspace = target.join(".openclaw/workspace");
+        for ((checkout, git_dir), status) in layouts.into_iter().zip(statuses) {
+            let checkout = copied_workspace.join(checkout);
+            assert_eq!(
+                fs::canonicalize(import_git(
+                    &checkout,
+                    &env,
+                    &["rev-parse", "--absolute-git-dir"]
+                ))
+                .unwrap(),
+                fs::canonicalize(copied_workspace.join(git_dir)).unwrap()
+            );
+            assert_eq!(
+                import_git(&checkout, &env, &["status", "--porcelain"]),
+                status
+            );
+            assert_eq!(
+                import_git(&checkout, &env, &["show", "HEAD:file"]),
+                "authored content"
+            );
+            assert_eq!(
+                Path::new(&import_git(
+                    &checkout,
+                    &env,
+                    &["config", "--get", "include.path"]
+                )),
+                Path::new(&import_git_argument(
+                    copied_workspace.join("settings.ini").to_str().unwrap()
+                ))
+            );
+        }
+    }
+}
+
+#[test]
 fn env_import_relocates_native_bare_shared_history_without_the_source() {
     for include_state in [false, true] {
         let fixture = TestDir::new("import-bare-shared-history");
