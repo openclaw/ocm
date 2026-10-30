@@ -2021,6 +2021,13 @@ mod tests {
                 fs::write(&installed.definition_path, &original).unwrap();
             }
 
+            // A relative recorded value is never resolved against OCM's own
+            // working directory, which Cargo sets to the package root here.
+            let package_src = format!("{}/src", env!("CARGO_MANIFEST_DIR"));
+            assert!(Path::new("src").is_dir());
+            assert!(!crate::store::same_ocm_home("src", &package_src));
+            assert!(crate::store::same_ocm_home(&package_src, &package_src));
+
             // A recorded store that no longer exists matches no other spelling.
             fs::rename(&store, root.path().join("moved-store")).unwrap();
             for current in [&alias, &other] {

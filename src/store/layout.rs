@@ -141,14 +141,18 @@ pub fn resolve_ocm_home(env: &BTreeMap<String, String>, cwd: &Path) -> Result<Pa
 }
 
 /// A recorded OCM_HOME names the current store when the text matches or both
-/// spellings resolve to the same existing directory, such as a symlinked store
-/// or HOME. A missing or unresolvable recorded store never matches another one.
+/// absolute spellings resolve to the same existing directory, such as a
+/// symlinked store or HOME. A relative, missing or unresolvable recorded store
+/// never matches another spelling, so the caller's working directory is never
+/// part of the decision.
 pub(crate) fn same_ocm_home(recorded: &str, current: &str) -> bool {
     recorded == current
-        || matches!(
-            (std::fs::canonicalize(recorded), std::fs::canonicalize(current)),
-            (Ok(recorded), Ok(current)) if recorded == current
-        )
+        || (Path::new(recorded).is_absolute()
+            && Path::new(current).is_absolute()
+            && matches!(
+                (std::fs::canonicalize(recorded), std::fs::canonicalize(current)),
+                (Ok(recorded), Ok(current)) if recorded == current
+            ))
 }
 
 pub fn resolve_store_paths(
