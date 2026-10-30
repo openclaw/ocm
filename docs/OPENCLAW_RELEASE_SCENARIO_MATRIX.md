@@ -69,7 +69,7 @@ Use OCM this way during validation:
   OpenClaw can report service health but does not mutate global/user-level
   service registrations from `doctor --fix`.
 - Inspect env services with `"$OCM_BIN" service status <env>`,
-  `"$OCM_BIN" service list`, and `"$OCM_BIN" logs <env>`.
+  `"$OCM_BIN" service status`, and `"$OCM_BIN" logs <env>`.
 - Simulate upgrades with
   `"$OCM_BIN" upgrade simulate <env> --to <target>`.
 - Use `"$OCM_BIN" help start`, `"$OCM_BIN" help service`,
