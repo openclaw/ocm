@@ -163,23 +163,47 @@ pub(in crate::store) fn validate_copied_git_config(
         let path = path.strip_suffix(b"\r").unwrap_or(path);
         let actual = PathBuf::from(git_path_from_bytes(path)?);
         if !output.status.success() || owned(&root, &actual).is_err() {
-            // A bare repository has no worktree to validate. Its administrative
-            // directories and selected config already passed ownership checks.
-            let bare = git_command()
-                .arg("-C")
-                .arg(git_path(&context.checkout))
-                .args(["rev-parse", "--is-bare-repository"])
-                .output()
-                .map_err(|e| e.to_string())?;
-            if bare.status.success() && bare.stdout.trim_ascii() == b"true" {
+            // A Git directory without a worktree has no checkout to validate.
+            // Its administrative directories and selected config already
+            // passed ownership checks.
+            if selects_no_worktree(context)? {
                 continue;
             }
-            return Err(
-                "copied Git configuration does not select a destination-owned checkout".into(),
-            );
+            return Err(format!(
+                "copied Git configuration does not select a destination-owned checkout: {}",
+                display_path(&context.checkout)
+            ));
         }
     }
     Ok(())
+}
+
+fn selects_no_worktree(context: &CopiedGitConfigContext) -> Result<bool, String> {
+    let bare = git_command()
+        .arg("-C")
+        .arg(git_path(&context.checkout))
+        .args(["rev-parse", "--is-bare-repository"])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !bare.status.success() {
+        return Ok(false);
+    }
+    if bare.stdout.trim_ascii() == b"true" {
+        return Ok(true);
+    }
+    // A --separate-git-dir directory is non-bare storage that a checkout
+    // selects through its gitfile; a copied checkout is validated as its own
+    // context. Without core.worktree, the directory itself selects no checkout.
+    if context.checkout != context.private_dir {
+        return Ok(false);
+    }
+    let worktree = git_command()
+        .arg("-C")
+        .arg(git_path(&context.checkout))
+        .args(["config", "--get", "core.worktree"])
+        .output()
+        .map_err(|e| e.to_string())?;
+    Ok(worktree.status.code() == Some(1))
 }
 
 /// Structural roots must be relocated before Git can safely resolve their

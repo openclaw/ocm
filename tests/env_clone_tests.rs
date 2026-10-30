@@ -3405,6 +3405,150 @@ fn env_clone_copied_git_config_shared_repositories_refuse_uncopied_donors() {
     }
 }
 
+fn copied_config_route(
+    root: &TestDir,
+    env: &std::collections::BTreeMap<String, String>,
+    route: &str,
+    home: &Path,
+) -> std::process::Output {
+    match route {
+        "clone" => run_ocm(root.path(), env, &["env", "clone", "source", "target"]),
+        "migrate" => run_ocm(
+            root.path(),
+            env,
+            &["migrate", "target", home.to_str().unwrap()],
+        ),
+        "adopt" => run_ocm(
+            root.path(),
+            env,
+            &[
+                "adopt",
+                "import",
+                "--name",
+                "target",
+                home.to_str().unwrap(),
+            ],
+        ),
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn env_clone_copied_git_config_separate_git_directories_use_destination_storage() {
+    for route in ["clone", "migrate", "adopt"] {
+        let root = TestDir::new("copy-separate-git-dir");
+        let (env, source, _) = copied_config_fixture(&root);
+        let workspace = source.join(".openclaw/workspace");
+        let layouts = [("beside", "beside-git"), ("inside", "inside/.git-data")];
+        for (checkout, git_dir) in layouts {
+            let checkout = workspace.join(checkout);
+            fs::create_dir(&checkout).unwrap();
+            copied_config_git(
+                &checkout,
+                &env,
+                &[
+                    "init",
+                    "-q",
+                    "--separate-git-dir",
+                    &copied_config_path(&workspace.join(git_dir)),
+                ],
+            );
+            write_text(&checkout.join("file"), "authored content\n");
+            copied_config_git(&checkout, &env, &["add", "file"]);
+            copied_config_git(
+                &checkout,
+                &env,
+                &[
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-qm",
+                    "fixture",
+                ],
+            );
+        }
+        let statuses = layouts.map(|(checkout, _)| {
+            copied_config_git(&workspace.join(checkout), &env, &["status", "--porcelain"])
+        });
+        let before = file_bytes(&source);
+        let output = copied_config_route(&root, &env, route, &source.join(".openclaw"));
+        assert!(output.status.success(), "{route}: {}", stderr(&output));
+        assert_eq!(file_bytes(&source), before, "{route} changed source bytes");
+        fs::rename(&source, source.with_extension("offline")).unwrap();
+        let target = source.parent().unwrap().join("target/.openclaw/workspace");
+        for ((checkout, git_dir), status) in layouts.into_iter().zip(statuses) {
+            let checkout = target.join(checkout);
+            assert_eq!(
+                fs::canonicalize(copied_config_git(
+                    &checkout,
+                    &env,
+                    &["rev-parse", "--absolute-git-dir"]
+                ))
+                .unwrap(),
+                fs::canonicalize(target.join(git_dir)).unwrap(),
+                "{route}: {} selects other Git storage",
+                checkout.display()
+            );
+            assert_eq!(
+                copied_config_git(&checkout, &env, &["status", "--porcelain"]),
+                status,
+                "{route}: {}",
+                checkout.display()
+            );
+            assert_eq!(
+                copied_config_git(&checkout, &env, &["show", "HEAD:file"]),
+                "authored content"
+            );
+        }
+    }
+}
+
+#[test]
+fn env_clone_copied_git_config_refusal_names_the_unselected_checkout() {
+    for route in ["clone", "migrate"] {
+        let root = TestDir::new("copy-separate-git-dir-external-worktree");
+        let (env, source, _) = copied_config_fixture(&root);
+        let workspace = source.join(".openclaw/workspace");
+        let checkout = workspace.join("project");
+        fs::create_dir(&checkout).unwrap();
+        let git_dir = workspace.join("project-git");
+        copied_config_git(
+            &checkout,
+            &env,
+            &[
+                "init",
+                "-q",
+                "--separate-git-dir",
+                &copied_config_path(&git_dir),
+            ],
+        );
+        let outside = root.child("outside worktree");
+        fs::create_dir(&outside).unwrap();
+        copied_config_git(
+            &git_dir,
+            &env,
+            &["config", "core.worktree", &copied_config_path(&outside)],
+        );
+        let output = copied_config_route(&root, &env, route, &source.join(".openclaw"));
+        assert!(
+            !output.status.success(),
+            "{route} accepted an external worktree"
+        );
+        let error = stderr(&output);
+        assert!(
+            error.contains(
+                "copied Git configuration does not select a destination-owned checkout: "
+            ) && error.contains("project"),
+            "{route}: {error}"
+        );
+        assert!(!source.parent().unwrap().join("target").exists());
+    }
+}
+
 #[test]
 fn env_clone_copied_git_config_native_worktrees_stage_independently_without_a_registry() {
     for route in ["clone", "migrate", "adopt"] {
