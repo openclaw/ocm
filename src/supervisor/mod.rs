@@ -3481,8 +3481,16 @@ fn restart_delay_ms(restart_count: usize) -> u64 {
 }
 
 /// The backoff count for restarting an exited child with an unchanged spec.
+/// An accepted OpenClaw restart handoff is a requested restart, such as an
+/// ordinary `ocm service restart`, so it does not add to the backoff.
 fn restart_count_after_exit(exited_child: &ExitedSupervisorChild) -> usize {
-    restart_count_since_stable_run(exited_child.restart_count, exited_child.ran_for) + 1
+    let restart_count =
+        restart_count_since_stable_run(exited_child.restart_count, exited_child.ran_for);
+    if exited_child.restart_handoff == RestartHandoffConsumeResult::Accepted {
+        restart_count
+    } else {
+        restart_count + 1
+    }
 }
 
 /// Restarts that count toward a child's backoff after it ran for `ran_for`.
@@ -4978,6 +4986,25 @@ mod tests {
         }
 
         assert_eq!(delays, [1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000]);
+    }
+
+    #[test]
+    fn accepted_restart_handoff_does_not_add_to_backoff() {
+        let quick = Duration::from_millis(SUPERVISOR_STABLE_RUN_MS - 1);
+        let stable = Duration::from_millis(SUPERVISOR_STABLE_RUN_MS);
+        for (restart_count, ran_for, expected_restart_count) in
+            [(0, quick, 0), (3, quick, 3), (3, stable, 0)]
+        {
+            let exited = exited_child_with_handoff_result(
+                Some(0),
+                restart_count,
+                0,
+                RestartHandoffConsumeResult::Accepted,
+                ran_for,
+            );
+
+            assert_eq!(restart_count_after_exit(&exited), expected_restart_count);
+        }
     }
 
     #[cfg(unix)]
