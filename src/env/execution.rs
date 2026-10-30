@@ -279,7 +279,7 @@ fn openclaw_command_path(args: &[String]) -> impl Iterator<Item = (&str, bool)> 
                     literal = true;
                     continue;
                 }
-                if matches!(arg, "--profile" | "--log-level" | "--container") {
+                if OPENCLAW_ROOT_OPTIONS_WITH_VALUE.contains(&arg) {
                     // OpenClaw requires a value here and takes the next token as it is.
                     index = (index + 1).min(args.len());
                     continue;
@@ -290,6 +290,32 @@ fn openclaw_command_path(args: &[String]) -> impl Iterator<Item = (&str, bool)> 
             }
             found = true;
             return Some((arg, literal));
+        }
+        None
+    })
+}
+
+const OPENCLAW_ROOT_OPTIONS_WITH_VALUE: [&str; 3] = ["--profile", "--log-level", "--container"];
+
+/// Yields the options OpenClaw reads in forwarded arguments, such as `--help`:
+/// every flag before the first `--`, without the values of root options that
+/// take one.
+pub(crate) fn openclaw_options(args: &[String]) -> impl Iterator<Item = &str> {
+    let mut index = 0;
+    std::iter::from_fn(move || {
+        while let Some(arg) = args.get(index).map(String::as_str) {
+            index += 1;
+            if arg == "--" {
+                index = args.len();
+                return None;
+            }
+            if OPENCLAW_ROOT_OPTIONS_WITH_VALUE.contains(&arg) {
+                index = (index + 1).min(args.len());
+                return Some(arg);
+            }
+            if arg.starts_with('-') {
+                return Some(arg);
+            }
         }
         None
     })

@@ -17,7 +17,7 @@ use crate::env::{
     CloneEnvironmentOptions, CreateEnvSnapshotOptions, CreateEnvironmentOptions, EnvMeta,
     EnvSnapshotSummary, EnvSummary, ExportEnvironmentOptions, ImportEnvironmentOptions,
     RemoveEnvSnapshotOptions, RestoreEnvSnapshotOptions, SourceWatchSession, SourceWatchState,
-    openclaw_command_words,
+    openclaw_command_words, openclaw_options,
 };
 use crate::infra::process::{run_direct, run_shell};
 use crate::infra::process_identity::ProcessIdentity;
@@ -107,15 +107,23 @@ struct EnvDestroyState<'a> {
     source_watch: Option<&'a SourceWatchSession>,
 }
 
+/// Tells whether forwarded `onboard` or `setup` arguments run onboarding, the
+/// only case where OCM clears the `skipBootstrap` its older releases wrote.
+/// Help, version and `--dry-run` queries, an explicit `--skip-bootstrap`, and
+/// `setup --baseline`, which OpenClaw runs without onboarding and which keeps a
+/// persisted `skipBootstrap`, leave the config alone.
 fn should_clear_skip_bootstrap_for_openclaw_args(args: &[String]) -> bool {
-    if !matches!(
-        openclaw_command_words(args).next(),
-        Some("onboard" | "setup")
-    ) {
+    let Some(command @ ("onboard" | "setup")) = openclaw_command_words(args).next() else {
+        return false;
+    };
+    if args.iter().any(|arg| arg == "--skip-bootstrap") {
         return false;
     }
 
-    !args.iter().any(|arg| arg == "--skip-bootstrap")
+    !openclaw_options(args).any(|option| {
+        matches!(option, "-h" | "--help" | "-V" | "--version" | "--dry-run")
+            || (command == "setup" && option == "--baseline")
+    })
 }
 
 impl Cli {
@@ -2279,7 +2287,33 @@ mod tests {
 
     use super::{
         active_invocation_processes, command_contains_process_path, process_path_is_within,
+        should_clear_skip_bootstrap_for_openclaw_args,
     };
+
+    #[test]
+    fn skip_bootstrap_clears_only_for_onboarding_runs() {
+        let cases: [(&[&str], bool); 11] = [
+            (&["onboard"], true),
+            (&["--log-level", "debug", "setup", "--workspace", "w"], true),
+            (&["--no-color", "onboard", "--flow", "quickstart"], true),
+            (&["onboard", "--skip-bootstrap"], false),
+            (&["onboard", "--help"], false),
+            (&["-h", "setup"], false),
+            (&["onboard", "--version"], false),
+            (&["setup", "-V"], false),
+            (&["setup", "--dry-run"], false),
+            (&["--no-color", "setup", "--baseline"], false),
+            (&["status", "--help"], false),
+        ];
+        for (forwarded, expected) in cases {
+            let forwarded: Vec<String> = forwarded.iter().map(|arg| arg.to_string()).collect();
+            assert_eq!(
+                should_clear_skip_bootstrap_for_openclaw_args(&forwarded),
+                expected,
+                "{forwarded:?}"
+            );
+        }
+    }
 
     #[test]
     fn process_path_containment_requires_component_boundaries() {
