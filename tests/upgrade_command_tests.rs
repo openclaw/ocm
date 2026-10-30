@@ -7736,6 +7736,99 @@ fn upgrade_rollback_restores_and_reverses_a_runtime_switch() {
     );
 }
 
+#[test]
+fn case_variant_runtime_targets_use_the_registered_runtime_name() {
+    let root = TestDir::new("upgrade-case-variant-runtime-target");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+
+    let old_runtime = root.child("old-openclaw");
+    let new_runtime = root.child("new-openclaw");
+    write_executable_script(&old_runtime, &recording_openclaw_script("2026.6.11"));
+    write_executable_script(&new_runtime, &recording_openclaw_script("2026.6.33"));
+
+    let env = ocm_env(&root);
+    for (name, runtime) in [("old", &old_runtime), ("new", &new_runtime)] {
+        let add = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "runtime",
+                "add",
+                name,
+                "--path",
+                &runtime.display().to_string(),
+            ],
+        );
+        assert!(add.status.success(), "{}", stderr(&add));
+    }
+    for name in ["demo", "same", "bound"] {
+        let create = run_ocm(&cwd, &env, &["env", "create", name, "--runtime", "old"]);
+        assert!(create.status.success(), "{}", stderr(&create));
+    }
+    let json = |args: &[&str]| -> Value {
+        let output = run_ocm(&cwd, &env, args);
+        assert!(output.status.success(), "{}", stderr(&output));
+        serde_json::from_str(&stdout(&output)).unwrap()
+    };
+    let latest_target = |name: &str| -> Value {
+        json(&["upgrade", "history", name, "--json"])[0]["target"]["name"].clone()
+    };
+
+    let upgrade = run_ocm(
+        &cwd,
+        &env,
+        &["upgrade", "demo", "--runtime", "NEW", "--json"],
+    );
+    if !upgrade.status.success() {
+        // Case-sensitive storage does not resolve a case variant at all.
+        assert!(
+            stderr(&upgrade).contains("runtime \"NEW\" does not exist"),
+            "{}",
+            stderr(&upgrade)
+        );
+        assert_eq!(
+            json(&["env", "show", "demo", "--json"])["defaultRuntime"],
+            "old"
+        );
+        return;
+    }
+    let upgrade: Value = serde_json::from_str(&stdout(&upgrade)).unwrap();
+    assert_eq!(upgrade["outcome"], "switched");
+    assert_eq!(upgrade["bindingName"], "new");
+    assert_eq!(latest_target("demo"), "new");
+    let dry_run = json(&["upgrade", "rollback", "demo", "--dry-run", "--json"]);
+    assert_eq!(dry_run["outcome"], "would-rollback");
+    let rollback = json(&["upgrade", "rollback", "demo", "--json"]);
+    assert_eq!(rollback["outcome"], "rolled-back");
+    assert_eq!(rollback["bindingName"], "old");
+    assert_eq!(
+        json(&["env", "show", "demo", "--json"])["defaultRuntime"],
+        "old"
+    );
+
+    // The bound runtime under another spelling is not a runtime switch.
+    let same_dry_run = json(&["upgrade", "same", "--runtime", "OLD", "--dry-run", "--json"]);
+    assert_eq!(same_dry_run["outcome"], "would-update");
+    assert_eq!(same_dry_run["bindingName"], "old");
+    let same = json(&["upgrade", "same", "--runtime", "OLD", "--json"]);
+    assert_eq!(same["outcome"], "up-to-date");
+    assert_eq!(same["bindingName"], "old");
+    assert_eq!(latest_target("same"), "old");
+
+    // A bound environment's set-runtime goes through the same upgrade.
+    let set = run_ocm(&cwd, &env, &["env", "set-runtime", "bound", "NEW"]);
+    assert!(set.status.success(), "{}", stderr(&set));
+    assert_eq!(
+        json(&["env", "show", "bound", "--json"])["defaultRuntime"],
+        "new"
+    );
+    assert_eq!(latest_target("bound"), "new");
+    let rollback = json(&["upgrade", "rollback", "bound", "--json"]);
+    assert_eq!(rollback["outcome"], "rolled-back");
+    assert_eq!(rollback["bindingName"], "old");
+}
+
 #[cfg(unix)]
 #[test]
 fn upgrade_refuses_a_live_watch_before_state_or_runtime_mutation() {
