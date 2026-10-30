@@ -9725,6 +9725,28 @@ fn start_moves_an_existing_env_to_another_runtime_through_the_transactional_upgr
         (Value::Null, Value::from("local"))
     );
 
+    // Leaving a launcher for a runtime replaces an existing binding too.
+    let from_launcher = start(
+        &[
+            "start",
+            "launcher-control",
+            "--runtime",
+            "new-local",
+            "--no-service",
+        ],
+        &env,
+    );
+    assert!(from_launcher.status.success(), "{}", stderr(&from_launcher));
+    assert_eq!(finalize_calls(), 1);
+    assert_eq!(
+        snapshot_labels("launcher-control"),
+        vec!["pre-upgrade".to_string()]
+    );
+    assert_eq!(
+        binding("launcher-control"),
+        (Value::from("new-local"), Value::Null)
+    );
+
     let switch = start(
         &[
             "start",

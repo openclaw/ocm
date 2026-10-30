@@ -869,8 +869,7 @@ starts the replacement plan. Equivalent recreation does not force a restart.
 Pending runtime and launcher starts also recheck the selected binding after
 capability probing. Clearing a binding with `ocm env set-runtime <env> none` or
 `ocm env set-launcher <env> none`, or replacing a launcher, prevents a pending
-probe from starting the removed binding. This also covers selecting a runtime
-with `ocm start <env> --runtime <runtime> --no-service`. This preserves service-running
+probe from starting the removed binding. This preserves service-running
 intent; normal reconciliation applies the updated plan and any remaining binding.
 Changing a binding does not instantly terminate an already-running Gateway.
 Launcher admission also checks the current command and working directory, so
