@@ -322,7 +322,7 @@ pub(crate) fn openclaw_options(args: &[String]) -> impl Iterator<Item = &str> {
 /// token is not a root option. As in OpenClaw's help detection, a root option
 /// takes the next token as its value only when that token does not look like a
 /// flag.
-pub(crate) fn openclaw_root_option_tokens(args: &[String], index: usize) -> usize {
+fn openclaw_root_option_tokens(args: &[String], index: usize) -> usize {
     let Some(arg) = args.get(index).map(String::as_str) else {
         return 0;
     };
@@ -339,10 +339,41 @@ pub(crate) fn openclaw_root_option_tokens(args: &[String], index: usize) -> usiz
     usize::from(matches!(arg, "--dev" | "--no-color") || with_inline_value)
 }
 
+/// Tells whether forwarded arguments run `onboard recommendations`, which
+/// reads or clears stored app recommendations rather than onboarding: `onboard`
+/// followed by its `recommendations` subcommand after only OpenClaw's root
+/// options and `--json`, the one `onboard` option that subcommand accepts.
+/// After any other option the word can be that option's value, as in
+/// `onboard --workspace recommendations`, which still onboards.
+pub(crate) fn names_onboard_recommendations(args: &[String]) -> bool {
+    let mut seen_onboard = false;
+    let mut index = 0;
+    while let Some(arg) = args.get(index).map(String::as_str) {
+        let root_tokens = openclaw_root_option_tokens(args, index);
+        if root_tokens > 0 {
+            index += root_tokens;
+            continue;
+        }
+        index += 1;
+        match arg {
+            "onboard" if !seen_onboard => seen_onboard = true,
+            "recommendations" if seen_onboard => return true,
+            "--json" if seen_onboard => {}
+            _ if !seen_onboard && arg.starts_with('-') => {}
+            _ => return false,
+        }
+    }
+    false
+}
+
 fn normalize_openclaw_args_for_env(args: &[String]) -> Result<Vec<String>, String> {
     let Some(("onboard", after_terminator)) = openclaw_command_path(args).next() else {
         return Ok(args.to_vec());
     };
+
+    if names_onboard_recommendations(args) {
+        return Ok(args.to_vec());
+    }
 
     if args.iter().any(|arg| arg == "--install-daemon") {
         return Err(
@@ -872,5 +903,58 @@ mod tests {
             normalize_openclaw_args_for_env(&args(&["--log-level", "debug", "status"])).unwrap(),
             args(&["--log-level", "debug", "status"])
         );
+    }
+
+    #[test]
+    fn onboard_recommendations_are_forwarded_without_daemon_guard() {
+        let unchanged: [&[&str]; 11] = [
+            &["onboard", "recommendations"],
+            &["onboard", "recommendations", "--json"],
+            &["onboard", "--json", "recommendations"],
+            &[
+                "onboard",
+                "recommendations",
+                "--agent",
+                "main",
+                "acknowledge",
+            ],
+            &["onboard", "recommendations", "refresh"],
+            &["--log-level", "debug", "onboard", "recommendations"],
+            &[
+                "onboard",
+                "--no-color",
+                "--profile",
+                "work",
+                "recommendations",
+            ],
+            &["onboard", "--log-level=debug", "--json", "recommendations"],
+            &["--profile", "onboard", "onboard", "recommendations"],
+            &["--", "onboard", "recommendations"],
+            &["--", "onboard", "--json", "recommendations"],
+        ];
+        for forwarded in unchanged {
+            assert_eq!(
+                normalize_openclaw_args_for_env(&args(forwarded)).unwrap(),
+                args(forwarded),
+                "{forwarded:?}"
+            );
+        }
+
+        let onboarding: [&[&str]; 5] = [
+            &["onboard", "--workspace", "recommendations"],
+            &["onboard", "--accept-risk", "recommendations"],
+            &["onboard", "--", "recommendations"],
+            &["onboard", "status", "recommendations"],
+            &["--log-level", "recommendations", "onboard"],
+        ];
+        for forwarded in onboarding {
+            let mut expected = args(forwarded);
+            expected.push("--no-install-daemon".to_string());
+            assert_eq!(
+                normalize_openclaw_args_for_env(&args(forwarded)).unwrap(),
+                expected,
+                "{forwarded:?}"
+            );
+        }
     }
 }
