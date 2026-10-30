@@ -595,6 +595,7 @@ fn append_env_root(
                     &source.root.join(relative_path),
                     &source.root,
                     &captured_target,
+                    options,
                 )?
             } else {
                 None
@@ -1215,6 +1216,7 @@ fn owned_archive_link_target(
     path: &Path,
     source_root: &Path,
     captured_target: &Path,
+    options: &EnvArchiveOptions,
 ) -> Result<Option<(PathBuf, PathBuf)>, EnvArchiveWriteError> {
     let target_path = if captured_target.is_absolute() {
         captured_target.to_path_buf()
@@ -1234,22 +1236,97 @@ fn owned_archive_link_target(
         .unwrap()
         .strip_prefix(source_root)
         .map_err(|error| EnvArchiveWriteError::Fatal(error.to_string()))?;
+    // Keep naming the in-root links the target names, so an imported link
+    // still follows them. Fall back to the resolved target otherwise.
+    let named = named_owned_link_target(parent, &root, captured_target, options)
+        .unwrap_or_else(|| target.to_path_buf());
     let common = parent
         .components()
-        .zip(target.components())
+        .zip(named.components())
         .take_while(|(left, right)| left == right)
         .count();
     let mut relative = PathBuf::new();
     for _ in parent.components().skip(common) {
         relative.push("..");
     }
-    for part in target.components().skip(common) {
+    for part in named.components().skip(common) {
         relative.push(part);
     }
     if relative.as_os_str().is_empty() {
         relative.push(".");
     }
     Ok(Some((relative, target.to_path_buf())))
+}
+
+// Returns the root-relative path a link target names, without resolving the
+// links along it, when every step of that path stays inside the root and is
+// archived. `parent` is the link's root-relative parent, a real directory.
+fn named_owned_link_target(
+    parent: &Path,
+    root: &Path,
+    captured_target: &Path,
+    options: &EnvArchiveOptions,
+) -> Option<PathBuf> {
+    use std::path::Component;
+    let mut components = captured_target.components();
+    let mut named = Vec::new();
+    if captured_target.is_absolute() {
+        // Skip the leading part that names the root, possibly through an alias.
+        let mut prefix = PathBuf::new();
+        loop {
+            let component = components.next()?;
+            prefix.push(component);
+            if matches!(component, Component::Normal(_)) && fs::canonicalize(&prefix).ok()? == root
+            {
+                break;
+            }
+        }
+    } else {
+        named.extend(parent.components());
+        // Leading parent steps only climb the link's real ancestors.
+        let mut ascending = true;
+        for component in components.by_ref() {
+            match component {
+                Component::CurDir => {}
+                Component::ParentDir if ascending => {
+                    named.pop()?;
+                }
+                Component::Normal(name) => {
+                    ascending = false;
+                    named.push(Component::Normal(name));
+                }
+                _ => return None,
+            }
+        }
+    }
+    for component in components {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(name) => named.push(Component::Normal(name)),
+            _ => return None,
+        }
+    }
+    let named: PathBuf = named.iter().collect();
+    let common = parent
+        .components()
+        .zip(named.components())
+        .take_while(|(left, right)| left == right)
+        .count();
+    // The shared ancestors are the link's own real directories. Each later
+    // step may be a link and must resolve inside the root and be archived.
+    let mut step = named.components().take(common).collect::<PathBuf>();
+    for component in named.components().skip(common) {
+        step.push(component);
+        let metadata = fs::symlink_metadata(root.join(&step)).ok()?;
+        if options.should_skip(&step, env_archive_entry_kind(&metadata)) {
+            return None;
+        }
+        fs::canonicalize(root.join(&step))
+            .ok()?
+            .strip_prefix(root)
+            .ok()?;
+    }
+    Some(named)
 }
 
 fn classify_sqlite_children(
@@ -1920,6 +1997,84 @@ mod tests {
                     .contains("external-directory")
             );
         }
+    }
+
+    #[cfg(unix)]
+    fn exclude_skipped_link(path: &Path, _kind: EnvArchiveEntryKind) -> bool {
+        path == Path::new("skipped")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_links_keep_naming_owned_links_only_along_archived_in_root_paths() {
+        use std::os::unix::fs::symlink;
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("home");
+        let outside = fixture.path().join("outside");
+        fs::create_dir_all(source.join("releases/v1")).unwrap();
+        fs::create_dir_all(source.join("releases/v2")).unwrap();
+        fs::create_dir(&outside).unwrap();
+        symlink(&source, fixture.path().join("alias")).unwrap();
+        symlink(&source, outside.join("back")).unwrap();
+        symlink("releases/v1", source.join("current")).unwrap();
+        symlink("releases/v1", source.join("skipped")).unwrap();
+        symlink(&outside, source.join("external")).unwrap();
+        let cases = [
+            // Named in-root links stay named, through a root alias too.
+            (
+                "alias-latest",
+                fixture.path().join("alias/current"),
+                "current",
+            ),
+            ("releases/up", PathBuf::from("../current"), "../current"),
+            ("self", PathBuf::from("."), "."),
+            // A path that leaves the root, climbs through a link or names
+            // an unarchived link keeps today's resolved target.
+            ("escape", PathBuf::from("../home/current"), "releases/v1"),
+            (
+                "round-trip",
+                PathBuf::from("external/back/current"),
+                "releases/v1",
+            ),
+            ("climb", PathBuf::from("current/../v2"), "releases/v2"),
+            ("via-skipped", PathBuf::from("skipped"), "releases/v1"),
+        ];
+        for (link, target, _) in &cases {
+            symlink(target, source.join(link)).unwrap();
+        }
+        let output = fixture.path().join("archive.tar");
+        write_env_archive_with_options(
+            &serde_json::json!({}),
+            &source,
+            &output,
+            EnvArchiveOptions {
+                sqlite_content_roots: BTreeSet::from([PathBuf::new()]),
+                should_exclude_path: exclude_skipped_link,
+                relocate_internal_symlinks: true,
+                private_output: true,
+                ..EnvArchiveOptions::default()
+            },
+        )
+        .unwrap();
+        let mut archived = std::collections::BTreeMap::new();
+        let mut archive = tar::Archive::new(fs::File::open(output).unwrap());
+        for entry in archive.entries().unwrap() {
+            let entry = entry.unwrap();
+            if entry.header().entry_type().is_symlink() {
+                archived.insert(
+                    entry.path().unwrap().into_owned(),
+                    entry.link_name().unwrap().unwrap().into_owned(),
+                );
+            }
+        }
+        for (link, _, expected) in cases {
+            assert_eq!(
+                archived[&Path::new("root").join(link)],
+                Path::new(expected),
+                "{link}"
+            );
+        }
+        assert!(!archived.contains_key(Path::new("root/skipped")));
     }
 
     #[cfg(unix)]
