@@ -886,7 +886,7 @@ fn preflight_migrated_launcher(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<Option<MigratedLauncherSpec>, String> {
-    let Some(command_path) = resolve_executable_on_path("openclaw", env) else {
+    let Some(command_path) = resolve_executable_on_path("openclaw", env, cwd) else {
         return Ok(None);
     };
     let command = migrated_launcher_command(&command_path);
@@ -965,17 +965,37 @@ fn may_brace_expand(path: &str) -> bool {
     }
 }
 
+/// The launcher runs from other directories than this one, so a relative
+/// `PATH` entry is resolved against `cwd` here, as the lookup sees it now.
+/// Joining drops `.` components but keeps `..`, which the lookup resolves
+/// through symlinks. Absolute entries keep their spelling.
+fn path_entry_dir(dir: PathBuf, cwd: &Path) -> PathBuf {
+    if dir.is_absolute() {
+        dir
+    } else {
+        cwd.join(dir).components().collect()
+    }
+}
+
 #[cfg(not(windows))]
-fn resolve_executable_on_path(command: &str, env: &BTreeMap<String, String>) -> Option<String> {
+fn resolve_executable_on_path(
+    command: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Option<String> {
     let path_value = env.get("PATH")?;
     std::env::split_paths(path_value)
-        .map(|dir| dir.join(command))
+        .map(|dir| path_entry_dir(dir, cwd).join(command))
         .find(|candidate| is_executable_file(candidate))
         .map(|candidate| display_path(&candidate))
 }
 
 #[cfg(windows)]
-fn resolve_executable_on_path(command: &str, env: &BTreeMap<String, String>) -> Option<String> {
+fn resolve_executable_on_path(
+    command: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Option<String> {
     let path_value = env.get("PATH")?;
     let extensions = env
         .get("PATHEXT")
@@ -1001,7 +1021,7 @@ fn resolve_executable_on_path(command: &str, env: &BTreeMap<String, String>) -> 
                 .collect()
         });
 
-    for dir in std::env::split_paths(path_value) {
+    for dir in std::env::split_paths(path_value).map(|dir| path_entry_dir(dir, cwd)) {
         if let Some(extension) = Path::new(command)
             .extension()
             .and_then(|value| value.to_str())

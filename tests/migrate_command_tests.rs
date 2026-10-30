@@ -2157,6 +2157,87 @@ fn migrated_launchers_run_openclaw_from_paths_that_need_shell_quoting() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn migrated_launchers_run_openclaw_found_through_relative_path_entries() {
+    for (entry, location, import) in [
+        ("bin", "bin", "migrate"),
+        ("./node_modules/.bin", "node_modules/.bin", "migrate"),
+        (".", "", "adopt"),
+        ("", "", "migrate"),
+    ] {
+        let root = TestDir::new("migrate-relative-launcher");
+        let cwd = root.child("project");
+        let elsewhere = root.child("elsewhere");
+        let source_home = root.child("legacy-home/.openclaw");
+        fs::create_dir_all(source_home.join("workspace")).unwrap();
+        fs::write(source_home.join("openclaw.json"), "{}\n").unwrap();
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&elsewhere).unwrap();
+        let mut env = ocm_env(&root);
+        install_fake_systemd_tools(&root, &mut env);
+        let marker = root.child("openclaw-args.txt");
+        let openclaw = cwd.join(location).join("openclaw");
+        write_executable_script(
+            &openclaw,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n",
+                path_string(&marker)
+            ),
+        );
+        let path = format!("{entry}:{}", env["PATH"]);
+        env.insert("PATH".to_string(), path);
+        let case = format!("{import} through {entry:?}");
+
+        let source = source_home.to_string_lossy();
+        let args: Vec<&str> = if import == "migrate" {
+            vec!["migrate", "mira", source.as_ref(), "--json"]
+        } else {
+            vec![
+                "adopt",
+                "import",
+                "--name",
+                "mira",
+                source.as_ref(),
+                "--json",
+            ]
+        };
+        let imported = run_ocm(&cwd, &env, &args);
+        assert!(imported.status.success(), "{case}: {}", stderr(&imported));
+        let shown = run_ocm(&cwd, &env, &["launcher", "show", "mira.migrated", "--json"]);
+        assert!(shown.status.success(), "{case}: {}", stderr(&shown));
+        let launcher: serde_json::Value = serde_json::from_str(&stdout(&shown)).unwrap();
+        let resolved = fs::canonicalize(&cwd)
+            .unwrap()
+            .join(location)
+            .join("openclaw");
+        assert_eq!(
+            launcher["command"],
+            serde_json::json!(path_string(&resolved)),
+            "{case}"
+        );
+
+        let ran = run_ocm(&elsewhere, &env, &["env", "run", "mira", "--", "status"]);
+        assert!(ran.status.success(), "{case}: {}", stderr(&ran));
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "status\n", "{case}");
+
+        let started = run_ocm(&elsewhere, &env, &["service", "start", "mira", "--json"]);
+        assert!(started.status.success(), "{case}: {}", stderr(&started));
+        let supervised = run_ocm(&elsewhere, &env, &["__daemon", "run", "--once", "--json"]);
+        assert!(
+            supervised.status.success(),
+            "{case}: {}",
+            stderr(&supervised)
+        );
+        let calls = fs::read_to_string(&marker).unwrap();
+        let gateway = calls.lines().nth(1).unwrap_or_default();
+        assert!(
+            gateway.starts_with("gateway run --port "),
+            "{case}: {calls}"
+        );
+    }
+}
+
 #[test]
 fn adopt_import_preserves_legacy_audit_history_bytes() {
     let root = TestDir::new("adopt-audit-history");
