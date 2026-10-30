@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::cli::env::EnvDestroySummary;
+use crate::cli::env::{BlockedPruneSummary, EnvDestroySummary};
 use crate::env::{
     EnvCleanupActionSummary, EnvCleanupBatchSummary, EnvCleanupSummary, EnvDoctorSummary,
     EnvExportSummary, EnvImportSummary, EnvSnapshotRemoveSummary, EnvSnapshotRestoreSummary,
@@ -296,10 +296,11 @@ fn env_destroyed_raw(summary: &EnvDestroySummary, command_example: &str) -> Vec<
 pub fn env_prune_preview(
     older_than_days: i64,
     candidates: &[EnvSummary],
+    blocked: &[BlockedPruneSummary],
     profile: RenderProfile,
 ) -> Vec<String> {
     if !profile.pretty {
-        return env_prune_preview_raw(older_than_days, candidates);
+        return env_prune_preview_raw(older_than_days, candidates, blocked);
     }
 
     let mut lines = vec![paint(
@@ -307,15 +308,14 @@ pub fn env_prune_preview(
         Tone::Strong,
         profile.color,
     )];
-    push_card(
-        &mut lines,
-        "Summary",
-        vec![
-            KeyValueRow::plain("Older than", format!("{older_than_days} day(s)")),
-            KeyValueRow::warning("Candidates", candidates.len().to_string()),
-        ],
-        profile.color,
-    );
+    let mut summary = vec![
+        KeyValueRow::plain("Older than", format!("{older_than_days} day(s)")),
+        KeyValueRow::warning("Candidates", candidates.len().to_string()),
+    ];
+    if !blocked.is_empty() {
+        summary.push(KeyValueRow::danger("Blocked", blocked.len().to_string()));
+    }
+    push_card(&mut lines, "Summary", summary, profile.color);
     if candidates.is_empty() {
         push_card(
             &mut lines,
@@ -323,20 +323,17 @@ pub fn env_prune_preview(
             vec![KeyValueRow::muted("Result", "nothing to remove")],
             profile.color,
         );
+        push_blocked_prune_table(&mut lines, blocked, profile);
         return lines;
     }
 
-    let rows = candidates
-        .iter()
-        .map(|summary| {
-            vec![
-                Cell::accent(summary.name.clone()),
-                Cell::muted(summary.root.clone()),
-            ]
-        })
-        .collect::<Vec<_>>();
     lines.push(String::new());
-    lines.extend(render_table(&["Env", "Root"], &rows, profile.color));
+    lines.extend(render_table(
+        &["Env", "Root"],
+        &env_root_rows(candidates),
+        profile.color,
+    ));
+    push_blocked_prune_table(&mut lines, blocked, profile);
     lines.push(String::new());
     lines.push(paint(
         "Re-run with --yes to remove them.",
@@ -346,7 +343,11 @@ pub fn env_prune_preview(
     lines
 }
 
-fn env_prune_preview_raw(older_than_days: i64, candidates: &[EnvSummary]) -> Vec<String> {
+fn env_prune_preview_raw(
+    older_than_days: i64,
+    candidates: &[EnvSummary],
+    blocked: &[BlockedPruneSummary],
+) -> Vec<String> {
     let mut lines = vec![format!(
         "Prune preview ({}d): {} candidate(s)",
         older_than_days,
@@ -355,50 +356,121 @@ fn env_prune_preview_raw(older_than_days: i64, candidates: &[EnvSummary]) -> Vec
     for summary in candidates {
         lines.push(format!("  {}  {}", summary.name, summary.root));
     }
+    push_blocked_prune_raw(&mut lines, blocked);
     lines.push("Re-run with --yes to remove them.".to_string());
     lines
 }
 
-pub fn env_pruned(removed: &[EnvSummary], profile: RenderProfile) -> Vec<String> {
+/// `stopped` marks an apply that ended on an error after these removals.
+pub fn env_pruned(
+    removed: &[EnvSummary],
+    blocked: &[BlockedPruneSummary],
+    stopped: bool,
+    profile: RenderProfile,
+) -> Vec<String> {
     if !profile.pretty {
-        return env_pruned_raw(removed);
+        return env_pruned_raw(removed, blocked, stopped);
     }
 
     let mut lines = vec![paint(
-        "Environment prune applied",
+        if stopped {
+            "Environment prune stopped"
+        } else {
+            "Environment prune applied"
+        },
         Tone::Strong,
         profile.color,
     )];
-    push_card(
-        &mut lines,
-        "Summary",
-        vec![KeyValueRow::plain("Removed", removed.len().to_string())],
-        profile.color,
-    );
-    if removed.is_empty() {
-        return lines;
+    let mut summary = vec![KeyValueRow::plain("Removed", removed.len().to_string())];
+    if !blocked.is_empty() {
+        summary.push(KeyValueRow::danger("Blocked", blocked.len().to_string()));
     }
+    if stopped {
+        summary.push(KeyValueRow::danger(
+            "Result",
+            "stopped on an error; remaining candidates were not removed",
+        ));
+    }
+    push_card(&mut lines, "Summary", summary, profile.color);
+    if !removed.is_empty() {
+        lines.push(String::new());
+        lines.extend(render_table(
+            &["Env", "Root"],
+            &env_root_rows(removed),
+            profile.color,
+        ));
+    }
+    push_blocked_prune_table(&mut lines, blocked, profile);
+    lines
+}
 
-    let rows = removed
-        .iter()
+fn env_pruned_raw(
+    removed: &[EnvSummary],
+    blocked: &[BlockedPruneSummary],
+    stopped: bool,
+) -> Vec<String> {
+    let mut lines = vec![if stopped {
+        format!(
+            "Prune stopped on an error after removing {} environment(s).",
+            removed.len()
+        )
+    } else {
+        format!("Pruned {} environment(s).", removed.len())
+    }];
+    for summary in removed {
+        lines.push(format!("  {}  {}", summary.name, summary.root));
+    }
+    push_blocked_prune_raw(&mut lines, blocked);
+    lines
+}
+
+fn env_root_rows(envs: &[EnvSummary]) -> Vec<Vec<Cell>> {
+    envs.iter()
         .map(|summary| {
             vec![
                 Cell::accent(summary.name.clone()),
                 Cell::muted(summary.root.clone()),
             ]
         })
-        .collect::<Vec<_>>();
-    lines.push(String::new());
-    lines.extend(render_table(&["Env", "Root"], &rows, profile.color));
-    lines
+        .collect()
 }
 
-fn env_pruned_raw(removed: &[EnvSummary]) -> Vec<String> {
-    let mut lines = vec![format!("Pruned {} environment(s).", removed.len())];
-    for summary in removed {
-        lines.push(format!("  {}  {}", summary.name, summary.root));
+fn push_blocked_prune_table(
+    lines: &mut Vec<String>,
+    blocked: &[BlockedPruneSummary],
+    profile: RenderProfile,
+) {
+    if blocked.is_empty() {
+        return;
     }
-    lines
+    let rows = blocked
+        .iter()
+        .map(|summary| {
+            vec![
+                Cell::accent(summary.env.name.clone()),
+                Cell::muted(summary.env.root.clone()),
+                Cell::danger(summary.reason.clone()),
+            ]
+        })
+        .collect::<Vec<_>>();
+    lines.push(String::new());
+    lines.push(paint("Blocked", Tone::Strong, profile.color));
+    lines.extend(render_table(
+        &["Env", "Root", "Reason"],
+        &rows,
+        profile.color,
+    ));
+}
+
+fn push_blocked_prune_raw(lines: &mut Vec<String>, blocked: &[BlockedPruneSummary]) {
+    if blocked.is_empty() {
+        return;
+    }
+    lines.push(format!("Blocked {} environment(s):", blocked.len()));
+    for summary in blocked {
+        lines.push(format!("  {}  {}", summary.env.name, summary.env.root));
+        lines.push(format!("    {}", summary.reason));
+    }
 }
 
 pub fn env_created(
@@ -1317,10 +1389,10 @@ mod tests {
 
     use super::{
         RenderProfile, env_cleanup, env_cleanup_batch, env_destroy_preview, env_destroyed,
-        env_doctor, env_list, env_resolved, env_show, env_snapshot_list_with_width,
-        env_snapshot_prune_preview, env_snapshot_show, env_status,
+        env_doctor, env_list, env_prune_preview, env_pruned, env_resolved, env_show,
+        env_snapshot_list_with_width, env_snapshot_prune_preview, env_snapshot_show, env_status,
     };
-    use crate::cli::env::{EnvDestroyStepSummary, EnvDestroySummary};
+    use crate::cli::env::{BlockedPruneSummary, EnvDestroyStepSummary, EnvDestroySummary};
     use crate::env::{
         EnvCleanupActionSummary, EnvCleanupBatchSummary, EnvCleanupSummary, EnvDoctorSummary,
         EnvSnapshotSummary, EnvStatusSummary, EnvSummary, ExecutionSummary,
@@ -1887,6 +1959,50 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("manual review required before destroying this env"))
         );
+    }
+
+    #[test]
+    fn env_prune_pretty_shows_blocked_candidates_and_stopped_apply() {
+        let summary = |name: &str| EnvSummary {
+            upgrade_independent_paths: Vec::new(),
+            name: name.to_string(),
+            root: format!("/tmp/{name}"),
+            openclaw_home: format!("/tmp/{name}/.openclaw"),
+            state_dir: format!("/tmp/{name}/.openclaw"),
+            config_path: format!("/tmp/{name}/.openclaw/openclaw.json"),
+            workspace_dir: format!("/tmp/{name}/workspace"),
+            gateway_port: None,
+            service_enabled: false,
+            service_running: false,
+            default_runtime: None,
+            default_launcher: None,
+            dev_repo_root: None,
+            dev_worktree_root: None,
+            dev_ui_port: None,
+            protected: false,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            last_used_at: None,
+        };
+        let blocked = [BlockedPruneSummary {
+            env: summary("donor"),
+            reason: "would affect registered dev source".to_string(),
+        }];
+        let has = |lines: &[String], text: &str| lines.iter().any(|line| line.contains(text));
+
+        let preview = env_prune_preview(14, &[], &blocked, RenderProfile::pretty(false));
+        assert!(has(&preview, "nothing to remove"));
+        assert!(has(&preview, "Reason"));
+        assert!(has(&preview, "would affect registered dev source"));
+
+        let stopped = env_pruned(
+            &[summary("plain")],
+            &blocked,
+            true,
+            RenderProfile::pretty(false),
+        );
+        assert_eq!(stopped[0], "Environment prune stopped");
+        assert!(has(&stopped, "remaining candidates were not removed"));
+        assert!(has(&stopped, "plain") && has(&stopped, "donor"));
     }
 
     #[test]

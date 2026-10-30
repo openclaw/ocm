@@ -313,7 +313,12 @@ fn env_prune_revalidates_candidates_after_waiting_for_operation_locks() {
                 .current_dir(cwd)
                 .env_clear()
                 .envs(&env)
-                .args(["env", "prune", "--older-than", "14", "--yes", "--json"])
+                .args(if case == "removed" {
+                    // One stopped case covers the text report.
+                    &["env", "prune", "--older-than", "14", "--yes", "--raw"][..]
+                } else {
+                    &["env", "prune", "--older-than", "14", "--yes", "--json"][..]
+                })
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -394,16 +399,34 @@ fn env_prune_revalidates_candidates_after_waiting_for_operation_locks() {
             sleep(Duration::from_millis(20));
         }
         let output = prune.0.take().unwrap().wait_with_output().unwrap();
-        if case == "protected" || case == "removed" {
-            assert!(!output.status.success(), "{case}: {}", stdout(&output));
-            let expected = if case == "protected" {
-                "is protected"
-            } else {
-                "does not exist"
-            };
+        if case == "protected" {
+            // The stop is reported with the removals that already happened.
+            assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+            let result: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+            assert_eq!(result["code"], "partial_apply");
             assert!(
-                stderr(&output).contains(expected),
-                "{case}: {}",
+                result["error"].as_str().unwrap().contains("is protected"),
+                "{result}"
+            );
+            let names: Vec<_> = result["removed"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["name"].as_str().unwrap())
+                .collect();
+            assert_eq!(names, ["a-progress", "b-blocker"]);
+            assert_eq!(result["count"], 2);
+        } else if case == "removed" {
+            assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+            let report = stdout(&output);
+            assert!(
+                report.starts_with("Prune stopped on an error after removing 2 environment(s).\n"),
+                "{report}"
+            );
+            assert!(report.contains("  a-progress  ") && report.contains("  b-blocker  "));
+            assert!(
+                stderr(&output).contains("does not exist"),
+                "{}",
                 stderr(&output)
             );
         } else {
@@ -436,6 +459,43 @@ fn env_prune_revalidates_candidates_after_waiting_for_operation_locks() {
             );
         }
     }
+}
+
+#[test]
+fn env_prune_reports_a_removal_whose_supervisor_sync_failed() {
+    let root = TestDir::new("env-prune-sync-failure");
+    let cwd = root.path();
+    let env = ocm_env(&root);
+    for name in ["a-first", "b-second"] {
+        let created = run_ocm(cwd, &env, &["env", "create", name]);
+        assert!(created.status.success(), "{}", stderr(&created));
+        let mut meta = get_environment(name, &env, cwd).unwrap();
+        meta.created_at -= time::Duration::days(30);
+        save_environment(meta, &env, cwd).unwrap();
+    }
+    let first = get_environment("a-first", &env, cwd).unwrap();
+    // A supervisor state that cannot be locked fails the sync that follows
+    // each removal, after the environment is already gone.
+    let supervisor = root.child("ocm-home").join("supervisor");
+    fs::create_dir_all(supervisor.join("state.lock")).unwrap();
+    fs::write(supervisor.join("state.json"), "{}").unwrap();
+
+    let output = run_ocm(cwd, &env, &["env", "prune", "--yes", "--json"]);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let result: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert_eq!(result["code"], "partial_apply");
+    assert!(
+        result["error"]
+            .as_str()
+            .unwrap()
+            .contains("supervisor state"),
+        "{result}"
+    );
+    assert_eq!(result["count"], 1);
+    assert_eq!(result["removed"][0]["name"], "a-first");
+    assert!(get_environment("a-first", &env, cwd).is_err());
+    assert!(!Path::new(&first.root).exists());
+    assert!(get_environment("b-second", &env, cwd).is_ok());
 }
 
 #[test]
@@ -1248,18 +1308,24 @@ fn env_destroy_preserves_nested_registered_dev_source_and_worker() {
     let registry_before = fs::read(&registry).unwrap();
     let direct = ocm::store::remove_environment("parent", true, &env, cwd).unwrap_err();
     assert!(direct.contains("registered dev source"), "{direct}");
-    for args in [
-        vec!["env", "remove", "parent", "--force"],
-        vec!["env", "prune", "--older-than", "14", "--yes"],
-    ] {
-        let refused = run_ocm(cwd, &env, &args);
-        assert!(!refused.status.success(), "{}", stdout(&refused));
-        assert!(
-            stderr(&refused).contains("registered dev source"),
-            "{}",
-            stderr(&refused)
-        );
-    }
+    let refused = run_ocm(cwd, &env, &["env", "remove", "parent", "--force"]);
+    assert!(!refused.status.success(), "{}", stdout(&refused));
+    assert!(
+        stderr(&refused).contains("registered dev source"),
+        "{}",
+        stderr(&refused)
+    );
+    // Prune reports the donor as blocked instead of attempting it.
+    let pruned = run_ocm(cwd, &env, &["env", "prune", "--older-than", "14", "--yes"]);
+    assert!(pruned.status.success(), "{}", stderr(&pruned));
+    assert!(
+        stdout(&pruned)
+            .starts_with("Pruned 0 environment(s).\nBlocked 1 environment(s):\n  parent  "),
+        "{}",
+        stdout(&pruned)
+    );
+    assert!(stdout(&pruned).contains("registered dev source for env child"));
+    assert_eq!(fs::read(&registry).unwrap(), registry_before);
     let mut worker = Command::new("python3")
         .current_dir(worktree)
         .args(["-c", "import time; time.sleep(60)"])

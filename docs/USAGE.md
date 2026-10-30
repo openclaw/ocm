@@ -1852,6 +1852,20 @@ set to run, such as those started with `ocm start`, because their Gateway is in
 use without any of those commands. Run `ocm service stop <env>` first to make one
 eligible again, or use `ocm env destroy` to remove it with its service.
 
+The preview lists, under blocked, each old environment that removal would refuse
+for a condition that already exists, with removal's reason: an active or unfinished
+source watch, or cleanup that would affect another environment's registered dev
+source or an active temporary dev source. `--yes` leaves those environments in
+place and still removes the other candidates. Run `ocm dev stop <env>` or remove
+the dependent dev environment, then prune again. JSON output lists them in
+`blocked`, each with the environment summary and `reason`; `count` covers only
+`candidates` or `removed`.
+
+If apply stops on an error after removing some environments, for example because
+an environment changed after the preview, it still prints the environments it
+removed and exits 1. JSON output adds `"code": "partial_apply"` and the `error`.
+Prune again after addressing the error; environments already removed are gone.
+
 The service output the supervisor captured for a removed environment,
 `$OCM_HOME/supervisor/logs/<env>.stdout.log` and `<env>.stderr.log`, stays in
 place until an environment with the same name is created, cloned or imported.
