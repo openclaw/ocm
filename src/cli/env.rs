@@ -17,7 +17,8 @@ use crate::env::{
     BlockedPruneCandidate, CloneEnvironmentOptions, CreateEnvSnapshotOptions,
     CreateEnvironmentOptions, EnvMeta, EnvSnapshotSummary, EnvSummary, ExportEnvironmentOptions,
     ImportEnvironmentOptions, RemoveEnvSnapshotOptions, RestoreEnvSnapshotOptions,
-    SourceWatchSession, SourceWatchState, openclaw_command_words,
+    SourceWatchSession, SourceWatchState, openclaw_command_words, openclaw_options,
+    openclaw_root_option_tokens,
 };
 use crate::infra::process::{run_direct, run_shell};
 use crate::infra::process_identity::ProcessIdentity;
@@ -128,15 +129,69 @@ struct EnvDestroyState<'a> {
     source_watch: Option<&'a SourceWatchSession>,
 }
 
+/// Tells whether forwarded `onboard` or `setup` arguments run onboarding, the
+/// only case where OCM clears the `skipBootstrap` its older releases wrote.
+/// These leave the config alone: help, version and `--dry-run` queries; an
+/// explicit `--skip-bootstrap`; `onboard recommendations`; `setup --baseline`,
+/// which keeps a persisted `skipBootstrap`; and a `setup` request to the
+/// system agent (`-m`/`--message` or `--yes` without onboarding options).
+/// A bare `setup` still clears: OpenClaw then chooses between onboarding and
+/// the system agent from the config and terminal, which the arguments do not
+/// show.
 fn should_clear_skip_bootstrap_for_openclaw_args(args: &[String]) -> bool {
-    if !matches!(
-        openclaw_command_words(args).next(),
-        Some("onboard" | "setup")
-    ) {
+    let Some(command @ ("onboard" | "setup")) = openclaw_command_words(args).next() else {
+        return false;
+    };
+    if (command == "onboard" && names_onboard_recommendations(args))
+        || args.iter().any(|arg| arg == "--skip-bootstrap")
+    {
         return false;
     }
 
-    !args.iter().any(|arg| arg == "--skip-bootstrap")
+    let mut system_agent_request = false;
+    let mut onboarding_option = false;
+    for option in openclaw_options(args) {
+        if matches!(option, "-h" | "--help" | "-V" | "--version" | "--dry-run")
+            || (command == "setup" && option == "--baseline")
+        {
+            return false;
+        }
+        if option.starts_with("-m")
+            || option == "--yes"
+            || option == "--message"
+            || option.starts_with("--message=")
+        {
+            system_agent_request = true;
+        } else if option != "--json" {
+            onboarding_option = true;
+        }
+    }
+    !(command == "setup" && system_agent_request && !onboarding_option)
+}
+
+/// Tells whether `onboard` is followed by its `recommendations` subcommand,
+/// after only OpenClaw's root options and `--json`, the one `onboard` option
+/// that subcommand accepts. After any other option the word can be that
+/// option's value, as in `onboard --workspace recommendations`.
+fn names_onboard_recommendations(args: &[String]) -> bool {
+    let mut seen_onboard = false;
+    let mut index = 0;
+    while let Some(arg) = args.get(index).map(String::as_str) {
+        let root_tokens = openclaw_root_option_tokens(args, index);
+        if root_tokens > 0 {
+            index += root_tokens;
+            continue;
+        }
+        index += 1;
+        match arg {
+            "onboard" if !seen_onboard => seen_onboard = true,
+            "recommendations" if seen_onboard => return true,
+            "--json" if seen_onboard => {}
+            _ if !seen_onboard && arg.starts_with('-') => {}
+            _ => return false,
+        }
+    }
+    false
 }
 
 impl Cli {
@@ -2322,7 +2377,65 @@ mod tests {
 
     use super::{
         active_invocation_processes, command_contains_process_path, process_path_is_within,
+        should_clear_skip_bootstrap_for_openclaw_args,
     };
+
+    #[test]
+    fn skip_bootstrap_clears_only_for_onboarding_runs() {
+        let cases: [(&[&str], bool); 28] = [
+            (&["onboard"], true),
+            (&["--log-level", "debug", "setup", "--workspace", "w"], true),
+            (&["--no-color", "onboard", "--flow", "quickstart"], true),
+            (&["onboard", "--skip-bootstrap"], false),
+            (&["onboard", "--help"], false),
+            (&["-h", "setup"], false),
+            (&["onboard", "--version"], false),
+            (&["setup", "-V"], false),
+            (&["setup", "--dry-run"], false),
+            (&["--no-color", "setup", "--baseline"], false),
+            (&["status", "--help"], false),
+            (&["--log-level", "--help", "onboard"], false),
+            (&["--profile", "work", "onboard"], true),
+            (&["onboard", "--", "--help"], true),
+            (&["onboard", "recommendations"], false),
+            (
+                &["--no-color", "onboard", "recommendations", "acknowledge"],
+                false,
+            ),
+            (&["setup", "-m", "status"], false),
+            (&["setup", "--message=status", "--yes", "--json"], false),
+            (&["--log-level", "debug", "setup", "--yes"], false),
+            (&["setup", "-m", "status", "--wizard"], true),
+            (&["setup", "--json"], true),
+            (&["setup", "-mstatus"], false),
+            (&["onboard", "--workspace", "recommendations"], true),
+            (&["onboard", "--json", "recommendations"], false),
+            (
+                &["--profile", "onboard", "onboard", "recommendations"],
+                false,
+            ),
+            (&["onboard", "recommendations", "--agent", "main"], false),
+            (&["onboard", "--no-color", "recommendations"], false),
+            (
+                &[
+                    "onboard",
+                    "--log-level",
+                    "debug",
+                    "--json",
+                    "recommendations",
+                ],
+                false,
+            ),
+        ];
+        for (forwarded, expected) in cases {
+            let forwarded: Vec<String> = forwarded.iter().map(|arg| arg.to_string()).collect();
+            assert_eq!(
+                should_clear_skip_bootstrap_for_openclaw_args(&forwarded),
+                expected,
+                "{forwarded:?}"
+            );
+        }
+    }
 
     #[test]
     fn process_path_containment_requires_component_boundaries() {

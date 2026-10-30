@@ -313,12 +313,13 @@ fn env_run_onboard_clears_legacy_skip_bootstrap_by_default() {
     let env_root = clean_path(&root.child("ocm-home/envs/demo"));
     let config_path = env_root.join(".openclaw/openclaw.json");
     let workspace = env_root.join(".openclaw/workspace");
-    let commands: [&[&str]; 5] = [
+    let commands: [&[&str]; 6] = [
         &["env", "run", "demo", "--", "onboard"],
         &["env", "run", "demo", "--", "--no-color", "onboard"],
         &["@demo", "--", "--log-level", "debug", "onboard"],
         &["@demo", "--", "--log-level=debug", "setup"],
         &["@demo", "--", "--log-level", "debug", "--", "setup"],
+        &["@demo", "--", "setup", "-m", "status", "--wizard"],
     ];
     for command in commands {
         write_text(
@@ -353,7 +354,7 @@ fn env_run_onboard_clears_legacy_skip_bootstrap_by_default() {
 }
 
 #[test]
-fn env_run_onboard_preserves_explicit_skip_bootstrap() {
+fn env_run_preserves_skip_bootstrap_without_onboarding() {
     let root = TestDir::new("behavior-env-run-onboard-skip-bootstrap");
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
@@ -372,10 +373,8 @@ fn env_run_onboard_preserves_explicit_skip_bootstrap() {
     let env_root = clean_path(&root.child("ocm-home/envs/demo"));
     let config_path = env_root.join(".openclaw/openclaw.json");
     let workspace = env_root.join(".openclaw/workspace");
-    write_text(
-        &config_path,
-        &format!(
-            r#"{{
+    let config = format!(
+        r#"{{
   "agents": {{
     "defaults": {{
       "workspace": "{}",
@@ -387,19 +386,37 @@ fn env_run_onboard_preserves_explicit_skip_bootstrap() {
   }}
 }}
 "#,
-            path_string(&workspace)
-        ),
+        path_string(&workspace)
     );
-
-    let run_output = run_ocm(
-        &cwd,
-        &env,
+    let commands: [&[&str]; 15] = [
         &["env", "run", "demo", "--", "onboard", "--skip-bootstrap"],
-    );
-    assert!(run_output.status.success(), "{}", stderr(&run_output));
+        &["@demo", "--", "setup", "--baseline", "--skip-bootstrap"],
+        &["@demo", "--", "onboard", "--help"],
+        &["@demo", "--", "onboard", "-h"],
+        &["@demo", "--", "--help", "onboard"],
+        &["@demo", "--", "onboard", "--version"],
+        &["@demo", "--", "setup", "-V"],
+        &["@demo", "--", "setup", "--dry-run"],
+        &["@demo", "--", "setup", "--baseline"],
+        &["@demo", "--", "--log-level", "debug", "setup", "--baseline"],
+        &["@demo", "--", "--log-level", "--help", "onboard"],
+        &["@demo", "--", "onboard", "recommendations", "--json"],
+        &["@demo", "--", "onboard", "--json", "recommendations"],
+        &["@demo", "--", "setup", "-m", "status"],
+        &["@demo", "--", "--log-level", "debug", "setup", "--yes"],
+    ];
+    for command in commands {
+        write_text(&config_path, &config);
 
-    let config: Value = serde_json::from_str(&fs::read_to_string(config_path).unwrap()).unwrap();
-    assert_eq!(config["agents"]["defaults"]["skipBootstrap"], true);
+        let run_output = run_ocm(&cwd, &env, command);
+        assert!(run_output.status.success(), "{}", stderr(&run_output));
+
+        assert_eq!(
+            fs::read_to_string(&config_path).unwrap(),
+            config,
+            "{command:?}"
+        );
+    }
 }
 
 #[test]

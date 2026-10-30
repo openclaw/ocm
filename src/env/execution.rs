@@ -279,7 +279,7 @@ fn openclaw_command_path(args: &[String]) -> impl Iterator<Item = (&str, bool)> 
                     literal = true;
                     continue;
                 }
-                if matches!(arg, "--profile" | "--log-level" | "--container") {
+                if OPENCLAW_ROOT_OPTIONS_WITH_VALUE.contains(&arg) {
                     // OpenClaw requires a value here and takes the next token as it is.
                     index = (index + 1).min(args.len());
                     continue;
@@ -293,6 +293,50 @@ fn openclaw_command_path(args: &[String]) -> impl Iterator<Item = (&str, bool)> 
         }
         None
     })
+}
+
+const OPENCLAW_ROOT_OPTIONS_WITH_VALUE: [&str; 3] = ["--profile", "--log-level", "--container"];
+
+/// Yields the flags before the first `--` in forwarded arguments, such as
+/// `--help` or `--yes`, leaving out OpenClaw's root options (`--no-color`,
+/// `--log-level debug`) and their values.
+pub(crate) fn openclaw_options(args: &[String]) -> impl Iterator<Item = &str> {
+    let mut index = 0;
+    std::iter::from_fn(move || {
+        while let Some(arg) = args.get(index).map(String::as_str) {
+            if arg == "--" {
+                index = args.len();
+                return None;
+            }
+            let root_tokens = openclaw_root_option_tokens(args, index);
+            index += root_tokens.max(1);
+            if root_tokens == 0 && arg.starts_with('-') {
+                return Some(arg);
+            }
+        }
+        None
+    })
+}
+
+/// Counts the tokens an OpenClaw root option at `index` takes, or 0 when the
+/// token is not a root option. As in OpenClaw's help detection, a root option
+/// takes the next token as its value only when that token does not look like a
+/// flag.
+pub(crate) fn openclaw_root_option_tokens(args: &[String], index: usize) -> usize {
+    let Some(arg) = args.get(index).map(String::as_str) else {
+        return 0;
+    };
+    if OPENCLAW_ROOT_OPTIONS_WITH_VALUE.contains(&arg) {
+        let has_value = args
+            .get(index + 1)
+            .is_some_and(|value| !value.starts_with('-'));
+        return 1 + usize::from(has_value);
+    }
+    let with_inline_value = OPENCLAW_ROOT_OPTIONS_WITH_VALUE.iter().any(|option| {
+        arg.strip_prefix(option)
+            .is_some_and(|rest| rest.starts_with('='))
+    });
+    usize::from(matches!(arg, "--dev" | "--no-color") || with_inline_value)
 }
 
 fn normalize_openclaw_args_for_env(args: &[String]) -> Result<Vec<String>, String> {
