@@ -788,21 +788,7 @@ impl Cli {
             for env in envs {
                 match self.upgrade_env(&env.name, &target, options) {
                     Ok(summary) => results.push(summary),
-                    Err(error) => results.push(UpgradeEnvSummary {
-                        source: None,
-                        env_name: env.name,
-                        previous_binding_kind: "unknown".to_string(),
-                        previous_binding_name: "—".to_string(),
-                        binding_kind: "unknown".to_string(),
-                        binding_name: "—".to_string(),
-                        outcome: "failed".to_string(),
-                        runtime_release_version: None,
-                        runtime_release_channel: None,
-                        service_action: None,
-                        snapshot_id: None,
-                        rollback: None,
-                        note: Some(error),
-                    }),
+                    Err(error) => results.push(failed_summary(&env, error)),
                 }
             }
 
@@ -6927,6 +6913,26 @@ fn unbound_summary(env_name: &str, env: &crate::env::EnvMeta) -> UpgradeEnvSumma
             "this env has no runtime or launcher binding; use start or env set-runtime/set-launcher to include it"
                 .to_string(),
         ),
+    }
+}
+
+fn failed_summary(env: &crate::env::EnvMeta, error: String) -> UpgradeEnvSummary {
+    // An error from `upgrade_env` is raised before the binding is published, so the entry still has the binding it started from.
+    let (binding_kind, binding_name) = source_binding(env);
+    UpgradeEnvSummary {
+        source: None,
+        env_name: env.name.clone(),
+        previous_binding_kind: binding_kind.clone(),
+        previous_binding_name: binding_name.clone(),
+        binding_kind,
+        binding_name,
+        outcome: "failed".to_string(),
+        runtime_release_version: None,
+        runtime_release_channel: None,
+        service_action: None,
+        snapshot_id: None,
+        rollback: None,
+        note: Some(error),
     }
 }
 
