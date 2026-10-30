@@ -678,6 +678,28 @@ impl Cli {
         )
     }
 
+    /// Replaces an env's existing runtime or launcher binding through the
+    /// guarded transition and reports a transition that did not complete as an
+    /// error.
+    pub(super) fn replace_env_binding_with_runtime(
+        &self,
+        name: &str,
+        version: Option<String>,
+        channel: Option<String>,
+        runtime: Option<String>,
+    ) -> Result<(), String> {
+        let summary = self.upgrade_env_to_runtime_target(name, version, channel, runtime)?;
+        if matches!(
+            summary.outcome.as_str(),
+            "failed" | "rolled-back" | "rollback-failed"
+        ) {
+            return Err(summary.note.unwrap_or_else(|| {
+                format!("runtime transition failed with outcome {}", summary.outcome)
+            }));
+        }
+        Ok(())
+    }
+
     pub(super) fn handle_upgrade_command(&self, args: Vec<String>) -> Result<i32, String> {
         if args.first().map(String::as_str) == Some("job") {
             return self.handle_upgrade_job(args[1..].to_vec());

@@ -79,6 +79,12 @@ environment stopped and preserves an existing environment's service state. Retry
 with `ocm start <name> --onboard`; use `--no-service` to finish onboarding without
 starting a background service. Gateway readiness is still checked when OCM starts
 the service after onboarding.
+When `start` moves an existing environment from its runtime or launcher to a
+different runtime with `--runtime`, `--version` or `--channel`, it uses the same
+transition as `ocm env set-runtime`: OCM refuses a downgrade, captures a
+pre-upgrade snapshot, runs OpenClaw's update finalization before the service
+restarts, and restores the snapshot and previous binding if the transition
+fails. Starting on the current runtime and launcher changes rebind directly.
 Repeating `ocm start luna --command ... --cwd .` from the same directory reuses the local
 launcher, as does the equivalent absolute directory. A different command or
 directory is refused without changing the existing launcher. When `start` is
