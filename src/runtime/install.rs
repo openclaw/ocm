@@ -618,15 +618,16 @@ impl<'a> RuntimeService<'a> {
                     .into_iter()
                     .next()
                     .ok_or_else(|| "runtime release was not found".to_string())?;
-                // A manifest description of the current release was recorded
-                // from the manifest, not supplied by the user.
+                // The manifest's description of the current release was copied
+                // from the manifest, not supplied by the user. When the manifest
+                // no longer lists that release, or describes it differently, the
+                // stored text cannot be told apart from a user's and is kept.
                 let previous = existing.release_version.as_deref().and_then(|version| {
                     manifest
                         .releases
                         .iter()
                         .find(|candidate| candidate.version == version)
                         .and_then(|candidate| candidate.description.as_deref())
-                        .map(str::trim)
                 });
                 (
                     ResolvedRuntimeUpdateRelease::Manifest(release),

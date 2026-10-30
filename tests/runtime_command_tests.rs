@@ -5679,10 +5679,13 @@ fn runtime_install_replacement_keeps_a_user_supplied_official_runtime_descriptio
 
 /// Installs manifest release 0.2.0, updates to 0.3.0, and returns the
 /// runtime's `releaseVersion` and `description` from `runtime show --json`.
-/// Each manifest release carries its own description.
+/// Each manifest release carries its own description; with
+/// `prune_installed_release` the manifest served for the update no longer
+/// lists 0.2.0.
 fn manifest_runtime_after_update(
     test_name: &str,
     install_description: Option<&str>,
+    prune_installed_release: bool,
 ) -> (Value, Value) {
     let root = TestDir::new(test_name);
     let cwd = root.child("workspace");
@@ -5709,18 +5712,26 @@ fn manifest_runtime_after_update(
         "application/octet-stream",
         next_body,
     );
-    let manifest_body = format!(
-        "{{\"releases\":[{{\"version\":\"0.2.0\",\"channel\":\"stable\",\"url\":\"{}\",\"sha256\":\"{}\",\"description\":\"Team build 0.2.0\"}},{{\"version\":\"0.3.0\",\"channel\":\"stable\",\"url\":\"{}\",\"sha256\":\"{}\",\"description\":\"Team build 0.3.0\"}}]}}",
+    let installed_release = format!(
+        "{{\"version\":\"0.2.0\",\"channel\":\"stable\",\"url\":\"{}\",\"sha256\":\"{}\",\"description\":\"Team build 0.2.0\"}}",
         stable_server.url(),
-        stable_sha256,
+        stable_sha256
+    );
+    let next_release = format!(
+        "{{\"version\":\"0.3.0\",\"channel\":\"stable\",\"url\":\"{}\",\"sha256\":\"{}\",\"description\":\"Team build 0.3.0\"}}",
         next_server.url(),
         next_sha256
     );
-    let manifest_server = TestHttpServer::serve_bytes_times(
+    let install_manifest = format!("{{\"releases\":[{installed_release},{next_release}]}}");
+    let update_manifest = if prune_installed_release {
+        format!("{{\"releases\":[{next_release}]}}")
+    } else {
+        install_manifest.clone()
+    };
+    let manifest_server = TestHttpServer::serve_bytes_sequence(
         "/manifests/releases.json",
         "application/json",
-        manifest_body.as_bytes(),
-        2,
+        vec![install_manifest.into_bytes(), update_manifest.into_bytes()],
     );
     let env = ocm_env(&root);
 
@@ -5756,9 +5767,22 @@ fn manifest_runtime_after_update(
 #[test]
 fn runtime_update_replaces_the_previous_manifest_release_description() {
     let (version, description) =
-        manifest_runtime_after_update("runtime-update-manifest-release-description", None);
+        manifest_runtime_after_update("runtime-update-manifest-release-description", None, false);
     assert_eq!(version, "0.3.0");
     assert_eq!(description, "Team build 0.3.0");
+}
+
+#[test]
+fn runtime_update_keeps_a_manifest_description_it_can_no_longer_recognize() {
+    // Without the installed release in the manifest, OCM cannot tell its
+    // recorded manifest text from a user description, so it keeps it.
+    let (version, description) = manifest_runtime_after_update(
+        "runtime-update-manifest-pruned-release-description",
+        None,
+        true,
+    );
+    assert_eq!(version, "0.3.0");
+    assert_eq!(description, "Team build 0.2.0");
 }
 
 #[test]
@@ -5766,6 +5790,7 @@ fn runtime_update_keeps_a_user_supplied_manifest_runtime_description() {
     let (version, description) = manifest_runtime_after_update(
         "runtime-update-manifest-user-description",
         Some("pinned for staging"),
+        false,
     );
     assert_eq!(version, "0.3.0");
     assert_eq!(description, "pinned for staging");
