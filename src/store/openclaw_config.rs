@@ -214,12 +214,78 @@ pub(crate) fn rewrite_openclaw_config_for_migration(
         source_state_root,
         canonical_source_state_root,
     )?;
+    if let Some(gateway_port) = gateway_port {
+        rewrite_included_gateway_port(target_paths, gateway_port)?;
+    }
     rewrite_openclaw_config_with_root_mapping(
         target_paths,
         Some((source_state_root, target_paths.state_dir.as_path())),
         gateway_port,
         SandboxOriginPolicy::NewEnvironment(sandbox_origin),
     )
+}
+
+/// Moves a Gateway port that a copied `$include` supplies to `gateway_port`,
+/// with the MCP app sandbox port that follows it. A port the config file sets
+/// itself overrides its includes and is left to the file's own rewrite.
+fn rewrite_included_gateway_port(target: &EnvPaths, gateway_port: u32) -> Result<(), String> {
+    let Some(mut config) = read_config_value(&target.config_path)? else {
+        return Ok(());
+    };
+    if read_gateway_port(&config).is_some() {
+        return Ok(());
+    }
+    let Some(effective) = load_effective_openclaw_config(&target.config_path)? else {
+        return Ok(());
+    };
+    let Some(source_port) = read_gateway_port(&effective.value) else {
+        return Ok(());
+    };
+    for (path, scopes) in effective.include_scopes {
+        let Some(value) = read_config_value(&path)? else {
+            continue;
+        };
+        let mut rewritten = None;
+        for scope in scopes {
+            let mut candidate = value.clone();
+            rewrite_gateway_port_in_scope(&mut candidate, &scope, gateway_port);
+            if rewritten
+                .as_ref()
+                .is_some_and(|previous| previous != &candidate)
+            {
+                return Err(format!(
+                    "cannot give the new environment its own Gateway port because OpenClaw include {} sets gateway.port and is also included elsewhere in the config; give gateway.port its own include before migration",
+                    display_path(&path)
+                ));
+            }
+            rewritten = Some(candidate);
+        }
+        if let Some(rewritten) = rewritten.filter(|rewritten| *rewritten != value) {
+            write_copied_config_value(&path, &target.state_dir, &rewritten)?;
+        }
+    }
+    if rewrite_port_coupled_mcp_app_sandbox(&mut config, source_port, gateway_port) {
+        write_config_value(&target.config_path, &config)?;
+    }
+    Ok(())
+}
+
+/// Rewrites `gateway.port` in a config fragment included at `scope`.
+fn rewrite_gateway_port_in_scope(value: &mut Value, scope: &[String], gateway_port: u32) {
+    const GATEWAY_PORT: [&str; 2] = ["gateway", "port"];
+    if scope.len() > GATEWAY_PORT.len() || scope.iter().zip(GATEWAY_PORT).any(|(a, b)| a != b) {
+        return;
+    }
+    let mut port = value;
+    for key in &GATEWAY_PORT[scope.len()..] {
+        let Some(child) = port.get_mut(*key) else {
+            return;
+        };
+        port = child;
+    }
+    if port.is_number() {
+        *port = Value::from(gateway_port);
+    }
 }
 
 fn rewrite_migrated_plugin_load_paths(

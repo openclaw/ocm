@@ -1230,6 +1230,14 @@ directives stay relative. Includes outside
 the source home, including symlink escapes, remain rejected.
 The existing restrictions on include-owned agent workspaces and sandbox origins
 still apply.
+
+Migration and adoption give the new environment its own Gateway port. A
+`gateway.port` set in the copied `openclaw.json` or in one of its copied
+`$include` files moves to the port OCM assigned, together with an MCP app
+sandbox port that follows it. When a copied include that sets the port is also
+included elsewhere in the config, the command fails and names the include
+instead of creating an environment that shares a Gateway port.
+
 Migration and adoption also relocate installed-plugin records authored under either
 the supplied home spelling or its canonical path. This includes internal local
 plugins when the home is supplied through an alias. Payloads must remain inside
