@@ -270,6 +270,75 @@ fn env_cleanup_keeps_user_home_config_paths_with_separate_ocm_home() {
 }
 
 #[test]
+fn env_cleanup_resets_home_default_workspace_without_rewriting_other_home_paths() {
+    let root = TestDir::new("env-cleanup-home-default-workspace");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    let home = PathBuf::from(&env["HOME"]);
+
+    let create = run_ocm(&cwd, &env, &["env", "create", "target", "--port", "19790"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let env_root = env_root_of(&cwd, &env, "target");
+
+    // The default workspace is still reset to the environment's own workspace,
+    // and a copied path from an unregistered OpenClaw home is still repaired.
+    let skills = path_string(&home.join(".openclaw/skills"));
+    let project = path_string(&home.join("projects/app/plugin"));
+    let copied_home = root.child("old-home");
+    let config_path = env_root.join(".openclaw/openclaw.json");
+    fs::write(
+        &config_path,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "gateway": {"port": 19790},
+            "agents": {"defaults": {"workspace": path_string(&home.join(".openclaw/workspace"))}},
+            "memory": {"logPath": path_string(&copied_home.join(".openclaw/logs/gateway.log"))},
+            "skills": {"load": {"extraDirs": [skills]}},
+            "plugins": {"load": {"paths": [project]}}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let doctor = run_ocm(&cwd, &env, &["env", "doctor", "target", "--json"]);
+    assert!(doctor.status.success(), "{}", stderr(&doctor));
+    let doctor: Value = serde_json::from_str(&stdout(&doctor)).unwrap();
+    let issues = doctor["issues"].as_array().unwrap();
+    assert!(issues.iter().any(|issue| {
+        issue
+            .as_str()
+            .unwrap()
+            .contains("OpenClaw config workspace points outside env root")
+    }));
+    assert!(issues.iter().all(|issue| {
+        !issue.as_str().unwrap().contains(&format!(
+            "outside the current env root: {}",
+            path_string(&home)
+        ))
+    }));
+
+    let cleanup = run_ocm(&cwd, &env, &["env", "cleanup", "target", "--yes"]);
+    assert!(cleanup.status.success(), "{}", stderr(&cleanup));
+    let repaired: Value = serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    assert_eq!(
+        repaired["agents"]["defaults"]["workspace"],
+        path_string(&env_root.join(".openclaw/workspace"))
+    );
+    assert_eq!(
+        repaired["memory"]["logPath"],
+        path_string(&env_root.join(".openclaw/logs/gateway.log"))
+    );
+    assert_eq!(
+        repaired["skills"]["load"]["extraDirs"],
+        serde_json::json!([skills])
+    );
+    assert_eq!(
+        repaired["plugins"]["load"]["paths"],
+        serde_json::json!([project])
+    );
+}
+
+#[test]
 fn env_cleanup_rewrites_only_the_inferred_openclaw_directory() {
     let root = TestDir::new("env-cleanup-inferred-openclaw-directory");
     let cwd = root.child("workspace");

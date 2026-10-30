@@ -1786,7 +1786,8 @@ recover without rebinding. `--all` applies the same rule.
 
 Config repair moves paths under another registered environment's root into this environment's root.
 Without a registered owner, it maps only paths inside another `.openclaw` directory onto this environment's `.openclaw` directory and leaves other paths unchanged.
-Paths in your own `~/.openclaw` are references to your existing OpenClaw home, so doctor does not report them and cleanup does not rewrite them.
+Paths in your own `~/.openclaw` are references to your existing OpenClaw home, so doctor does not report them as copied paths and config repair leaves them unchanged.
+The default workspace setting is checked separately: when `agents.defaults.workspace` points at a `.openclaw/workspace` directory outside the environment, including `~/.openclaw/workspace`, doctor reports it and cleanup resets it to the environment's own workspace.
 
 Runtime-state cleanup preserves configured agent directories inside the environment, including their authentication and state files beneath generated plugin dependencies.
 It also retains shared managed skills under `.openclaw/skills` and their global ClawHub tracking metadata under `.openclaw/.clawhub`.
