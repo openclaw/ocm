@@ -52,8 +52,9 @@ pub(crate) use envs::{
 };
 pub(crate) use envs::{
     save_environment_with_dev_registration, save_environment_with_runtime_guard,
-    save_environment_with_validated_launcher, save_environment_with_validated_runtime,
-    save_environment_with_validated_runtime_guard, with_locked_environments,
+    save_environment_with_runtime_guard_admitted, save_environment_with_validated_launcher,
+    save_environment_with_validated_runtime, save_environment_with_validated_runtime_guard,
+    with_locked_environments,
 };
 pub(crate) use gateway_ports::{
     openclaw_port_family_available, openclaw_port_family_range, resolve_config_gateway_port,

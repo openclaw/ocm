@@ -93,6 +93,19 @@ pub(crate) fn retain_unclaimed_gateway_port(
     envs: &[EnvMeta],
     env: &BTreeMap<String, String>,
 ) -> Result<u32, String> {
+    if !gateway_port_family_claimed(port, envs, env) {
+        return Ok(port);
+    }
+    choose_available_gateway_port(port, envs, env)
+}
+
+/// Reports whether `envs` hold a Gateway port family or dev UI port inside
+/// the port family of `port`.
+pub(crate) fn gateway_port_family_claimed(
+    port: u32,
+    envs: &[EnvMeta],
+    env: &BTreeMap<String, String>,
+) -> bool {
     let mut registered = BTreeSet::new();
     reserve_dev_ui_ports(envs, &mut registered);
     for claimed_port in resolve_effective_gateway_ports(envs, env)
@@ -101,10 +114,7 @@ pub(crate) fn retain_unclaimed_gateway_port(
     {
         reserve_openclaw_port_family(claimed_port, &mut registered);
     }
-    if !openclaw_port_family_conflicts(port, &registered) {
-        return Ok(port);
-    }
-    choose_available_gateway_port(port, envs, env)
+    openclaw_port_family_conflicts(port, &registered)
 }
 
 fn reserve_foreign_openclaw_port_family(

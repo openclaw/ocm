@@ -24,7 +24,8 @@ use super::dev_sources::{
     protected_dev_source_footprints,
 };
 use super::gateway_ports::{
-    resolve_config_gateway_port, resolve_env_gateway_port, retain_unclaimed_gateway_port,
+    gateway_port_family_claimed, resolve_config_gateway_port, resolve_env_gateway_port,
+    retain_unclaimed_gateway_port,
 };
 use super::layout::{
     EnvPaths, derive_env_paths, display_path, snapshot_archive_path, snapshot_checkpoint_path,
@@ -832,15 +833,6 @@ fn prepare_env_snapshot_restore_with_binding(
                     .map_err(|error| error.to_string())?;
                 prior_state_restored = false;
             }
-            if purpose == RestorePurpose::Snapshot {
-                reselect_claimed_automatic_gateway_port(
-                    &mut restored,
-                    &current_paths,
-                    &mut warnings,
-                    env,
-                    cwd,
-                )?;
-            }
             if legacy_archive && !restore_uses_directory_link(&current_paths.root)? {
                 rewrite_openclaw_config_for_target(
                     &current_paths,
@@ -860,8 +852,31 @@ fn prepare_env_snapshot_restore_with_binding(
                     preserve_current_excluded_openclaw_state(&backup_root, &current_paths.root)?;
                 }
             }
-            restored =
-                super::save_environment_with_runtime_guard(restored, runtime_guard, env, cwd)?;
+            // Decide on the port the restored tree and record now resolve to,
+            // after a legacy archive's config has taken the archived port.
+            if purpose == RestorePurpose::Snapshot {
+                reselect_claimed_automatic_gateway_port(
+                    &mut restored,
+                    &current_paths,
+                    &independent,
+                    &mut warnings,
+                    env,
+                    cwd,
+                )?;
+            }
+            let check_port = purpose == RestorePurpose::Snapshot;
+            restored = super::save_environment_with_runtime_guard_admitted(
+                restored,
+                runtime_guard,
+                env,
+                cwd,
+                |meta, envs| {
+                    if check_port {
+                        ensure_automatic_gateway_port_unclaimed(meta, envs, env)?;
+                    }
+                    Ok(())
+                },
+            )?;
             Ok(restored.clone())
         })();
 
@@ -990,6 +1005,7 @@ pub(crate) fn rollback_env_snapshot_restore(
 fn reselect_claimed_automatic_gateway_port(
     restored: &mut EnvMeta,
     paths: &EnvPaths,
+    independent: &[PathBuf],
     warnings: &mut Vec<String>,
     env: &BTreeMap<String, String>,
     cwd: &Path,
@@ -1009,21 +1025,81 @@ fn reselect_claimed_automatic_gateway_port(
         return Ok(());
     }
     restored.gateway_port = Some(selected);
-    if resolve_config_gateway_port(restored).is_some() && !restore_uses_directory_link(&paths.root)?
+    if resolve_config_gateway_port(restored).is_some()
+        && restore_owns_config_file(paths, independent)?
     {
         rewrite_openclaw_config_gateway_port(paths, selected)?;
     }
     if resolve_env_gateway_port(restored) != Some(selected) {
         return Err(format!(
-            "restored Gateway port {port} for env {} is held by another environment, and OpenClaw config sets it where OCM does not rewrite it: {}",
+            "restored Gateway port {port} for env {} conflicts with another environment, and OpenClaw config sets it where restore does not rewrite it: {}",
             restored.name,
             display_path(&paths.config_path)
         ));
     }
     warnings.push(format!(
-        "Gateway port {port} is held by another environment; env {} now uses Gateway port {selected}",
+        "Gateway port {port} conflicts with another environment; env {} now uses Gateway port {selected}",
         restored.name
     ));
+    Ok(())
+}
+
+// Restore replaced the config file itself only when it is a regular entry of
+// the restored tree: not reached through a link and not an independent path
+// that restore leaves in place.
+fn restore_owns_config_file(paths: &EnvPaths, independent: &[PathBuf]) -> Result<bool, String> {
+    if restore_uses_directory_link(&paths.root)? {
+        return Ok(false);
+    }
+    match fs::symlink_metadata(&paths.config_path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.to_string()),
+    }
+    let Ok(relative) = paths.config_path.strip_prefix(&paths.root) else {
+        return Ok(false);
+    };
+    Ok(!config_within_independent_path(relative, independent))
+}
+
+// Compared without case so a case-insensitive filesystem cannot hide a match.
+fn config_within_independent_path(relative: &Path, independent: &[PathBuf]) -> bool {
+    let fold = |path: &Path| {
+        path.components()
+            .map(|part| part.as_os_str().to_string_lossy().to_lowercase())
+            .collect::<Vec<_>>()
+    };
+    let config = fold(relative);
+    independent
+        .iter()
+        .any(|path| config.starts_with(&fold(path)))
+}
+
+// Another command may register a port between the restore's selection and its
+// registry write; check again under the registry lock that allocation holds.
+fn ensure_automatic_gateway_port_unclaimed(
+    meta: &EnvMeta,
+    envs: &[EnvMeta],
+    env: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    if !meta.gateway_port_auto_assigned {
+        return Ok(());
+    }
+    let Some(port) = resolve_env_gateway_port(meta) else {
+        return Ok(());
+    };
+    let others = envs
+        .iter()
+        .filter(|other| other.name != meta.name)
+        .cloned()
+        .collect::<Vec<_>>();
+    if gateway_port_family_claimed(port, &others, env) {
+        return Err(format!(
+            "another environment registered Gateway port {port} while env {} was being restored; retry the restore",
+            meta.name
+        ));
+    }
     Ok(())
 }
 
@@ -1541,4 +1617,71 @@ fn remove_snapshot_parent_if_empty(
         fs::remove_dir(&dir).map_err(|error| error.to_string())?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn meta(name: &str, gateway_port: u32, auto: bool) -> EnvMeta {
+        EnvMeta {
+            upgrade_independent_paths: Vec::new(),
+            kind: "ocm-env".to_string(),
+            name: name.to_string(),
+            root: format!("/nonexistent-ocm-restore-port-test/envs/{name}"),
+            gateway_port: Some(gateway_port),
+            gateway_port_auto_assigned: auto,
+            service_enabled: false,
+            service_running: false,
+            default_runtime: None,
+            default_launcher: None,
+            dev: None,
+            dev_ui_port: None,
+            protected: false,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+            last_used_at: None,
+        }
+    }
+
+    #[test]
+    fn registry_admission_refuses_an_automatic_port_registered_during_restore() {
+        let env = BTreeMap::from([(
+            "HOME".to_string(),
+            "/nonexistent-ocm-restore-port-test/home".to_string(),
+        )]);
+        let restored = meta("a", 18_789, true);
+        // The registry still holds a's pre-restore entry; only others count.
+        let own = meta("a", 18_789, true);
+        assert!(ensure_automatic_gateway_port_unclaimed(&restored, &[own.clone()], &env).is_ok());
+
+        let raced = meta("c", 18_850, true);
+        let error =
+            ensure_automatic_gateway_port_unclaimed(&restored, &[own.clone(), raced.clone()], &env)
+                .unwrap_err();
+        assert!(error.contains("Gateway port 18789"), "{error}");
+
+        let disjoint = meta("c", 18_900, true);
+        assert!(ensure_automatic_gateway_port_unclaimed(&restored, &[own, disjoint], &env).is_ok());
+        let explicit = meta("a", 18_789, false);
+        assert!(ensure_automatic_gateway_port_unclaimed(&explicit, &[raced], &env).is_ok());
+    }
+
+    #[test]
+    fn config_inside_an_independent_path_is_not_restore_owned() {
+        let config = Path::new(".openclaw/openclaw.json");
+        assert!(!config_within_independent_path(config, &[]));
+        assert!(!config_within_independent_path(
+            config,
+            &[PathBuf::from(".openclaw/workspace")]
+        ));
+        assert!(config_within_independent_path(
+            config,
+            &[PathBuf::from(".openclaw")]
+        ));
+        assert!(config_within_independent_path(
+            config,
+            &[PathBuf::from(".OpenClaw/OpenClaw.json")]
+        ));
+    }
 }

@@ -1562,8 +1562,11 @@ Restore keeps the snapshot's Gateway port. When OCM assigned that port
 automatically and another registered environment now holds its port family,
 restore selects the next available port the way clone and import do, moves a
 `gateway.port` set in the restored OpenClaw config with it, and reports the
-change as a warning. A port chosen with `--port` is restored unchanged, and
-upgrade rollback keeps the environment's own pre-upgrade port.
+change as a warning. When that port comes from a config OCM does not rewrite
+during restore, such as a linked config file, an include, or an independent
+path, restore refuses and returns the environment to its pre-restore state.
+A port chosen with `--port` is restored unchanged, and upgrade rollback keeps
+the environment's own pre-upgrade port.
 
 Restore retains the displaced environment until supervisor synchronization and managed-service acceptance succeed.
 If synchronization fails, OCM attempts to restore the pre-restore root and registry before returning the error. A quiesced service resumes only when its prior data was unchanged or recovered successfully, including recovery with cleanup or resynchronization warnings.
