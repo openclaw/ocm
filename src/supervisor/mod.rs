@@ -419,7 +419,7 @@ pub(crate) fn discard_child_logs<'n>(
         .collect::<Vec<_>>();
     // Judge ownership as it will be once this name is registered.
     let is_registered =
-        |name: &str| name == env_name || registered.iter().any(|current| current == name);
+        |name: &str| Some(name == env_name || registered.iter().any(|current| current == name));
     let daemon_logs_dir = if env_name.eq_ignore_ascii_case("daemon") {
         Some(SupervisorService::new(env, cwd).saved_daemon_logs_dir()?)
     } else {
@@ -463,14 +463,16 @@ fn remove_earlier_child_log(path: &Path, env_name: &str) -> Result<(), String> {
     }
 }
 
-/// Whether a registered environment has exactly this name. Unreadable
-/// registration proves no owner.
+/// Whether a registered environment has exactly this name, or `None` when the
+/// registry cannot be read.
 pub(crate) fn registered_env<'a>(
     env: &'a BTreeMap<String, String>,
     cwd: &'a Path,
-) -> impl FnOnce(&str) -> bool + 'a {
+) -> impl FnOnce(&str) -> Option<bool> + 'a {
     move |name| {
-        list_environments(env, cwd).is_ok_and(|envs| envs.iter().any(|meta| meta.name == name))
+        list_environments(env, cwd)
+            .ok()
+            .map(|envs| envs.iter().any(|meta| meta.name == name))
     }
 }
 

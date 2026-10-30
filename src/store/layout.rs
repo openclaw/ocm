@@ -376,7 +376,7 @@ pub(crate) fn supervisor_child_log_file(
     path: &Path,
     env_name: &str,
     stream: &str,
-    is_registered: impl FnOnce(&str) -> bool,
+    is_registered: impl FnOnce(&str) -> Option<bool>,
 ) -> PathBuf {
     resolve_child_log_file(path, env_name, stream, is_registered).0
 }
@@ -388,7 +388,7 @@ pub(crate) fn adopt_supervisor_child_log_file(
     path: &Path,
     env_name: &str,
     stream: &str,
-    is_registered: impl FnOnce(&str) -> bool,
+    is_registered: impl FnOnce(&str) -> Option<bool>,
 ) -> PathBuf {
     let (file, leftover) = resolve_child_log_file(path, env_name, stream, is_registered);
     if let Some(leftover) = leftover {
@@ -400,12 +400,13 @@ pub(crate) fn adopt_supervisor_child_log_file(
 }
 
 /// The resolved file, and the entry it opens when that entry is spelled for a
-/// name that is not registered.
+/// name that is not registered. `is_registered` answers `None` when
+/// registration cannot be read.
 fn resolve_child_log_file(
     path: &Path,
     env_name: &str,
     stream: &str,
-    is_registered: impl FnOnce(&str) -> bool,
+    is_registered: impl FnOnce(&str) -> Option<bool>,
 ) -> (PathBuf, Option<PathBuf>) {
     let unchanged = || (path.to_path_buf(), None);
     let (Some(dir), Some(file_name)) = (path.parent(), path.file_name()) else {
@@ -446,12 +447,12 @@ fn resolve_child_log_file(
     }) else {
         return unchanged();
     };
-    if creator == env_name {
-        unchanged()
-    } else if is_registered(creator) {
-        (separate, None)
-    } else {
-        (path.to_path_buf(), Some(dir.join(entry)))
+    // Unknown registration keeps the file as it is: never rename a file that
+    // may still belong to a registered environment.
+    match (creator == env_name, is_registered(creator)) {
+        (true, _) | (false, None) => unchanged(),
+        (false, Some(true)) => (separate, None),
+        (false, Some(false)) => (path.to_path_buf(), Some(dir.join(entry))),
     }
 }
 
@@ -523,4 +524,43 @@ pub fn snapshot_checkpoint_path(
     cwd: &Path,
 ) -> Result<PathBuf, String> {
     Ok(snapshot_env_dir(env_name, env, cwd)?.join(format!("{snapshot_id}.checkpoint")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry_names(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn a_case_variants_service_log_is_renamed_only_when_its_name_is_known_unregistered() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        fs::write(dir.join("Alpha.stdout.log"), "left output\n").unwrap();
+        let case_insensitive = dir.join("ALPHA.STDOUT.LOG").exists();
+        let path = dir.join("alpha.stdout.log");
+
+        // Registration that cannot be read never moves the entry.
+        assert_eq!(
+            adopt_supervisor_child_log_file(&path, "alpha", "stdout", |_| None),
+            path
+        );
+        assert_eq!(entry_names(dir), ["Alpha.stdout.log"]);
+
+        assert_eq!(
+            adopt_supervisor_child_log_file(&path, "alpha", "stdout", |_| Some(false)),
+            path
+        );
+        let expected = if case_insensitive {
+            "alpha.stdout.log"
+        } else {
+            "Alpha.stdout.log"
+        };
+        assert_eq!(entry_names(dir), [expected]);
+    }
 }
