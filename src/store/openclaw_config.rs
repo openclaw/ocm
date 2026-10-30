@@ -146,6 +146,15 @@ pub(crate) fn rewrite_openclaw_config_for_target(
     .map(|_| ())
 }
 
+/// Reports whether the config file itself, not an include, sets the Gateway
+/// port.
+pub(crate) fn openclaw_config_file_sets_gateway_port(paths: &EnvPaths) -> Result<bool, String> {
+    Ok(read_config_value(&paths.config_path)?
+        .as_ref()
+        .and_then(read_gateway_port)
+        .is_some())
+}
+
 /// Moves a config-set Gateway port, and the ports coupled to it, to
 /// `gateway_port`. A config without a Gateway port is left untouched.
 pub(crate) fn rewrite_openclaw_config_gateway_port(

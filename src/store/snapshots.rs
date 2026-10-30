@@ -31,7 +31,9 @@ use super::layout::{
     EnvPaths, derive_env_paths, display_path, snapshot_archive_path, snapshot_checkpoint_path,
     snapshot_env_dir, snapshot_meta_path, validate_name,
 };
-use super::openclaw_config::rewrite_openclaw_config_gateway_port;
+use super::openclaw_config::{
+    openclaw_config_file_sets_gateway_port, rewrite_openclaw_config_gateway_port,
+};
 use super::{
     OpenClawWorkspaceRuntime, audit_openclaw_state, clear_nonportable_runtime_state,
     get_environment, list_environments, now_utc, remove_upgrade_recovery_for_snapshot,
@@ -854,8 +856,8 @@ fn prepare_env_snapshot_restore_with_binding(
             }
             // Decide on the port the restored tree and record now resolve to,
             // after a legacy archive's config has taken the archived port.
-            if purpose == RestorePurpose::Snapshot {
-                reselect_claimed_automatic_gateway_port(
+            let check_port = purpose == RestorePurpose::Snapshot
+                && reselect_claimed_automatic_gateway_port(
                     &mut restored,
                     &current_paths,
                     &independent,
@@ -863,8 +865,6 @@ fn prepare_env_snapshot_restore_with_binding(
                     env,
                     cwd,
                 )?;
-            }
-            let check_port = purpose == RestorePurpose::Snapshot;
             restored = super::save_environment_with_runtime_guard_admitted(
                 restored,
                 runtime_guard,
@@ -1001,7 +1001,10 @@ pub(crate) fn rollback_env_snapshot_restore(
 }
 
 // Clone and import choose a free port for their new environment. Restore keeps
-// the recorded one unless OCM chose it and another environment now holds it.
+// the port it applies unless OCM chose it and another environment now holds
+// it. Returns whether restore applied the port: the recorded automatic port, or
+// a `gateway.port` in a config file the restore replaced. A port set through
+// config restore leaves in place is the user's, like an explicit `--port`.
 fn reselect_claimed_automatic_gateway_port(
     restored: &mut EnvMeta,
     paths: &EnvPaths,
@@ -1009,30 +1012,38 @@ fn reselect_claimed_automatic_gateway_port(
     warnings: &mut Vec<String>,
     env: &BTreeMap<String, String>,
     cwd: &Path,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     if !restored.gateway_port_auto_assigned {
-        return Ok(());
+        return Ok(false);
     }
     let Some(port) = resolve_env_gateway_port(restored) else {
-        return Ok(());
+        return Ok(false);
     };
+    let config_sets_port = resolve_config_gateway_port(restored).is_some();
+    if config_sets_port
+        && !(restore_owns_config_file(paths, independent)?
+            && openclaw_config_file_sets_gateway_port(paths)?)
+    {
+        return Ok(false);
+    }
     let others = list_environments(env, cwd)?
         .into_iter()
         .filter(|meta| meta.name != restored.name)
         .collect::<Vec<_>>();
-    let selected = retain_unclaimed_gateway_port(port, &others, env)?;
+    // The environment keeps its retained dev UI port, so a new Gateway port
+    // family must not contain it.
+    let reserved = restored.dev_ui_port.into_iter().collect::<Vec<_>>();
+    let selected = retain_unclaimed_gateway_port(port, &others, &reserved, env)?;
     if selected == port {
-        return Ok(());
+        return Ok(true);
     }
     restored.gateway_port = Some(selected);
-    if resolve_config_gateway_port(restored).is_some()
-        && restore_owns_config_file(paths, independent)?
-    {
+    if config_sets_port {
         rewrite_openclaw_config_gateway_port(paths, selected)?;
     }
     if resolve_env_gateway_port(restored) != Some(selected) {
         return Err(format!(
-            "restored Gateway port {port} for env {} conflicts with another environment, and OpenClaw config sets it where restore does not rewrite it: {}",
+            "restored Gateway port {port} for env {} conflicts with another environment, and an include overrides the port restore rewrote in {}",
             restored.name,
             display_path(&paths.config_path)
         ));
@@ -1041,7 +1052,7 @@ fn reselect_claimed_automatic_gateway_port(
         "Gateway port {port} conflicts with another environment; env {} now uses Gateway port {selected}",
         restored.name
     ));
-    Ok(())
+    Ok(true)
 }
 
 // Restore replaced the config file itself only when it is a regular entry of
@@ -1057,27 +1068,39 @@ fn restore_owns_config_file(paths: &EnvPaths, independent: &[PathBuf]) -> Result
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error.to_string()),
     }
-    let Ok(relative) = paths.config_path.strip_prefix(&paths.root) else {
-        return Ok(false);
-    };
-    Ok(!config_within_independent_path(relative, independent))
+    Ok(!config_within_independent_path(paths, independent)?)
 }
 
-// Compared without case so a case-insensitive filesystem cannot hide a match.
-fn config_within_independent_path(relative: &Path, independent: &[PathBuf]) -> bool {
-    let fold = |path: &Path| {
-        path.components()
-            .map(|part| part.as_os_str().to_string_lossy().to_lowercase())
-            .collect::<Vec<_>>()
-    };
-    let config = fold(relative);
-    independent
-        .iter()
-        .any(|path| config.starts_with(&fold(path)))
+// Compared by filesystem identity, so a path spelled with another case matches
+// exactly when the filesystem resolves both spellings to the same entry.
+fn config_within_independent_path(
+    paths: &EnvPaths,
+    independent: &[PathBuf],
+) -> Result<bool, String> {
+    let mut config_entries = Vec::new();
+    for entry in paths.config_path.ancestors() {
+        if entry == paths.root || !entry.starts_with(&paths.root) {
+            break;
+        }
+        config_entries.push(path_identity(entry)?);
+    }
+    for relative in independent {
+        let candidate = paths.root.join(relative);
+        match fs::symlink_metadata(&candidate) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.to_string()),
+        }
+        if config_entries.contains(&path_identity(&candidate)?) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 // Another command may register a port between the restore's selection and its
-// registry write; check again under the registry lock that allocation holds.
+// registry write; check the port restore applied again under the registry lock
+// that allocation holds.
 fn ensure_automatic_gateway_port_unclaimed(
     meta: &EnvMeta,
     envs: &[EnvMeta],
@@ -1669,19 +1692,31 @@ mod tests {
 
     #[test]
     fn config_inside_an_independent_path_is_not_restore_owned() {
-        let config = Path::new(".openclaw/openclaw.json");
-        assert!(!config_within_independent_path(config, &[]));
-        assert!(!config_within_independent_path(
-            config,
-            &[PathBuf::from(".openclaw/workspace")]
+        let root = std::env::temp_dir().join(format!(
+            "ocm-restore-independent-config-{}-{}",
+            std::process::id(),
+            NEXT_REMOVAL_ID.fetch_add(1, Ordering::Relaxed)
         ));
-        assert!(config_within_independent_path(
-            config,
-            &[PathBuf::from(".openclaw")]
-        ));
-        assert!(config_within_independent_path(
-            config,
-            &[PathBuf::from(".OpenClaw/OpenClaw.json")]
-        ));
+        let paths = derive_env_paths(&root);
+        fs::create_dir_all(paths.config_path.parent().unwrap()).unwrap();
+        fs::write(&paths.config_path, "{}").unwrap();
+        fs::create_dir_all(root.join(".openclaw/workspace")).unwrap();
+        let within = |independent: &[&str]| {
+            let independent = independent.iter().map(PathBuf::from).collect::<Vec<_>>();
+            config_within_independent_path(&paths, &independent).unwrap()
+        };
+
+        assert!(!within(&[]));
+        assert!(!within(&[".openclaw/workspace", "absent"]));
+        assert!(within(&[".openclaw"]));
+        assert!(within(&[".openclaw/openclaw.json"]));
+        // Another spelling matches only where the filesystem resolves it to
+        // the same entry.
+        assert_eq!(
+            within(&[".OpenClaw"]),
+            root.join(".OpenClaw").symlink_metadata().is_ok()
+        );
+
+        fs::remove_dir_all(&root).unwrap();
     }
 }

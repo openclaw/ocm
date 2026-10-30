@@ -5290,9 +5290,11 @@ fn env_snapshot_restore_checks_the_port_a_legacy_archive_applies() {
     assert_eq!(restored["warnings"].as_array().unwrap().len(), 1);
 }
 
+// A port set in a config the restore does not replace is the user's choice,
+// like an explicit `--port`; restore neither moves it nor writes through the link.
 #[cfg(unix)]
 #[test]
-fn env_snapshot_restore_refuses_to_move_a_port_set_through_a_linked_config() {
+fn env_snapshot_restore_leaves_a_port_set_through_a_linked_config() {
     let root = TestDir::new("env-snapshot-restore-linked-config-port");
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
@@ -5316,21 +5318,15 @@ fn env_snapshot_restore_refuses_to_move_a_port_set_through_a_linked_config() {
         &env,
         &["env", "create", "holder", "--port", &holder_port, "--json"],
     );
-    let port_before = gateway_port(&cwd, &env, "a");
 
-    let restore = run_ocm(
+    let restored = ocm_json(
         &cwd,
         &env,
-        &["env", "snapshot", "restore", "a", snapshot_id],
+        &["env", "snapshot", "restore", "a", snapshot_id, "--json"],
     );
 
-    assert!(!restore.status.success());
-    assert!(
-        stderr(&restore).contains("OpenClaw config sets it where restore does not rewrite it"),
-        "{}",
-        stderr(&restore)
-    );
+    assert!(restored.get("warnings").is_none(), "{restored}");
+    assert_eq!(gateway_port(&cwd, &env, "a"), (snapshot_port, true));
     assert_eq!(fs::read_to_string(&external_config).unwrap(), external_raw);
     assert!(fs::symlink_metadata(&config_path).unwrap().is_symlink());
-    assert_eq!(gateway_port(&cwd, &env, "a"), port_before);
 }
