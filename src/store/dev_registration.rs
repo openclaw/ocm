@@ -252,6 +252,16 @@ fn source_changed(name: &str, dev: Option<&EnvDevMeta>, envs: &[EnvMeta]) -> boo
                 .and_then(|meta| meta.dev.as_ref())
 }
 
+fn held_operation(
+    name: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<BTreeSet<(u64, u64)>, String> {
+    Ok(BTreeSet::from([path_identity(
+        &environment_operation_lock_path(name, env, cwd)?,
+    )?]))
+}
+
 #[derive(Default)]
 pub(crate) struct DevSourceRegistration {
     source: Option<(EnvDevMeta, SourceIdentity)>,
@@ -285,12 +295,36 @@ impl DevSourceRegistration {
         env: &BTreeMap<String, String>,
         cwd: &Path,
     ) -> Result<Self, String> {
+        Self::lock_source_with(dev, envs, BTreeSet::new(), env, cwd)
+    }
+
+    // The caller holds `name`'s environment operation lock. A source inside that
+    // environment is admitted under it, so publication reports the overlap
+    // instead of the command contending with its own lock.
+    pub(crate) fn lock_source_holding(
+        name: &str,
+        dev: &EnvDevMeta,
+        envs: &[EnvMeta],
+        env: &BTreeMap<String, String>,
+        cwd: &Path,
+    ) -> Result<Self, String> {
+        Self::lock_source_with(dev, envs, held_operation(name, env, cwd)?, env, cwd)
+    }
+
+    fn lock_source_with(
+        dev: &EnvDevMeta,
+        envs: &[EnvMeta],
+        held_files: BTreeSet<(u64, u64)>,
+        env: &BTreeMap<String, String>,
+        cwd: &Path,
+    ) -> Result<Self, String> {
         if dev.borrowed_source_root().is_some() {
             dev.execution_source_root()?;
         }
         let identity = source_identity(dev)?;
         let mut registration = Self {
             source: Some((dev.clone(), identity)),
+            held_files,
             ..Self::default()
         };
         registration.lock_owners(envs, env, cwd)?;
@@ -319,9 +353,7 @@ impl DevSourceRegistration {
         let identity = source_identity(&dev)?;
         let mut registration = Self {
             source: Some((dev.clone(), identity)),
-            held_files: BTreeSet::from([path_identity(&environment_operation_lock_path(
-                name, env, cwd,
-            )?)?]),
+            held_files: held_operation(name, env, cwd)?,
             ..Self::default()
         };
         registration.lock_owners(envs, env, cwd)?;

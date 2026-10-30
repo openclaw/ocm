@@ -187,10 +187,60 @@ fn dev_rebind_refusals_preserve_the_binding_and_policy() {
         assert!(!rebind(root.path(), &env, &target).status.success());
         assert_eq!(fs::read(&registry).unwrap(), unchanged);
     }
+    // A target inside the environment's own root, or a shared clone whose
+    // objects live there, is refused for isolation rather than reported as a
+    // concurrent operation that a retry could clear.
     let overlap = Path::new(&original.root).join("source");
     init_nested_openclaw_repo(&overlap);
-    assert!(!rebind(root.path(), &env, &overlap).status.success());
+    commit_nested_openclaw_repo(&overlap);
+    let shared = root.child("shared-clone");
+    let cloned = Command::new("git")
+        .args(["clone", "-q", "--shared"])
+        .arg(&overlap)
+        .arg(&shared)
+        .output()
+        .unwrap();
+    assert!(
+        cloned.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cloned.stderr)
+    );
+    for refused in [
+        rebind(root.path(), &env, &overlap),
+        rebind(root.path(), &env, &shared),
+        run_ocm(
+            root.path(),
+            &env,
+            &dev_plain(&["demo", "--repo", &path_string(&overlap)]),
+        ),
+    ] {
+        assert!(!refused.status.success());
+        let message = stderr(&refused);
+        assert!(
+            message.contains("overlaps borrowed source or Git metadata for env demo"),
+            "{message}"
+        );
+        assert!(!message.contains("operation in progress"), "{message}");
+        assert_eq!(fs::read(&registry).unwrap(), unchanged);
+    }
+    // Another containing environment that is genuinely busy is still reported
+    // as an operation in progress.
+    let peer = run_ocm(root.path(), &env, &["env", "create", "peer"]);
+    assert!(peer.status.success(), "{}", stderr(&peer));
+    let peer_root =
+        Path::new(&get_environment("peer", &env, root.path()).unwrap().root).join("source");
+    init_nested_openclaw_repo(&peer_root);
+    let unchanged = fs::read(&registry).unwrap();
+    let peer_operation = hold_environment_operation(&root, "peer");
+    let busy = rebind(root.path(), &env, &peer_root);
+    assert!(!busy.status.success());
+    assert!(
+        stderr(&busy).contains("environment peer has an operation in progress"),
+        "{}",
+        stderr(&busy)
+    );
     assert_eq!(fs::read(&registry).unwrap(), unchanged);
+    drop(peer_operation);
     let operation = hold_environment_operation(&root, "demo");
     let busy = rebind(root.path(), &env, &repo);
     assert!(!busy.status.success());
