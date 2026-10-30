@@ -12,7 +12,7 @@ use std::sync::{
 
 #[cfg(not(target_os = "macos"))]
 use filetime::{FileTime, set_file_times, set_symlink_file_times};
-use rusqlite::{Connection, ErrorCode, OpenFlags};
+use rusqlite::{Connection, OpenFlags};
 #[cfg(not(target_os = "macos"))]
 use std::io::Write;
 
@@ -20,6 +20,7 @@ use super::common::{ensure_dir, path_exists};
 use super::dev_sources::projected_path_contains;
 use super::layout::display_path;
 use super::openclaw_workspaces::canonicalize_path_allow_missing;
+use crate::infra::sqlite_snapshot::{recover_hot_journal, sqlite_is_busy, sqlite_needs_rollback};
 use crate::infra::tree_digest::{inventory_tree, inventory_tree_except};
 
 pub(crate) const STORAGE_APFS_CLONE: &str = "apfs-clone-v1";
@@ -132,6 +133,7 @@ enum SqliteCheck {
     Verified,
     Deferred,
     ReadOnlyDirectory,
+    HotJournal,
 }
 
 pub(crate) fn default_snapshot_storage_kind() -> String {
@@ -253,7 +255,7 @@ pub(crate) fn create_tree_checkpoint_from_preparation(
         false,
     )?;
     verify_selected_tree_checkpoint(&prepared.source, &candidate, &prepared.independent)?;
-    verify_sqlite_databases(&candidate)?;
+    verify_sqlite_databases(&prepared.source, &candidate)?;
     sync_tree_root(&candidate)?;
     ensure_checkpoint_source(&prepared.requested_source, &prepared.source)?;
     fs::rename(&candidate, destination).map_err(|error| error.to_string())?;
@@ -328,9 +330,10 @@ fn verify_selected_tree_checkpoint(
     Ok(())
 }
 
-fn verify_sqlite_databases(root: &Path) -> Result<(), String> {
+fn verify_sqlite_databases(source: &Path, root: &Path) -> Result<(), String> {
     for path in regular_files(root)? {
-        let _ = verify_sqlite_database(&path)?;
+        let relative = path.strip_prefix(root).map_err(|error| error.to_string())?;
+        let _ = verify_sqlite_database(&path, &source.join(relative))?;
     }
     Ok(())
 }
@@ -338,12 +341,13 @@ fn verify_sqlite_databases(root: &Path) -> Result<(), String> {
 #[cfg(not(target_os = "macos"))]
 fn preflight_sqlite_databases(root: &Path, independent: &[PathBuf]) -> Result<(), String> {
     for path in regular_files_except(root, independent)? {
-        let _ = check_sqlite_database(&path)?;
+        let _ = check_live_sqlite_database(&path)?;
     }
     Ok(())
 }
 
-fn verify_sqlite_database(path: &Path) -> Result<bool, String> {
+/// Verifies a captured database; `source` is the live database it was copied from.
+fn verify_sqlite_database(path: &Path, source: &Path) -> Result<bool, String> {
     let mut check = check_sqlite_database(path)?;
     if check == SqliteCheck::ReadOnlyDirectory {
         // Only the isolated captured tree reaches this verifier. A live source
@@ -351,10 +355,13 @@ fn verify_sqlite_database(path: &Path) -> Result<bool, String> {
         let connection = open_closed_checkpoint_database(path)?;
         check = check_sqlite_integrity(path, &connection)?;
     }
+    if check == SqliteCheck::HotJournal {
+        check = check_hot_journal(path, source)?;
+    }
     match check {
         SqliteCheck::NotDatabase => Ok(false),
         SqliteCheck::Verified => Ok(true),
-        SqliteCheck::Deferred => Err(format!(
+        SqliteCheck::Deferred | SqliteCheck::HotJournal => Err(format!(
             "checkpoint SQLite database remained busy after quiescence: {}",
             display_path(path)
         )),
@@ -401,6 +408,37 @@ fn open_closed_checkpoint_database(path: &Path) -> Result<Connection, String> {
     })
 }
 
+fn check_live_sqlite_database(path: &Path) -> Result<SqliteCheck, String> {
+    match check_sqlite_database(path)? {
+        SqliteCheck::HotJournal => check_hot_journal(path, path),
+        check => Ok(check),
+    }
+}
+
+/// Checks the committed state SQLite recovers from a hot rollback journal,
+/// replayed in a private copy so the live database is never written. A copied
+/// journal is hot without the source's locks, so a capture is accepted only
+/// while the live journal is still hot and holds the captured bytes.
+fn check_hot_journal(path: &Path, source: &Path) -> Result<SqliteCheck, String> {
+    let Some(recovered) = recover_hot_journal(source)? else {
+        return Ok(SqliteCheck::Deferred);
+    };
+    if path != source && !recovered.matches(path)? {
+        return Ok(SqliteCheck::Deferred);
+    }
+    let connection = Connection::open_with_flags(
+        recovered.path(),
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| {
+        format!(
+            "failed to open checkpoint SQLite database {}: {error}",
+            display_path(path)
+        )
+    })?;
+    check_sqlite_integrity(path, &connection)
+}
+
 fn check_sqlite_database(path: &Path) -> Result<SqliteCheck, String> {
     let mut file = fs::File::open(path).map_err(|error| error.to_string())?;
     let mut magic = [0_u8; 16];
@@ -417,6 +455,7 @@ fn check_sqlite_database(path: &Path) -> Result<SqliteCheck, String> {
         Err(error) if sqlite_needs_writable_directory(&error) => {
             return Ok(SqliteCheck::ReadOnlyDirectory);
         }
+        Err(error) if sqlite_needs_rollback(&error) => return Ok(SqliteCheck::HotJournal),
         Err(error) => {
             return Err(format!(
                 "failed to open checkpoint SQLite database {}: {error}",
@@ -434,6 +473,7 @@ fn check_sqlite_integrity(path: &Path, connection: &Connection) -> Result<Sqlite
         Err(error) if sqlite_needs_writable_directory(&error) => {
             return Ok(SqliteCheck::ReadOnlyDirectory);
         }
+        Err(error) if sqlite_needs_rollback(&error) => return Ok(SqliteCheck::HotJournal),
         Err(error) => {
             return Err(format!(
                 "failed to verify checkpoint SQLite database {}: {error}",
@@ -454,13 +494,6 @@ fn sqlite_needs_writable_directory(error: &rusqlite::Error) -> bool {
     error
         .sqlite_error()
         .is_some_and(|error| error.extended_code == rusqlite::ffi::SQLITE_READONLY_DIRECTORY)
-}
-
-fn sqlite_is_busy(error: &rusqlite::Error) -> bool {
-    matches!(
-        error.sqlite_error_code(),
-        Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
-    )
 }
 
 #[cfg(target_os = "macos")]
@@ -514,7 +547,7 @@ fn prepare_entry_path(
             .to_vec()
             .into_boxed_slice();
         let before = file_fingerprint(&metadata);
-        let sqlite_check = match check_sqlite_database(path) {
+        let sqlite_check = match check_live_sqlite_database(path) {
             Ok(check) => check,
             Err(_) if !path_exists(path) => {
                 out.insert(
@@ -686,7 +719,10 @@ fn capture_prepared_clone(
             path.strip_prefix(destination)
                 .map_err(|error| error.to_string())?,
         )? {
-            let _ = verify_sqlite_database(&path)?;
+            let relative = path
+                .strip_prefix(destination)
+                .map_err(|error| error.to_string())?;
+            let _ = verify_sqlite_database(&path, &source.join(relative))?;
         }
     }
     Ok(())
@@ -2117,6 +2153,142 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn checkpoint_captures_hot_journal_without_writing_the_source() {
+        use crate::infra::sqlite_snapshot::{plant_hot_journal, recovered_records};
+
+        let source = tempfile::tempdir().unwrap();
+        let database = source.path().join("proj/app.db");
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        let _ = plant_hot_journal(&database);
+        let journal = source.path().join("proj/app.db-journal");
+        let before = [fs::read(&database).unwrap(), fs::read(&journal).unwrap()];
+        let destination_parent = tempfile::tempdir().unwrap();
+        let destination = destination_parent.path().join("checkpoint");
+
+        super::create_tree_checkpoint(source.path(), &destination).unwrap();
+
+        assert_eq!(
+            [fs::read(&database).unwrap(), fs::read(&journal).unwrap()],
+            before
+        );
+        super::verify_tree_checkpoint(source.path(), &destination).unwrap();
+        let committed = (0..300)
+            .map(|i| format!("committed{i}"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            recovered_records(&destination.join("proj/app.db")),
+            committed
+        );
+
+        // Restoring the checkpoint verifies the captured journal the same way.
+        let restored = destination_parent.path().join("restored");
+        super::copy_tree_checkpoint(&destination, &restored).unwrap();
+        assert_eq!(recovered_records(&restored.join("proj/app.db")), committed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_refuses_a_corrupt_database_behind_hot_journal() {
+        use crate::infra::sqlite_snapshot::{damage_page, plant_hot_journal};
+
+        let source = tempfile::tempdir().unwrap();
+        let database = source.path().join("app.db");
+        let untouched = plant_hot_journal(&database);
+        damage_page(&database, untouched);
+        let before = [
+            fs::read(&database).unwrap(),
+            fs::read(source.path().join("app.db-journal")).unwrap(),
+        ];
+        let destination_parent = tempfile::tempdir().unwrap();
+
+        let error =
+            super::create_tree_checkpoint(source.path(), &destination_parent.path().join("c"))
+                .unwrap_err();
+
+        assert!(
+            error.contains("integrity check failed") || error.contains("malformed"),
+            "{error}"
+        );
+        assert_eq!(
+            [
+                fs::read(&database).unwrap(),
+                fs::read(source.path().join("app.db-journal")).unwrap()
+            ],
+            before
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_refuses_a_hot_journal_of_a_multi_database_transaction() {
+        use crate::infra::sqlite_snapshot::{name_super_journal, plant_hot_journal};
+
+        let source = tempfile::tempdir().unwrap();
+        let database = source.path().join("app.db");
+        let _ = plant_hot_journal(&database);
+        let outside = tempfile::tempdir().unwrap();
+        let super_journal = outside.path().join("transaction-mj");
+        fs::write(&super_journal, b"").unwrap();
+        name_super_journal(&database, &super_journal);
+        let destination_parent = tempfile::tempdir().unwrap();
+
+        let error =
+            super::create_tree_checkpoint(source.path(), &destination_parent.path().join("c"))
+                .unwrap_err();
+
+        assert!(error.contains("multi-database transaction"), "{error}");
+        assert!(super_journal.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_refuses_a_journal_copied_from_a_database_in_use() {
+        use crate::infra::sqlite_snapshot::plant_hot_journal;
+
+        let source = tempfile::tempdir().unwrap();
+        let database = source.path().join("app.db");
+        let _ = plant_hot_journal(&database);
+        let captured = tempfile::tempdir().unwrap();
+        let captured_database = captured.path().join("app.db");
+        fs::copy(&database, &captured_database).unwrap();
+        fs::copy(
+            source.path().join("app.db-journal"),
+            captured.path().join("app.db-journal"),
+        )
+        .unwrap();
+        assert!(super::verify_sqlite_database(&captured_database, &database).unwrap());
+
+        // The capture no longer holds the live bytes.
+        let mut journal = fs::read(captured.path().join("app.db-journal")).unwrap();
+        let last = journal.len() - 1;
+        journal[last] ^= 1;
+        fs::write(captured.path().join("app.db-journal"), journal).unwrap();
+        let error = super::verify_sqlite_database(&captured_database, &database).unwrap_err();
+        assert!(error.contains("remained busy"), "{error}");
+
+        // A live writer holds the database: its copied journal is not recoverable state.
+        let writer = rusqlite::Connection::open(&database).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA cache_size=5;
+                 BEGIN;
+                 UPDATE records SET value = value || printf('%.2000c', 'y');",
+            )
+            .unwrap();
+        assert_eq!(
+            super::check_live_sqlite_database(&database).unwrap(),
+            super::SqliteCheck::Deferred
+        );
+        let destination_parent = tempfile::tempdir().unwrap();
+        let error =
+            super::create_tree_checkpoint(source.path(), &destination_parent.path().join("c"))
+                .unwrap_err();
+        assert!(error.contains("remained busy"), "{error}");
+        drop(writer);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn readonly_sqlite_retry_requires_absent_sidecars() {
         use std::os::unix::fs::{PermissionsExt, symlink};
 
@@ -2133,7 +2305,7 @@ mod tests {
             super::check_sqlite_database(&database_path).unwrap(),
             super::SqliteCheck::ReadOnlyDirectory
         );
-        assert!(super::verify_sqlite_database(&database_path).unwrap());
+        assert!(super::verify_sqlite_database(&database_path, &database_path).unwrap());
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755)).unwrap();
         for suffix in ["-wal", "-shm", "-journal"] {
             let sidecar = root.path().join(format!("state.sqlite{suffix}"));

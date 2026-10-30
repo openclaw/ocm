@@ -1520,7 +1520,13 @@ writable or removing its attributes.
 Clean, closed WAL-mode SQLite databases can also be captured and restored from
 read-only directories without creating sidecars there. SQLite integrity checks
 remain required; databases with WAL or journal sidecars retain normal SQLite
-validation so committed sidecar data is not ignored.
+validation so committed sidecar data is not ignored. A database left with a hot
+rollback journal by an interrupted writer is validated, and captured by export
+and clone, as the committed data SQLite recovers from that journal; recovery
+runs on a private copy, so the live database and journal are not modified. A
+journal left by an interrupted multi-database transaction names a separate
+super-journal file and is refused instead; open the database with SQLite to
+recover it, then retry.
 
 A symlinked environment root is resolved for capture so the checkpoint contains
 independent bytes; links inside the root remain links. Restore replaces the

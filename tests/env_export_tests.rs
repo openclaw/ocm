@@ -1397,6 +1397,48 @@ fn env_export_include_state_retains_the_installation_and_snapshots_sqlite_anywhe
 }
 
 #[test]
+fn env_export_include_state_captures_committed_rows_behind_a_hot_journal() {
+    let root = TestDir::new("export-hot-journal");
+    let env = ocm_env(&root);
+    let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let database = root.child("ocm-home/envs/source/proj/app.db");
+    let committed = support::plant_hot_journal(&database);
+    let journal = root.child("ocm-home/envs/source/proj/app.db-journal");
+    let before = [fs::read(&database).unwrap(), fs::read(&journal).unwrap()];
+
+    let export = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "env",
+            "export",
+            "source",
+            "--include-state",
+            "--output",
+            "state.tar",
+        ],
+    );
+    assert!(export.status.success(), "{}", stderr(&export));
+
+    // The live database is read, never recovered in place.
+    assert_eq!(
+        [fs::read(&database).unwrap(), fs::read(&journal).unwrap()],
+        before
+    );
+    let import = run_ocm(
+        root.path(),
+        &env,
+        &["env", "import", "state.tar", "--name", "target"],
+    );
+    assert!(import.status.success(), "{}", stderr(&import));
+    assert_eq!(
+        support::captured_records(&root.child("ocm-home/envs/target/proj/app.db")),
+        committed
+    );
+}
+
+#[test]
 fn env_export_import_retains_configured_agent_directories() {
     let root = TestDir::new("export-configured-agent-directories");
     let cwd = root.path();

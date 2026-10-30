@@ -1114,3 +1114,56 @@ pub fn stdout(output: &Output) -> String {
 pub fn stderr(output: &Output) -> String {
     String::from_utf8(output.stderr.clone()).unwrap()
 }
+
+/// Leaves `database` with a hot rollback journal over `committed0..committed299`
+/// in table `records`, as a writer killed mid-transaction does. Returns those
+/// committed values.
+pub fn plant_hot_journal(database: &Path) -> Vec<String> {
+    let scratch = tempfile::tempdir().unwrap();
+    let writer_path = scratch.path().join("writer.sqlite");
+    let writer = rusqlite::Connection::open(&writer_path).unwrap();
+    writer
+        .execute_batch(
+            "PRAGMA journal_mode=DELETE;
+             CREATE TABLE records(id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+             WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 299)
+             INSERT INTO records(value) SELECT 'committed' || i FROM n;
+             PRAGMA cache_size=5;
+             BEGIN;
+             UPDATE records SET value = value || printf('%.2000c', 'x');
+             INSERT INTO records(value) SELECT value FROM records;",
+        )
+        .unwrap();
+    let journal = format!("{}-journal", writer_path.display());
+    assert!(
+        Path::new(&journal).exists(),
+        "the writer did not spill its transaction"
+    );
+    fs::create_dir_all(database.parent().unwrap()).unwrap();
+    // Copies carry no locks, so the copied journal is hot.
+    fs::copy(&writer_path, database).unwrap();
+    fs::copy(&journal, format!("{}-journal", database.display())).unwrap();
+    (0..300).map(|i| format!("committed{i}")).collect()
+}
+
+/// The `records` values of a captured database that must have no sidecars.
+pub fn captured_records(database: &Path) -> Vec<String> {
+    for suffix in ["-journal", "-wal", "-shm"] {
+        let sidecar = format!("{}{suffix}", database.display());
+        assert!(!Path::new(&sidecar).exists(), "{sidecar}");
+    }
+    let db =
+        rusqlite::Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    assert_eq!(
+        db.query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+            .unwrap(),
+        "ok"
+    );
+    db.prepare("SELECT value FROM records ORDER BY id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
