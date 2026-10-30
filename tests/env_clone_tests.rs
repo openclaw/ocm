@@ -3845,6 +3845,9 @@ fn env_clone_refuses_a_separate_git_dir_checkout_outside_workspaces_like_import(
                 "user.email=fixture@example.invalid",
                 "-c",
                 "commit.gpgsign=false",
+                // Detached auto-maintenance would change the source snapshot.
+                "-c",
+                "maintenance.auto=false",
                 "commit",
                 "-qm",
                 "fixture",
