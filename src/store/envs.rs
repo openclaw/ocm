@@ -1826,7 +1826,10 @@ fn prepare_environment_root_removal(root: &Path) -> Result<(), String> {
         for entry in entries {
             let entry =
                 entry.map_err(|error| format!("could not read {}: {error}", display_path(&dir)))?;
-            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            let kind = entry.file_type().map_err(|error| {
+                format!("could not inspect {}: {error}", display_path(&entry.path()))
+            })?;
+            if kind.is_dir() {
                 pending.push(entry.path());
             }
         }

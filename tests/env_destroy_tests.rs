@@ -2478,3 +2478,53 @@ fn env_destroy_removes_read_only_directories_and_snapshots() {
     assert!(!env_root.exists());
     assert!(get_environment("cache", &env, cwd).is_err());
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn env_remove_reports_a_directory_it_cannot_make_writable_before_deleting_anything() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = TestDir::new("env-remove-locked-read-only-dir");
+    let cwd = root.path();
+    let env = ocm_env(&root);
+    let created = run_ocm(cwd, &env, &["env", "create", "locked"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    let env_root = PathBuf::from(get_environment("locked", &env, cwd).unwrap().root);
+    crate::support::write_text(&env_root.join(".openclaw/openclaw.json"), "{}\n");
+    crate::support::write_text(&env_root.join(".openclaw/workspace/notes.txt"), "notes\n");
+    // An immutable read-only directory cannot be made writable, even by its owner.
+    let locked = env_root.join(".openclaw/workspace/locked");
+    crate::support::write_text(&locked.join("kept.txt"), "kept\n");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+    let chflags = |flag: &str| {
+        let output = Command::new("chflags")
+            .arg(flag)
+            .arg(&locked)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+    };
+    chflags("uchg");
+
+    let removed = run_ocm(cwd, &env, &["env", "remove", "locked"]);
+    chflags("nouchg");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(!removed.status.success(), "{}", stdout(&removed));
+    let error = stderr(&removed);
+    assert!(
+        error.contains(&format!(
+            "cannot remove environment \"locked\": could not make {} writable",
+            path_string(&locked)
+        )),
+        "{error}"
+    );
+    assert!(error.contains("no files were removed"), "{error}");
+    assert!(get_environment("locked", &env, cwd).is_ok());
+    for (file, contents) in [
+        (".openclaw/openclaw.json", "{}\n"),
+        (".openclaw/workspace/notes.txt", "notes\n"),
+        (".openclaw/workspace/locked/kept.txt", "kept\n"),
+    ] {
+        assert_eq!(fs::read_to_string(env_root.join(file)).unwrap(), contents);
+    }
+}
