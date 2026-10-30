@@ -1979,6 +1979,115 @@ fn env_default_export_import_retains_shared_skills_and_clawhub_tracking() {
 
 #[cfg(unix)]
 #[test]
+fn env_default_export_leaves_out_sockets_and_fifos_and_imports() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::FileTypeExt;
+
+    let root = TestDir::new("default-export-special-files");
+    let env = ocm_env(&root);
+    let created = run_ocm(root.path(), &env, &["env", "create", "source"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    let source = root.child("ocm-home/envs/source");
+    write_text(
+        &source.join(".openclaw/workspace/notes.txt"),
+        "workspace notes",
+    );
+    write_text(&source.join("root-notes.txt"), "root notes");
+    let fifos = [
+        source.join(".openclaw/workspace/events.fifo"),
+        source.join("events.fifo"),
+    ];
+    for fifo in &fifos {
+        let fifo = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    }
+    let socket = source.join(".openclaw/workspace/.git/fsmonitor--daemon.ipc");
+    fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let _listener = {
+        // Keep the short socket path on the same filesystem as the source.
+        let short_root = tempfile::tempdir().unwrap();
+        let path = short_root.path().join("socket");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        fs::rename(path, &socket).unwrap();
+        (short_root, listener)
+    };
+
+    let archive = root.child("source.tar");
+    let exported = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "env",
+            "export",
+            "source",
+            "--output",
+            archive.to_str().unwrap(),
+        ],
+    );
+    assert!(exported.status.success(), "{}", stderr(&exported));
+    let mut reader = tar::Archive::new(fs::File::open(&archive).unwrap());
+    let mut members = Vec::new();
+    for entry in reader.entries().unwrap() {
+        let entry = entry.unwrap();
+        let kind = entry.header().entry_type();
+        assert!(
+            kind.is_file() || kind.is_dir() || kind.is_symlink(),
+            "{:?} archived as {kind:?}",
+            entry.path().unwrap()
+        );
+        members.push(entry.path().unwrap().into_owned());
+    }
+    for (member, present) in [
+        ("root/.openclaw/workspace/notes.txt", true),
+        ("root/root-notes.txt", true),
+        ("root/.openclaw/workspace/events.fifo", false),
+        ("root/events.fifo", false),
+        ("root/.openclaw/workspace/.git/fsmonitor--daemon.ipc", false),
+    ] {
+        assert_eq!(
+            members.contains(&std::path::PathBuf::from(member)),
+            present,
+            "{member}"
+        );
+    }
+
+    let imported = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "env",
+            "import",
+            archive.to_str().unwrap(),
+            "--name",
+            "target",
+        ],
+    );
+    assert!(imported.status.success(), "{}", stderr(&imported));
+    let target = root.child("ocm-home/envs/target");
+    assert_eq!(
+        fs::read_to_string(target.join(".openclaw/workspace/notes.txt")).unwrap(),
+        "workspace notes"
+    );
+    assert_eq!(
+        fs::read_to_string(target.join("root-notes.txt")).unwrap(),
+        "root notes"
+    );
+    assert!(!target.join(".openclaw/workspace/events.fifo").exists());
+    assert!(!target.join("events.fifo").exists());
+    for fifo in &fifos {
+        assert!(fs::symlink_metadata(fifo).unwrap().file_type().is_fifo());
+    }
+    assert!(
+        fs::symlink_metadata(&socket)
+            .unwrap()
+            .file_type()
+            .is_socket()
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn env_export_retains_agent_payload_under_equivalent_root_spellings() {
     let root = TestDir::new("export-agent-root-alias");
     let env = ocm_env(&root);
