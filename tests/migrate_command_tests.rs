@@ -4790,3 +4790,57 @@ fn migrate_and_adopt_refuse_a_gateway_port_in_a_shared_include() {
         );
     }
 }
+
+#[test]
+fn migrate_moves_a_port_include_and_keeps_an_inline_port_over_its_include() {
+    let root = TestDir::new("migrate-gateway-port-include-forms");
+    let env = ocm_env(&root);
+    let created = run_ocm(
+        root.path(),
+        &env,
+        &["env", "create", "occupied", "--port", "19100"],
+    );
+    assert!(created.status.success(), "{}", stderr(&created));
+    let cases = [
+        // The include supplies gateway.port itself.
+        (
+            "port-include",
+            "{\"gateway\":{\"port\":{\"$include\":\"./port.json\"}}}",
+            "port.json",
+            "19100",
+        ),
+        // The inline sibling overrides the include, so only openclaw.json moves.
+        (
+            "inline-sibling",
+            "{\"gateway\":{\"$include\":\"./gateway.json\",\"port\":19100}}",
+            "gateway.json",
+            "{\"port\":19100,\"bind\":\"loopback\"}",
+        ),
+    ];
+    for (name, config, include, contents) in cases {
+        let source = root.child(format!("source/{name}"));
+        support::write_text(&source.join("openclaw.json"), config);
+        support::write_text(&source.join(include), contents);
+        let imported = run_ocm(
+            root.path(),
+            &env,
+            &["migrate", name, source.to_str().unwrap()],
+        );
+        assert!(imported.status.success(), "{}", stderr(&imported));
+        let migrated = effective_gateway_port(&root, &env, name);
+        assert_ne!(migrated, 19_100, "{name}");
+        let state = root.child(format!("ocm-home/envs/{name}/.openclaw"));
+        let copied_include = fs::read_to_string(state.join(include)).unwrap();
+        let copied_config = serde_json::from_str::<serde_json::Value>(
+            &fs::read_to_string(state.join("openclaw.json")).unwrap(),
+        )
+        .unwrap();
+        if name == "port-include" {
+            assert_eq!(copied_include.trim(), migrated.to_string());
+        } else {
+            assert_eq!(copied_config["gateway"]["port"], migrated);
+            assert_eq!(copied_include, contents);
+        }
+        assert_eq!(fs::read_to_string(source.join(include)).unwrap(), contents);
+    }
+}

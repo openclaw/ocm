@@ -217,28 +217,12 @@ pub(crate) fn rewrite_openclaw_config_for_migration(
     if let Some(gateway_port) = gateway_port {
         rewrite_included_gateway_port(target_paths, gateway_port)?;
     }
-    let outcome = rewrite_openclaw_config_with_root_mapping(
+    rewrite_openclaw_config_with_root_mapping(
         target_paths,
         Some((source_state_root, target_paths.state_dir.as_path())),
         gateway_port,
         SandboxOriginPolicy::NewEnvironment(sandbox_origin),
-    )?;
-    if let Some(gateway_port) = gateway_port {
-        // The copy's port becomes the environment's effective port, so a
-        // port the rewrite could not move would share the source's Gateway.
-        let effective = load_effective_openclaw_config(&target_paths.config_path)?;
-        if let Some(port) = effective
-            .as_ref()
-            .and_then(|effective| read_gateway_port(&effective.value))
-            .filter(|port| *port != gateway_port)
-        {
-            return Err(format!(
-                "cannot give the new environment its own Gateway port: copied OpenClaw config {} still sets gateway.port {port}; set gateway.port as a number in openclaw.json or a config include before migration",
-                display_path(&target_paths.config_path)
-            ));
-        }
-    }
-    Ok(outcome)
+    )
 }
 
 /// Moves a Gateway port that a copied `$include` supplies to `gateway_port`,
