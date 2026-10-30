@@ -14,10 +14,11 @@ use sha2::{Digest, Sha256};
 
 use super::{Cli, render};
 use crate::env::{
-    CloneEnvironmentOptions, CreateEnvSnapshotOptions, CreateEnvironmentOptions, EnvMeta,
-    EnvSnapshotSummary, EnvSummary, ExportEnvironmentOptions, ImportEnvironmentOptions,
-    RemoveEnvSnapshotOptions, RestoreEnvSnapshotOptions, SourceWatchSession, SourceWatchState,
-    openclaw_command_words, openclaw_options, openclaw_root_option_tokens,
+    BlockedPruneCandidate, CloneEnvironmentOptions, CreateEnvSnapshotOptions,
+    CreateEnvironmentOptions, EnvMeta, EnvSnapshotSummary, EnvSummary, ExportEnvironmentOptions,
+    ImportEnvironmentOptions, RemoveEnvSnapshotOptions, RestoreEnvSnapshotOptions,
+    SourceWatchSession, SourceWatchState, openclaw_command_words, openclaw_options,
+    openclaw_root_option_tokens,
 };
 use crate::infra::process::{run_direct, run_shell};
 use crate::infra::process_identity::ProcessIdentity;
@@ -39,6 +40,27 @@ pub(crate) struct EnvDestroyStepSummary {
 }
 
 pub(crate) type EnvDestroyProcessIdentity = ProcessIdentity;
+
+/// A stale environment prune leaves in place because removal would refuse it.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BlockedPruneSummary {
+    #[serde(flatten)]
+    pub env: EnvSummary,
+    pub reason: String,
+}
+
+fn summarize_blocked_prune_candidates(
+    blocked: &[BlockedPruneCandidate],
+) -> Vec<BlockedPruneSummary> {
+    blocked
+        .iter()
+        .map(|candidate| BlockedPruneSummary {
+            env: summarize_env(&candidate.meta),
+            reason: candidate.reason.clone(),
+        })
+        .collect()
+}
 
 fn managed_gateway_lifecycle_action(args: &[String]) -> Option<&str> {
     let mut words = openclaw_command_words(args);
@@ -492,18 +514,21 @@ impl Cli {
             _ => 14,
         };
 
-        let candidates = self
-            .environment_service()
-            .prune_candidates(older_than_days)?;
-        let candidate_summaries = candidates.iter().map(summarize_env).collect::<Vec<_>>();
-
         if !yes {
+            let plan = self.environment_service().prune_plan(older_than_days)?;
+            let candidate_summaries = plan
+                .candidates
+                .iter()
+                .map(summarize_env)
+                .collect::<Vec<_>>();
+            let blocked = summarize_blocked_prune_candidates(&plan.blocked);
             if json_flag {
                 self.print_json(&serde_json::json!({
                     "apply": false,
                     "olderThanDays": older_than_days,
                     "count": candidate_summaries.len(),
                     "candidates": candidate_summaries,
+                    "blocked": blocked,
                 }))?;
                 return Ok(0);
             }
@@ -511,29 +536,48 @@ impl Cli {
             self.stdout_lines(render::env::env_prune_preview(
                 older_than_days,
                 &candidate_summaries,
+                &blocked,
                 profile,
             ));
             return Ok(0);
         }
 
-        let mut removed = Vec::<EnvSummary>::new();
-        let removed_meta = self.environment_service().prune(older_than_days)?;
-        for meta in removed_meta {
-            removed.push(summarize_env(&meta));
+        let result = self.environment_service().prune(older_than_days)?;
+        let removed = result.removed.iter().map(summarize_env).collect::<Vec<_>>();
+        let blocked = summarize_blocked_prune_candidates(&result.blocked);
+        // Without removals the stop is an ordinary failure; otherwise the
+        // caller must learn what is already gone before retrying.
+        if let Some(error) = &result.stopped
+            && removed.is_empty()
+        {
+            return Err(error.clone());
         }
 
         if json_flag {
-            self.print_json(&serde_json::json!({
+            let mut output = serde_json::json!({
                 "apply": true,
                 "olderThanDays": older_than_days,
                 "count": removed.len(),
                 "removed": removed,
-            }))?;
-            return Ok(0);
+                "blocked": blocked,
+            });
+            if let Some(error) = &result.stopped {
+                output["code"] = "partial_apply".into();
+                output["error"] = error.as_str().into();
+            }
+            self.print_json(&output)?;
+        } else {
+            self.stdout_lines(render::env::env_pruned(
+                &removed,
+                &blocked,
+                result.stopped.is_some(),
+                profile,
+            ));
+            if let Some(error) = &result.stopped {
+                self.stderr_line(format!("ocm: {error}"));
+            }
         }
-
-        self.stdout_lines(render::env::env_pruned(&removed, profile));
-        Ok(0)
+        Ok(if result.stopped.is_some() { 1 } else { 0 })
     }
 
     pub(super) fn handle_env_create(&self, args: Vec<String>) -> Result<i32, String> {

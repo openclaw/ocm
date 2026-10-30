@@ -13,6 +13,8 @@ use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 
 use crate::support::{TestDir, ocm_env, run_ocm, stderr, stdout};
+#[cfg(unix)]
+use crate::support::{install_fake_systemd_tools, path_string, write_executable_script};
 
 fn install_fake_openclaw_on_path(
     root: &TestDir,
@@ -2064,6 +2066,95 @@ fn adopt_import_preserves_history_and_logs_from_plain_openclaw_home() {
 
     let imported_state = root.child("ocm-home/envs/mira/.openclaw");
     assert_imported_plain_openclaw_home(&imported_state, &source_home);
+}
+
+#[cfg(unix)]
+#[test]
+fn migrated_launchers_run_openclaw_from_paths_that_need_shell_quoting() {
+    // The first two are controls: their launcher commands stay unquoted.
+    for (dir_name, import) in [
+        ("bin", "migrate"),
+        ("a#b~c=d%e^f!g", "adopt"),
+        ("my bin", "migrate"),
+        ("my bin", "adopt"),
+        ("o'brien", "migrate"),
+        ("a(b)&c;d$e#f", "adopt"),
+    ] {
+        let root = TestDir::new("migrate-quoted-launcher");
+        let cwd = root.child("workspace");
+        let source_home = root.child("legacy-home/.openclaw");
+        fs::create_dir_all(source_home.join("workspace")).unwrap();
+        fs::write(source_home.join("openclaw.json"), "{}\n").unwrap();
+        fs::create_dir_all(&cwd).unwrap();
+        let mut env = ocm_env(&root);
+        install_fake_systemd_tools(&root, &mut env);
+        let marker = root.child("openclaw-args.txt");
+        let openclaw = root.child(dir_name).join("openclaw");
+        write_executable_script(
+            &openclaw,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n",
+                path_string(&marker)
+            ),
+        );
+        let path = format!(
+            "{}:{}",
+            path_string(openclaw.parent().unwrap()),
+            env["PATH"]
+        );
+        env.insert("PATH".to_string(), path);
+        let case = format!("{import} from {dir_name:?}");
+
+        let source = source_home.to_string_lossy();
+        let args: Vec<&str> = if import == "migrate" {
+            vec!["migrate", "mira", source.as_ref(), "--json"]
+        } else {
+            vec![
+                "adopt",
+                "import",
+                "--name",
+                "mira",
+                source.as_ref(),
+                "--json",
+            ]
+        };
+        let imported = run_ocm(&cwd, &env, &args);
+        assert!(imported.status.success(), "{case}: {}", stderr(&imported));
+        assert!(
+            stdout(&imported).contains("\"defaultLauncher\": \"mira.migrated\""),
+            "{case}"
+        );
+        if matches!(dir_name, "bin" | "a#b~c=d%e^f!g") {
+            let shown = run_ocm(&cwd, &env, &["launcher", "show", "mira.migrated", "--json"]);
+            assert!(shown.status.success(), "{case}: {}", stderr(&shown));
+            let launcher: serde_json::Value = serde_json::from_str(&stdout(&shown)).unwrap();
+            assert_eq!(
+                launcher["command"],
+                serde_json::json!(path_string(&openclaw))
+            );
+        }
+
+        let ran = run_ocm(&cwd, &env, &["env", "run", "mira", "--", "status"]);
+        assert!(ran.status.success(), "{case}: {}", stderr(&ran));
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "status\n", "{case}");
+
+        let started = run_ocm(&cwd, &env, &["service", "start", "mira", "--json"]);
+        assert!(started.status.success(), "{case}: {}", stderr(&started));
+        let supervised = run_ocm(&cwd, &env, &["__daemon", "run", "--once", "--json"]);
+        assert!(
+            supervised.status.success(),
+            "{case}: {}",
+            stderr(&supervised)
+        );
+        let calls = fs::read_to_string(&marker).unwrap();
+        let mut lines = calls.lines().skip(1);
+        let gateway = lines.next().unwrap_or_default();
+        assert!(
+            gateway.starts_with("gateway run --port "),
+            "{case}: {calls}"
+        );
+        assert_eq!(lines.next(), None, "{case}: {calls}");
+    }
 }
 
 #[test]

@@ -400,6 +400,7 @@ Use `upgrade simulate` when you want to test what would happen against a publish
 - pinned runtimes stay pinned unless you pass `--version`, `--channel`, or `--runtime`
 - local-command environments are reported clearly instead of being changed behind your back
 - dev environments registered with `ocm dev` are reported as `dev-checkout` and left on their checkout; update that checkout outside OCM
+- under `upgrade --all`, environments without a runtime or launcher binding are reported as `unbound` and skipped; `ocm upgrade <env>` still refuses them until you bind one
 
 ### 8. Run OpenClaw without activating the shell first
 
@@ -643,7 +644,7 @@ ocm service list
 ocm service status mira
 ```
 
-Use `service install` when you want a background service for an environment that was created with `--no-service`, or when you want to bring an older env under background management later.
+Use `service install` when you want a background service for an environment that was created with `--no-service`, or when you want to bring an older env under background management later. Install enables the environment without starting it; running it again for an environment whose service is already running keeps that Gateway running.
 
 On Linux, OCM writes its user-service unit under `$XDG_CONFIG_HOME/systemd/user`
 when `XDG_CONFIG_HOME` is an absolute path. An unset, empty, or relative value
@@ -1071,7 +1072,7 @@ ocm upgrade --all
 ```
 
 This updates channel-tracked environments and restarts their running services when needed.
-Pinned, manual-runtime, local-command and `ocm dev` environments are reported as skipped and left unchanged.
+Pinned, manual-runtime, local-command, `ocm dev` and unbound environments are reported as skipped and left unchanged.
 
 ### Move a pinned or local env to a different published release
 
@@ -1794,6 +1795,11 @@ underlying error; preview and apply preserve that binding. Restore access or rep
 the metadata, then rerun doctor. Restoring valid metadata allows execution to
 recover without rebinding. `--all` applies the same rule.
 
+Config repair moves paths under another registered environment's root into this environment's root.
+Without a registered owner, it maps only paths inside another `.openclaw` directory onto this environment's `.openclaw` directory and leaves other paths unchanged.
+Paths in your own `~/.openclaw` are references to your existing OpenClaw home, so doctor does not report them as copied paths and config repair leaves them unchanged.
+The default workspace setting is checked separately: when `agents.defaults.workspace` points at a `.openclaw/workspace` directory outside the environment, including `~/.openclaw/workspace`, doctor reports it and cleanup resets it to the environment's own workspace.
+
 Runtime-state cleanup preserves configured agent directories inside the environment, including their authentication and state files beneath generated plugin dependencies.
 It also retains shared managed skills under `.openclaw/skills` and their global ClawHub tracking metadata under `.openclaw/.clawhub`.
 A runtime-state reset is planned only when a session transcript under `.openclaw/agents/<id>/sessions` records, in its header, a working directory under another environment's root or another `.openclaw` directory, as state copied from elsewhere does.
@@ -1845,6 +1851,20 @@ Prune skips protected environments and environments whose background service is
 set to run, such as those started with `ocm start`, because their Gateway is in
 use without any of those commands. Run `ocm service stop <env>` first to make one
 eligible again, or use `ocm env destroy` to remove it with its service.
+
+The preview lists, under blocked, each old environment that removal would refuse
+for a condition that already exists, with removal's reason: an active or unfinished
+source watch, or cleanup that would affect another environment's registered dev
+source or an active temporary dev source. `--yes` leaves those environments in
+place and still removes the other candidates. Run `ocm dev stop <env>` or remove
+the dependent dev environment, then prune again. JSON output lists them in
+`blocked`, each with the environment summary and `reason`; `count` covers only
+`candidates` or `removed`.
+
+If apply stops on an error after removing some environments, for example because
+an environment changed after the preview, it still prints the environments it
+removed and exits 1. JSON output adds `"code": "partial_apply"` and the `error`.
+Prune again after addressing the error; environments already removed are gone.
 
 The service output the supervisor captured for a removed environment,
 `$OCM_HOME/supervisor/logs/<env>.stdout.log` and `<env>.stderr.log`, stays in

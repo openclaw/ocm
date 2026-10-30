@@ -116,6 +116,15 @@ impl Transaction {
         Self::lock(root, OpenOptions::new(), wait)
     }
 
+    /// Opens the journal only when it already exists, so a run that changes
+    /// nothing needs no write access beside the executable.
+    pub(super) fn open_existing(binary: &Path) -> Result<Option<Self>, String> {
+        match fs::symlink_metadata(transaction_root(binary)?) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            _ => Self::open(binary, false).map(Some),
+        }
+    }
+
     fn lock(root: PathBuf, mut options: OpenOptions, wait: bool) -> Result<Self, String> {
         let file = options
             .read(true)

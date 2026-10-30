@@ -900,18 +900,25 @@ pub(crate) fn protected_dev_source_footprints<'a>(
     service: &crate::env::EnvironmentService<'_>,
 ) -> Result<Vec<(&'a EnvMeta, SourceFootprint)>, String> {
     let mut footprints = Vec::new();
-    for meta in envs.iter().filter(|meta| {
-        meta.name != target.name
-            || meta
-                .dev
-                .as_ref()
-                .is_some_and(|dev| dev.borrowed_source_root().is_some())
-    }) {
+    for meta in envs
+        .iter()
+        .filter(|meta| source_constrains_removal(meta, target))
+    {
         if let Some(footprint) = protected_dev_source_footprint(meta, envs, service)? {
             footprints.push((meta, footprint));
         }
     }
     Ok(footprints)
+}
+
+// Removing an environment retires its own owned source with it; a borrowed
+// source outlives the environment, so its footprint still applies.
+fn source_constrains_removal(owner: &EnvMeta, target: &EnvMeta) -> bool {
+    owner.name != target.name
+        || owner
+            .dev
+            .as_ref()
+            .is_some_and(|dev| dev.borrowed_source_root().is_some())
 }
 
 pub(crate) fn ensure_environment_removal_preserves_dev_sources(
@@ -920,16 +927,67 @@ pub(crate) fn ensure_environment_removal_preserves_dev_sources(
     service: &crate::env::EnvironmentService<'_>,
 ) -> Result<(), String> {
     let footprints = protected_dev_source_footprints(target, envs, service)?;
-    if footprints.is_empty() {
+    ensure_removal_preserves_footprints(
+        target,
+        footprints
+            .iter()
+            .map(|(owner, footprint)| (*owner, footprint)),
+    )
+}
+
+fn ensure_removal_preserves_footprints<'f>(
+    target: &EnvMeta,
+    footprints: impl IntoIterator<Item = (&'f EnvMeta, &'f SourceFootprint)>,
+) -> Result<(), String> {
+    let mut footprints = footprints.into_iter().peekable();
+    if footprints.peek().is_none() {
         return Ok(());
     }
     let removal = DevSourceRemoval::environment(target)?;
     for (owner, footprint) in footprints {
-        if let Some(path) = removal.affected_path(&footprint)? {
+        if let Some(path) = removal.affected_path(footprint)? {
             return Err(source_removal_error(&target.name, owner, path));
         }
     }
     Ok(())
+}
+
+/// Every environment's protected dev source footprint, inspected once so many
+/// removals can be checked against the same registry, as prune's plan does.
+/// An inspection error is kept and returned only to the removals it constrains,
+/// matching `ensure_environment_removal_preserves_dev_sources`.
+pub(crate) struct DevSourceFootprints<'a> {
+    footprints: Vec<(&'a EnvMeta, Result<Option<SourceFootprint>, String>)>,
+}
+
+impl<'a> DevSourceFootprints<'a> {
+    pub(crate) fn inspect(
+        envs: &'a [EnvMeta],
+        service: &crate::env::EnvironmentService<'_>,
+    ) -> Self {
+        Self {
+            footprints: envs
+                .iter()
+                .map(|meta| (meta, protected_dev_source_footprint(meta, envs, service)))
+                .collect(),
+        }
+    }
+
+    pub(crate) fn ensure_environment_removal_preserves(
+        &self,
+        target: &EnvMeta,
+    ) -> Result<(), String> {
+        let mut constraining = Vec::new();
+        for (owner, footprint) in &self.footprints {
+            if !source_constrains_removal(owner, target) {
+                continue;
+            }
+            if let Some(footprint) = footprint.as_ref().map_err(Clone::clone)? {
+                constraining.push((*owner, footprint));
+            }
+        }
+        ensure_removal_preserves_footprints(target, constraining)
+    }
 }
 
 pub(crate) fn ensure_runtime_cleanup_preserves_dev_sources(

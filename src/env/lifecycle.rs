@@ -296,6 +296,28 @@ pub(crate) struct ImportEnvironmentResult {
     pub sandbox_port: Option<u32>,
 }
 
+/// A stale environment that removal would refuse, with removal's reason.
+#[derive(Clone, Debug)]
+pub struct BlockedPruneCandidate {
+    pub meta: EnvMeta,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PrunePlan {
+    pub candidates: Vec<EnvMeta>,
+    pub blocked: Vec<BlockedPruneCandidate>,
+}
+
+/// What an applied prune did. `stopped` holds the error that ended it after
+/// the environments in `removed` were already gone.
+#[derive(Clone, Debug)]
+pub struct PruneResult {
+    pub removed: Vec<EnvMeta>,
+    pub blocked: Vec<BlockedPruneCandidate>,
+    pub stopped: Option<String>,
+}
+
 /// The background service keeps this environment's Gateway running, so the
 /// environment is in use even when no command has recorded a use.
 fn service_keeps_gateway_running(meta: &EnvMeta) -> bool {
@@ -579,35 +601,94 @@ impl<'a> EnvironmentService<'a> {
         })
     }
 
-    pub fn prune_candidates(&self, older_than_days: i64) -> Result<Vec<EnvMeta>, String> {
-        let envs = list_environments(self.env, self.cwd)?;
-        let candidates = select_prune_candidates(&envs, older_than_days)?;
-        for candidate in &candidates {
-            crate::store::ensure_environment_removal_preserves_registered_roots(candidate, &envs)?;
+    /// Splits the stale environments into those removal accepts and those it
+    /// would refuse for a condition that already exists, so the preview and
+    /// apply agree. Blockers are judged against the current registry, which
+    /// keeps the result independent of the order candidates are removed in.
+    pub fn prune_plan(&self, older_than_days: i64) -> Result<PrunePlan, String> {
+        let mut checked = crate::store::with_locked_environments(self.env, self.cwd, |envs| {
+            let selected = select_prune_candidates(envs, older_than_days)?;
+            for candidate in &selected {
+                crate::store::ensure_environment_removal_preserves_registered_roots(
+                    candidate, envs,
+                )?;
+            }
+            if selected.is_empty() {
+                return Ok(Vec::new());
+            }
+            let footprints = crate::store::DevSourceFootprints::inspect(envs, self);
+            Ok(selected
+                .into_iter()
+                .map(|candidate| {
+                    let blocker = footprints
+                        .ensure_environment_removal_preserves(&candidate)
+                        .err();
+                    (candidate, blocker)
+                })
+                .collect::<Vec<_>>())
+        })?;
+        // Removal checks the watch before taking the registry lock; keep that order.
+        for (candidate, blocker) in &mut checked {
+            if blocker.is_none() {
+                *blocker = self.ensure_source_watch_stopped(&candidate.name).err();
+            }
         }
-        Ok(candidates)
+        let mut plan = PrunePlan::default();
+        for (meta, blocker) in checked {
+            match blocker {
+                Some(reason) => plan.blocked.push(BlockedPruneCandidate { meta, reason }),
+                None => plan.candidates.push(meta),
+            }
+        }
+        Ok(plan)
     }
 
-    pub fn prune(&self, older_than_days: i64) -> Result<Vec<EnvMeta>, String> {
+    pub fn prune(&self, older_than_days: i64) -> Result<PruneResult, String> {
         let cutoff = prune_cutoff(older_than_days)?;
-        let candidates = self.prune_candidates(older_than_days)?;
-        let mut removed = Vec::with_capacity(candidates.len());
-        for meta in candidates {
-            let _lock = self.lock_operation(&meta.name)?;
-            let current = self.get(&meta.name)?;
-            // Waiting for an earlier candidate can outlive use, replacement or
-            // a service start for this name. Service commands take this lock,
-            // so admission and removal see the same policy.
-            if current.root != meta.root
-                || current.created_at != meta.created_at
-                || current.last_used_at.unwrap_or(current.created_at) >= cutoff
-                || service_keeps_gateway_running(&current)
-            {
-                continue;
+        let plan = self.prune_plan(older_than_days)?;
+        let mut result = PruneResult {
+            removed: Vec::with_capacity(plan.candidates.len()),
+            blocked: plan.blocked,
+            stopped: None,
+        };
+        for meta in plan.candidates {
+            if let Err(error) = self.prune_candidate(&meta, cutoff, &mut result.removed) {
+                result.stopped = Some(error);
+                break;
             }
-            removed.push(self.remove_locked(&meta.name, false)?);
         }
-        Ok(removed)
+        Ok(result)
+    }
+
+    fn prune_candidate(
+        &self,
+        meta: &EnvMeta,
+        cutoff: OffsetDateTime,
+        removed: &mut Vec<EnvMeta>,
+    ) -> Result<(), String> {
+        let _lock = self.lock_operation(&meta.name)?;
+        let current = self.get(&meta.name)?;
+        // Waiting for an earlier candidate can outlive use, replacement or
+        // a service start for this name. Service commands take this lock,
+        // so admission and removal see the same policy.
+        if current.root != meta.root
+            || current.created_at != meta.created_at
+            || current.last_used_at.unwrap_or(current.created_at) >= cutoff
+            || service_keeps_gateway_running(&current)
+        {
+            return Ok(());
+        }
+        // Record the removal before the supervisor sync, which can still fail
+        // after the environment is gone.
+        removed.push(remove_environment_locked(
+            &meta.name,
+            false,
+            self.env,
+            self.cwd,
+            |_| Ok(()),
+        )?);
+        sync_supervisor_env_if_present(self.env, self.cwd, &meta.name)?;
+        Ok(())
     }
 
     pub(crate) fn resolve_effective_gateway_port(

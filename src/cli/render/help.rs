@@ -739,6 +739,7 @@ pub fn upgrade_help(cmd: &str) -> String {
             "Pinned runtimes stay pinned unless you pass --version, --channel, or --runtime explicitly.",
             "Opaque or unsupported local-command environments are reported without attempting an update.",
             "Dev environments run their checkout and are reported as dev-checkout without an update; update that checkout outside ocm.",
+            "With --all, envs without a runtime or launcher binding are reported as unbound and skipped; naming one still requires a binding.",
         ],
     )
 }
@@ -1738,8 +1739,8 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
             &[
                 "An environment is unused when no env use, exec or run has touched it within the threshold. Protected environments and environments whose background service is set to run are skipped; run service stop first, or use env destroy to remove an environment with its service.",
                 "Legacy roots or owned worktree cleanup containing another registered environment or its required links block preview and apply. Remove that environment separately first.",
-                "Active or unfinished source watches block removal; run dev stop for those envs first.",
-                "Cleanup preserves registered and active temporary dev sources and their required Git metadata.",
+                "An environment with an active or unfinished source watch, or whose cleanup would affect a registered or active temporary dev source and its required Git metadata, is listed as blocked with the reason and left in place; the other candidates are still removed. Run dev stop or remove the dependent dev env, then prune again.",
+                "If apply stops on an error after removing environments, it lists those removals and exits 1.",
             ],
         ),
         "snapshot" => env_snapshot_help(cmd),
@@ -2343,7 +2344,7 @@ pub fn service_command_help(cmd: &str, action: &str) -> Option<String> {
     Some(match action {
         "install" => render_leaf(
             "Enable an env in the OCM background service",
-            "Enable one env in the shared OCM background service without marking it as running yet.",
+            "Enable one env in the shared OCM background service. A stopped env stays stopped; an env whose service is already running keeps running.",
             vec![format!("{cmd} service install <env> [--raw] [--json]")],
             &[
                 (

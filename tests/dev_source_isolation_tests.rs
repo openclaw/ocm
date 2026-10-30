@@ -458,6 +458,84 @@ fn borrowed_state_roots_cannot_overlap_the_source_or_its_git_metadata() {
 }
 
 #[test]
+fn prune_reports_dev_source_donors_as_blocked_and_removes_the_rest() {
+    // The same stale set must prune the same way whichever name sorts first.
+    for (owner_name, borrower_name) in [("z-owner", "a-borrower"), ("a-owner", "z-borrower")] {
+        let fixture = TestDir::new(&format!("prune-dev-source-{owner_name}"));
+        let cwd = fixture.path();
+        let env = ocm_env(&fixture);
+        let plain_root = fixture.child("plain-env");
+        let owner_root = fixture.child("owner-env");
+        create("m-plain", Some(&plain_root), None, &env, cwd).unwrap();
+        create(owner_name, Some(&owner_root), None, &env, cwd).unwrap();
+        let donor = init_checkout(&owner_root.join("checkout"));
+        let source = fixture.child("borrowed-source");
+        git(
+            cwd,
+            &[
+                "clone",
+                "--shared",
+                &path_string(&donor),
+                &path_string(&source),
+            ],
+        );
+        let source = fs::canonicalize(source).unwrap();
+        create(borrower_name, None, Some(borrowed(&source)), &env, cwd).unwrap();
+        for name in ["m-plain", owner_name, borrower_name] {
+            let mut aged = ocm::store::get_environment(name, &env, cwd).unwrap();
+            aged.created_at -= time::Duration::days(30);
+            save_environment(aged, &env, cwd).unwrap();
+        }
+        let names = |value: &serde_json::Value| -> Vec<String> {
+            value
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let mut removable = vec![borrower_name, "m-plain"];
+        removable.sort();
+
+        let preview = run_ocm(cwd, &env, &["env", "prune", "--json"]);
+        assert!(preview.status.success(), "{}", stderr(&preview));
+        let preview: serde_json::Value = serde_json::from_str(&stdout(&preview)).unwrap();
+        assert_eq!(names(&preview["candidates"]), removable);
+        assert_eq!(preview["count"], 2);
+        assert_eq!(names(&preview["blocked"]), [owner_name]);
+        let reason = preview["blocked"][0]["reason"].as_str().unwrap();
+        assert!(
+            reason.contains(&format!("registered dev source for env {borrower_name}")),
+            "{reason}"
+        );
+        let text = run_ocm(cwd, &env, &["env", "prune", "--raw"]);
+        assert!(text.status.success(), "{}", stderr(&text));
+        assert!(stdout(&text).contains("Prune preview (14d): 2 candidate(s)"));
+        assert!(stdout(&text).contains("Blocked 1 environment(s):"));
+        assert!(stdout(&text).contains(reason), "{}", stdout(&text));
+
+        let applied = run_ocm(cwd, &env, &["env", "prune", "--yes", "--json"]);
+        assert!(applied.status.success(), "{}", stderr(&applied));
+        let applied: serde_json::Value = serde_json::from_str(&stdout(&applied)).unwrap();
+        assert_eq!(names(&applied["removed"]), removable);
+        assert_eq!(names(&applied["blocked"]), [owner_name]);
+        assert!(applied.get("code").is_none());
+        assert!(!plain_root.exists());
+        assert!(ocm::store::get_environment(owner_name, &env, cwd).is_ok());
+        assert!(owner_root.exists());
+        assert_eq!(git(&source, &["cat-file", "-t", "HEAD"]), "commit");
+
+        // With its borrower gone, the donor is an ordinary candidate again.
+        let applied = run_ocm(cwd, &env, &["env", "prune", "--yes", "--json"]);
+        assert!(applied.status.success(), "{}", stderr(&applied));
+        let applied: serde_json::Value = serde_json::from_str(&stdout(&applied)).unwrap();
+        assert_eq!(names(&applied["removed"]), [owner_name]);
+        assert!(names(&applied["blocked"]).is_empty());
+        assert!(!owner_root.exists());
+    }
+}
+
+#[test]
 fn removal_preserves_shared_git_objects_but_allows_independent_clones() {
     for mode in [
         "shared",

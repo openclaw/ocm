@@ -55,7 +55,7 @@ pub(crate) struct MigrateHomeResult {
 #[derive(Clone, Debug)]
 struct MigratedLauncherSpec {
     name: String,
-    command_path: String,
+    command: String,
     needs_creation: bool,
 }
 
@@ -610,7 +610,7 @@ fn complete_migration_import(
     let created_launcher = if launcher.needs_creation {
         launcher_service.add(AddLauncherOptions {
             name: launcher.name.clone(),
-            command: launcher.command_path.clone(),
+            command: launcher.command.clone(),
             cwd: None,
             description: Some(format!(
                 "Imported plain OpenClaw command for env {}",
@@ -889,28 +889,48 @@ fn preflight_migrated_launcher(
     let Some(command_path) = resolve_executable_on_path("openclaw", env) else {
         return Ok(None);
     };
+    let command = migrated_launcher_command(command_path);
 
     let launcher_name = format!("{env_name}.migrated");
     match LauncherService::new(env, cwd).show(&launcher_name) {
         Ok(existing) => {
-            if existing.command != command_path || existing.cwd.is_some() {
+            if existing.command != command || existing.cwd.is_some() {
                 Err(format!(
                     "launcher \"{launcher_name}\" already exists with different settings; choose another env name or remove the conflicting launcher"
                 ))
             } else {
                 Ok(Some(MigratedLauncherSpec {
                     name: launcher_name,
-                    command_path,
+                    command,
                     needs_creation: false,
                 }))
             }
         }
         Err(error) if error.contains("does not exist") => Ok(Some(MigratedLauncherSpec {
             name: launcher_name,
-            command_path,
+            command,
             needs_creation: true,
         })),
         Err(error) => Err(error),
+    }
+}
+
+/// Launcher commands are shell recipes, so quote a discovered path that the
+/// shell would not read as one literal word. Other paths stay unquoted, which
+/// keeps matching launchers that earlier migrations stored for them. Windows
+/// recipes run through `cmd`, whose quoting differs, so they keep the path as found.
+fn migrated_launcher_command(command_path: String) -> String {
+    // These are literal inside a word that starts with `/`, but not at its start.
+    let absolute = command_path.starts_with('/');
+    let plain = command_path.chars().all(|ch| {
+        ch.is_alphanumeric()
+            || matches!(ch, '/' | '.' | '_' | '-' | '+' | ',' | ':' | '@')
+            || (absolute && matches!(ch, '#' | '~' | '=' | '%' | '^' | '!'))
+    });
+    if cfg!(windows) || plain {
+        command_path
+    } else {
+        crate::infra::shell::quote_posix(&command_path)
     }
 }
 
@@ -1422,5 +1442,81 @@ mod tests {
         assert!(!root.join("ocm-home/envs/mira").exists());
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migrate_plain_openclaw_home_reuses_an_identical_migrated_launcher() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Paths the shell reads as one word keep the unquoted command earlier
+        // migrations stored; other paths are matched in their quoted form.
+        for (index, (dir_name, quoted)) in [("bin", false), ("a#b~c", false), ("my bin", true)]
+            .into_iter()
+            .enumerate()
+        {
+            let root = std::env::temp_dir().join(format!(
+                "ocm-migrate-tests-launcher-reuse-{}-{index}",
+                std::process::id()
+            ));
+            let cwd = root.join("cwd");
+            let source_home = root.join("legacy-home");
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(source_home.join("workspace")).unwrap();
+            fs::create_dir_all(&cwd).unwrap();
+            fs::write(source_home.join("openclaw.json"), "{}\n").unwrap();
+            let bin_dir = root.join(dir_name);
+            fs::create_dir_all(&bin_dir).unwrap();
+            let openclaw = bin_dir.join("openclaw");
+            fs::write(&openclaw, "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(&openclaw, fs::Permissions::from_mode(0o755)).unwrap();
+
+            let mut env = BTreeMap::new();
+            env.insert("HOME".to_string(), root.join("home").display().to_string());
+            env.insert(
+                "OCM_HOME".to_string(),
+                root.join("ocm-home").display().to_string(),
+            );
+            env.insert("PATH".to_string(), bin_dir.display().to_string());
+
+            let openclaw_path = openclaw.display().to_string();
+            let command = if quoted {
+                crate::infra::shell::quote_posix(&openclaw_path)
+            } else {
+                openclaw_path
+            };
+            LauncherService::new(&env, &cwd)
+                .add(AddLauncherOptions {
+                    name: "mira.migrated".to_string(),
+                    command: command.clone(),
+                    cwd: None,
+                    description: Some("kept".to_string()),
+                })
+                .unwrap();
+
+            let result = migrate_plain_openclaw_home(
+                MigrateHomeOptions {
+                    source_home: Some(source_home.display().to_string()),
+                    name: "mira".to_string(),
+                    root: None,
+                },
+                &env,
+                &cwd,
+            )
+            .unwrap();
+
+            assert_eq!(
+                result.default_launcher.as_deref(),
+                Some("mira.migrated"),
+                "{dir_name}"
+            );
+            let launcher = LauncherService::new(&env, &cwd)
+                .show("mira.migrated")
+                .unwrap();
+            assert_eq!(launcher.command, command, "{dir_name}");
+            assert_eq!(launcher.description.as_deref(), Some("kept"), "{dir_name}");
+
+            let _ = fs::remove_dir_all(&root);
+        }
     }
 }

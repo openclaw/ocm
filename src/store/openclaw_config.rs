@@ -13,7 +13,7 @@ use crate::env::EnvMeta;
 
 use super::common::{ensure_dir, path_exists, write_file_replacing_path};
 use super::gateway_ports::read_port_number;
-use super::layout::{EnvPaths, clean_path, derive_env_paths, display_path};
+use super::layout::{EnvPaths, clean_path, derive_env_paths, display_path, resolve_user_home};
 use super::openclaw_workspaces::{
     OpenClawConfigReadContext, OpenClawConfigReadError, OpenClawWorkspaceInventory,
     OpenClawWorkspaceRuntime, load_effective_openclaw_config, read_openclaw_config_field,
@@ -28,7 +28,8 @@ mod macos_privacy_tests;
 pub(crate) struct OpenClawConfigAudit {
     pub status: String,
     pub issues: Vec<String>,
-    pub repair_source_root: Option<PathBuf>,
+    /// Config paths under the first root move to the same suffix under the second.
+    pub repair_root_rewrite: Option<(PathBuf, PathBuf)>,
     pub repair_workspace: bool,
     pub repair_gateway_port: bool,
 }
@@ -39,13 +40,17 @@ pub(crate) struct OpenClawConfigRewriteOutcome {
     pub sandbox_port: Option<u32>,
 }
 
-pub(crate) fn audit_openclaw_config(meta: &EnvMeta, known_envs: &[EnvMeta]) -> OpenClawConfigAudit {
+pub(crate) fn audit_openclaw_config(
+    meta: &EnvMeta,
+    known_envs: &[EnvMeta],
+    env: &BTreeMap<String, String>,
+) -> OpenClawConfigAudit {
     let paths = derive_env_paths(Path::new(&meta.root));
     if !path_exists(&paths.config_path) {
         return OpenClawConfigAudit {
             status: "absent".to_string(),
             issues: Vec::new(),
-            repair_source_root: None,
+            repair_root_rewrite: None,
             repair_workspace: false,
             repair_gateway_port: false,
         };
@@ -60,7 +65,7 @@ pub(crate) fn audit_openclaw_config(meta: &EnvMeta, known_envs: &[EnvMeta]) -> O
                     "OpenClaw config is unreadable: {} ({error})",
                     display_path(&paths.config_path)
                 )],
-                repair_source_root: None,
+                repair_root_rewrite: None,
                 repair_workspace: false,
                 repair_gateway_port: false,
             };
@@ -76,14 +81,20 @@ pub(crate) fn audit_openclaw_config(meta: &EnvMeta, known_envs: &[EnvMeta]) -> O
                     "OpenClaw config is invalid JSON/JSON5: {} ({error})",
                     display_path(&paths.config_path)
                 )],
-                repair_source_root: None,
+                repair_root_rewrite: None,
                 repair_workspace: false,
                 repair_gateway_port: false,
             };
         }
     };
 
-    audit_openclaw_config_value(meta, known_envs, &paths, &value)
+    audit_openclaw_config_value(
+        meta,
+        known_envs,
+        &paths,
+        &value,
+        &clean_path(&resolve_user_home(env)),
+    )
 }
 
 pub(crate) struct OpenClawConfigRepair {
@@ -100,20 +111,27 @@ impl OpenClawConfigRepair {
 pub(crate) fn prepare_openclaw_config_repair(
     meta: &EnvMeta,
     known_envs: &[EnvMeta],
+    env: &BTreeMap<String, String>,
 ) -> Result<Option<OpenClawConfigRepair>, String> {
     let paths = derive_env_paths(Path::new(&meta.root));
     let Some(mut value) = read_config_value(&paths.config_path)? else {
         return Ok(None);
     };
 
-    let audit = audit_openclaw_config_value(meta, known_envs, &paths, &value);
+    let audit = audit_openclaw_config_value(
+        meta,
+        known_envs,
+        &paths,
+        &value,
+        &clean_path(&resolve_user_home(env)),
+    );
     if audit.status != "drifted" {
         return Ok(None);
     }
 
     let mut changed = false;
-    if let Some(source_root) = audit.repair_source_root.as_deref() {
-        changed |= rewrite_env_root_paths(&mut value, source_root, &paths.root);
+    if let Some((source_root, target_root)) = audit.repair_root_rewrite.as_ref() {
+        changed |= rewrite_env_root_paths(&mut value, source_root, target_root);
     }
     if audit.repair_workspace && workspace_field_needs_repair(&value, &paths.root) {
         changed |= rewrite_workspace_field(&mut value, &paths.workspace_dir);
@@ -1496,10 +1514,11 @@ fn audit_openclaw_config_value(
     known_envs: &[EnvMeta],
     paths: &EnvPaths,
     value: &Value,
+    user_home: &Path,
 ) -> OpenClawConfigAudit {
     let mut issues = Vec::new();
     let foreign_roots = collect_foreign_env_roots(meta, known_envs, value);
-    let inferred_roots = collect_inferred_foreign_env_roots(&paths.root, value);
+    let inferred_roots = collect_inferred_foreign_env_roots(&paths.root, user_home, value);
     let known_roots = foreign_roots
         .values()
         .map(|(root, _)| root.clone())
@@ -1561,10 +1580,21 @@ fn audit_openclaw_config_value(
         );
     }
 
-    let mut repair_roots = known_roots;
-    repair_roots.extend(inferred_roots.keys().cloned());
-    let repair_source_root = if repair_roots.len() == 1 {
-        repair_roots.into_iter().next()
+    // A registered root is known to be an environment, so its whole tree moves.
+    // An inferred root is only evidenced by its OpenClaw state directory, and
+    // only that directory maps onto this environment's state directory.
+    let mut repair_rewrites = known_roots
+        .iter()
+        .map(|root| (root.clone(), paths.root.clone()))
+        .collect::<BTreeSet<_>>();
+    repair_rewrites.extend(
+        inferred_roots
+            .keys()
+            .filter(|root| !known_roots.contains(*root))
+            .map(|root| (root.join(".openclaw"), paths.state_dir.clone())),
+    );
+    let repair_root_rewrite = if repair_rewrites.len() == 1 {
+        repair_rewrites.into_iter().next()
     } else {
         None
     };
@@ -1573,7 +1603,7 @@ fn audit_openclaw_config_value(
     OpenClawConfigAudit {
         status,
         issues,
-        repair_source_root,
+        repair_root_rewrite,
         repair_workspace,
         repair_gateway_port,
     }
@@ -1834,10 +1864,11 @@ fn collect_foreign_env_roots(
 
 fn collect_inferred_foreign_env_roots(
     current_root: &Path,
+    user_home: &Path,
     value: &Value,
 ) -> BTreeMap<PathBuf, usize> {
     let mut refs = BTreeMap::<PathBuf, usize>::new();
-    collect_inferred_foreign_env_roots_inner(current_root, value, &mut refs);
+    collect_inferred_foreign_env_roots_inner(current_root, user_home, value, &mut refs);
     refs
 }
 
@@ -1875,25 +1906,26 @@ fn collect_foreign_env_roots_inner(
 
 fn collect_inferred_foreign_env_roots_inner(
     current_root: &Path,
+    user_home: &Path,
     value: &Value,
     refs: &mut BTreeMap<PathBuf, usize>,
 ) {
     match value {
         Value::String(raw) => {
             let path = Path::new(raw);
-            let Some(env_root) = inferred_foreign_env_root(current_root, path) else {
+            let Some(env_root) = inferred_foreign_env_root(current_root, user_home, path) else {
                 return;
             };
             *refs.entry(env_root).or_insert(0) += 1;
         }
         Value::Array(values) => {
             for nested in values {
-                collect_inferred_foreign_env_roots_inner(current_root, nested, refs);
+                collect_inferred_foreign_env_roots_inner(current_root, user_home, nested, refs);
             }
         }
         Value::Object(values) => {
             for nested in values.values() {
-                collect_inferred_foreign_env_roots_inner(current_root, nested, refs);
+                collect_inferred_foreign_env_roots_inner(current_root, user_home, nested, refs);
             }
         }
         _ => {}
@@ -1921,7 +1953,11 @@ fn matching_foreign_env_root(
     None
 }
 
-fn inferred_foreign_env_root(current_root: &Path, path: &Path) -> Option<PathBuf> {
+fn inferred_foreign_env_root(
+    current_root: &Path,
+    user_home: &Path,
+    path: &Path,
+) -> Option<PathBuf> {
     if !path.is_absolute() {
         return None;
     }
@@ -1937,7 +1973,13 @@ fn inferred_foreign_env_root(current_root: &Path, path: &Path) -> Option<PathBuf
             if prefix.as_os_str().is_empty() {
                 return None;
             }
-            return Some(clean_path(&prefix));
+            let prefix = clean_path(&prefix);
+            // Paths in the user's own OpenClaw home point at live data, not at
+            // a copied environment root.
+            if prefix == user_home {
+                return None;
+            }
+            return Some(prefix);
         }
         prefix.push(component.as_os_str());
     }
@@ -3117,9 +3159,20 @@ mod tests {
         let current_root = Path::new("/tmp/ocm/envs/target");
         let inferred = inferred_foreign_env_root(
             current_root,
+            Path::new("/home/user"),
             Path::new("/tmp/ocm/envs/source/.openclaw/workspace/notes.txt"),
         );
         assert_eq!(inferred, Some(PathBuf::from("/tmp/ocm/envs/source")));
+    }
+
+    #[test]
+    fn inferred_foreign_env_root_ignores_the_users_openclaw_home() {
+        let inferred = inferred_foreign_env_root(
+            Path::new("/home/user/.ocm/envs/target"),
+            Path::new("/home/user"),
+            Path::new("/home/user/.openclaw/skills"),
+        );
+        assert_eq!(inferred, None);
     }
 
     #[test]
@@ -3140,11 +3193,15 @@ mod tests {
             }
         });
 
-        let audit = audit_openclaw_config_value(&current, &[], &paths, &value);
+        let audit =
+            audit_openclaw_config_value(&current, &[], &paths, &value, Path::new("/home/user"));
         assert_eq!(audit.status, "drifted");
         assert_eq!(
-            audit.repair_source_root,
-            Some(PathBuf::from("/tmp/ocm/envs/source"))
+            audit.repair_root_rewrite,
+            Some((
+                PathBuf::from("/tmp/ocm/envs/source/.openclaw"),
+                PathBuf::from("/tmp/ocm/envs/target/.openclaw")
+            ))
         );
         assert!(audit.repair_workspace);
         assert!(audit.repair_gateway_port);
@@ -3160,7 +3217,8 @@ mod tests {
         let paths = derive_env_paths(Path::new(&current.root));
         let value = json!({"gateway": {"port": 19789}});
 
-        let audit = audit_openclaw_config_value(&current, &[], &paths, &value);
+        let audit =
+            audit_openclaw_config_value(&current, &[], &paths, &value, Path::new("/home/user"));
 
         assert_eq!(audit.status, "ok");
         assert!(!audit.repair_gateway_port);
