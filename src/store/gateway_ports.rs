@@ -84,6 +84,29 @@ pub(crate) fn choose_available_gateway_port(
     next_available_gateway_port(preferred_port.max(DEFAULT_GATEWAY_PORT), &claimed)
 }
 
+/// Keeps `port` unless one of `envs` claims part of its port family, and
+/// otherwise selects the next available port the way allocation does.
+/// Only registered environments decide whether the port is kept, so a port
+/// left unbound while its own service is stopped is not treated as taken.
+pub(crate) fn retain_unclaimed_gateway_port(
+    port: u32,
+    envs: &[EnvMeta],
+    env: &BTreeMap<String, String>,
+) -> Result<u32, String> {
+    let mut registered = BTreeSet::new();
+    reserve_dev_ui_ports(envs, &mut registered);
+    for claimed_port in resolve_effective_gateway_ports(envs, env)
+        .into_values()
+        .filter_map(Result::ok)
+    {
+        reserve_openclaw_port_family(claimed_port, &mut registered);
+    }
+    if !openclaw_port_family_conflicts(port, &registered) {
+        return Ok(port);
+    }
+    choose_available_gateway_port(port, envs, env)
+}
+
 fn reserve_foreign_openclaw_port_family(
     env: &BTreeMap<String, String>,
     claimed: &mut BTreeSet<u32>,

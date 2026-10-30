@@ -146,6 +146,21 @@ pub(crate) fn rewrite_openclaw_config_for_target(
     .map(|_| ())
 }
 
+/// Moves a config-set Gateway port, and the ports coupled to it, to
+/// `gateway_port`. A config without a Gateway port is left untouched.
+pub(crate) fn rewrite_openclaw_config_gateway_port(
+    paths: &EnvPaths,
+    gateway_port: u32,
+) -> Result<(), String> {
+    let Some(mut value) = read_config_value(&paths.config_path)? else {
+        return Ok(());
+    };
+    if rewrite_gateway_port_family(&mut value, gateway_port) {
+        write_config_value(&paths.config_path, &value)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn rewrite_openclaw_config_for_new_environment(
     target_paths: &EnvPaths,
     source_root: Option<&Path>,

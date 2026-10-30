@@ -23,10 +23,14 @@ use super::dev_sources::{
     contains_existing, path_identity, projected_path_contains, projected_path_relative,
     protected_dev_source_footprints,
 };
+use super::gateway_ports::{
+    resolve_config_gateway_port, resolve_env_gateway_port, retain_unclaimed_gateway_port,
+};
 use super::layout::{
-    derive_env_paths, display_path, snapshot_archive_path, snapshot_checkpoint_path,
+    EnvPaths, derive_env_paths, display_path, snapshot_archive_path, snapshot_checkpoint_path,
     snapshot_env_dir, snapshot_meta_path, validate_name,
 };
+use super::openclaw_config::rewrite_openclaw_config_gateway_port;
 use super::{
     OpenClawWorkspaceRuntime, audit_openclaw_state, clear_nonportable_runtime_state,
     get_environment, list_environments, now_utc, remove_upgrade_recovery_for_snapshot,
@@ -653,7 +657,7 @@ pub(crate) fn prepare_env_snapshot_restore(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<EnvSnapshotRestoreTransaction, SnapshotRestoreError> {
-    prepare_env_snapshot_restore_with_binding(options, true, None, env, cwd)
+    prepare_env_snapshot_restore_with_binding(options, RestorePurpose::Snapshot, None, env, cwd)
 }
 
 pub(crate) fn prepare_upgrade_snapshot_restore(
@@ -662,12 +666,27 @@ pub(crate) fn prepare_upgrade_snapshot_restore(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<EnvSnapshotRestoreTransaction, SnapshotRestoreError> {
-    prepare_env_snapshot_restore_with_binding(options, false, runtime_guard, env, cwd)
+    prepare_env_snapshot_restore_with_binding(
+        options,
+        RestorePurpose::UpgradeRollback,
+        runtime_guard,
+        env,
+        cwd,
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RestorePurpose {
+    /// `env snapshot restore`: keeps the current dev execution binding and
+    /// moves an automatic Gateway port another environment now holds.
+    Snapshot,
+    /// Upgrade rollback returns the environment to its own pre-upgrade state.
+    UpgradeRollback,
 }
 
 fn prepare_env_snapshot_restore_with_binding(
     options: RestoreEnvSnapshotOptions,
-    preserve_current_dev_execution: bool,
+    purpose: RestorePurpose,
     runtime_guard: Option<&super::RuntimeMutationGuard>,
     env: &BTreeMap<String, String>,
     cwd: &Path,
@@ -775,7 +794,7 @@ fn prepare_env_snapshot_restore_with_binding(
             )
         };
 
-        if preserve_current_dev_execution && current.dev.is_some() {
+        if purpose == RestorePurpose::Snapshot && current.dev.is_some() {
             restored.default_runtime = current.default_runtime.clone();
             restored.default_launcher = current.default_launcher.clone();
         }
@@ -806,11 +825,21 @@ fn prepare_env_snapshot_restore_with_binding(
             renamed = true;
         }
 
+        let mut warnings = Vec::new();
         let restore_result = (|| {
             if independent.is_empty() {
                 fs::rename(&candidate_root, &current_paths.root)
                     .map_err(|error| error.to_string())?;
                 prior_state_restored = false;
+            }
+            if purpose == RestorePurpose::Snapshot {
+                reselect_claimed_automatic_gateway_port(
+                    &mut restored,
+                    &current_paths,
+                    &mut warnings,
+                    env,
+                    cwd,
+                )?;
             }
             if legacy_archive && !restore_uses_directory_link(&current_paths.root)? {
                 rewrite_openclaw_config_for_target(
@@ -848,7 +877,7 @@ fn prepare_env_snapshot_restore_with_binding(
                     default_runtime: meta.default_runtime.clone(),
                     default_launcher: meta.default_launcher.clone(),
                     protected: meta.protected,
-                    warnings: Vec::new(),
+                    warnings,
                 },
                 original: current.clone(),
                 operation_root: operation.root.clone(),
@@ -954,6 +983,48 @@ pub(crate) fn rollback_env_snapshot_restore(
                 )
             }),
     )
+}
+
+// Clone and import choose a free port for their new environment. Restore keeps
+// the recorded one unless OCM chose it and another environment now holds it.
+fn reselect_claimed_automatic_gateway_port(
+    restored: &mut EnvMeta,
+    paths: &EnvPaths,
+    warnings: &mut Vec<String>,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<(), String> {
+    if !restored.gateway_port_auto_assigned {
+        return Ok(());
+    }
+    let Some(port) = resolve_env_gateway_port(restored) else {
+        return Ok(());
+    };
+    let others = list_environments(env, cwd)?
+        .into_iter()
+        .filter(|meta| meta.name != restored.name)
+        .collect::<Vec<_>>();
+    let selected = retain_unclaimed_gateway_port(port, &others, env)?;
+    if selected == port {
+        return Ok(());
+    }
+    restored.gateway_port = Some(selected);
+    if resolve_config_gateway_port(restored).is_some() && !restore_uses_directory_link(&paths.root)?
+    {
+        rewrite_openclaw_config_gateway_port(paths, selected)?;
+    }
+    if resolve_env_gateway_port(restored) != Some(selected) {
+        return Err(format!(
+            "restored Gateway port {port} for env {} is held by another environment, and OpenClaw config sets it where OCM does not rewrite it: {}",
+            restored.name,
+            display_path(&paths.config_path)
+        ));
+    }
+    warnings.push(format!(
+        "Gateway port {port} is held by another environment; env {} now uses Gateway port {selected}",
+        restored.name
+    ));
+    Ok(())
 }
 
 // Restore custody belongs to directory entries, even when a link target is offline.
