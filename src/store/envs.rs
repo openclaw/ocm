@@ -464,6 +464,45 @@ pub(crate) fn set_environment_service_policy(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<EnvironmentServicePolicyChange, String> {
+    update_environment_service_policy(
+        name,
+        |meta| {
+            if let Some(service_enabled) = service_enabled {
+                meta.service_enabled = service_enabled;
+            }
+            if let Some(service_running) = service_running {
+                meta.service_running = service_running;
+            }
+        },
+        env,
+        cwd,
+    )
+}
+
+/// Enable the service and keep running intent only where the service already
+/// runs, so installing again never stops a Gateway the service is running.
+pub(crate) fn enable_environment_service_policy(
+    name: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<EnvironmentServicePolicyChange, String> {
+    update_environment_service_policy(
+        name,
+        |meta| {
+            meta.service_running = meta.service_enabled && meta.service_running;
+            meta.service_enabled = true;
+        },
+        env,
+        cwd,
+    )
+}
+
+fn update_environment_service_policy(
+    name: &str,
+    apply: impl FnOnce(&mut EnvMeta),
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<EnvironmentServicePolicyChange, String> {
     let safe_name = validate_name(name, "Environment name")?;
     let service = crate::env::EnvironmentService::new(env, cwd);
     let _admission_lock = service.lock_gateway_admission(&safe_name)?;
@@ -477,12 +516,7 @@ pub(crate) fn set_environment_service_policy(
             .ok_or_else(|| format!("environment \"{safe_name}\" does not exist"))?;
         let previous_service_enabled = meta.service_enabled;
         let previous_service_running = meta.service_running;
-        if let Some(service_enabled) = service_enabled {
-            meta.service_enabled = service_enabled;
-        }
-        if let Some(service_running) = service_running {
-            meta.service_running = service_running;
-        }
+        apply(meta);
         if meta.service_enabled && meta.service_running {
             service.ensure_source_watch_allows_service(&safe_name)?;
         }

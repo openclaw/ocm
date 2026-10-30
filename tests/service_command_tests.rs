@@ -585,6 +585,97 @@ fn service_install_enables_the_env_and_installs_the_ocm_service() {
 }
 
 #[test]
+fn service_install_keeps_a_running_service_in_the_supervisor_plan() {
+    for systemd in [false, true] {
+        let root = TestDir::new("service-install-keeps-running-service");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let env = if systemd {
+            systemd_env(&root)
+        } else {
+            launchd_env(&root)
+        };
+        setup_launcher_env(&cwd, &env);
+        let started = run_ocm(&cwd, &env, &["service", "start", "demo"]);
+        assert!(started.status.success(), "{}", stderr(&started));
+        let state_path = root.child("ocm-home/supervisor/state.json");
+        let initial: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(
+            initial["children"].as_array().unwrap().len(),
+            1,
+            "{initial}"
+        );
+
+        // The daemon acts on whatever plan it reads, so record the persisted
+        // plan at every service-manager call the install makes.
+        let snapshots = root.child("plan-snapshots");
+        fs::create_dir_all(&snapshots).unwrap();
+        let manager_path = root.child(if systemd {
+            "fake-bin/systemctl"
+        } else {
+            "fake-bin/launchctl"
+        });
+        let original = fs::read_to_string(&manager_path).unwrap();
+        write_executable_script(
+            &manager_path,
+            &format!(
+                "#!/bin/sh\nn=$(ls '{snapshots}' | wc -l | tr -d ' ')\ncp '{state}' '{snapshots}/'\"$n\".json\n{original}",
+                snapshots = path_string(&snapshots),
+                state = path_string(&state_path),
+            ),
+        );
+
+        let installed = run_ocm(&cwd, &env, &["service", "install", "demo", "--json"]);
+        assert!(installed.status.success(), "{}", stderr(&installed));
+        let body = json_output(&installed);
+        assert_eq!(body["installed"], true);
+        assert_eq!(body["desiredRunning"], true);
+        let mut observed = 0;
+        for entry in fs::read_dir(&snapshots).unwrap() {
+            let path = entry.unwrap().path();
+            let plan: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(
+                plan["children"],
+                initial["children"],
+                "install published a plan without the running child ({})",
+                path.display()
+            );
+            observed += 1;
+        }
+        assert!(observed > 0, "the install made no service-manager call");
+        let after: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(after["children"], initial["children"]);
+        assert_eq!(after["restartRequests"], initial["restartRequests"]);
+        let shown = json_output(&run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]));
+        assert_eq!(shown["serviceEnabled"], true);
+        assert_eq!(shown["serviceRunning"], true);
+
+        // Install still enables a stopped service without starting it.
+        fs::write(&manager_path, original).unwrap();
+        let stopped = run_ocm(&cwd, &env, &["service", "stop", "demo"]);
+        assert!(stopped.status.success(), "{}", stderr(&stopped));
+        let reinstalled = run_ocm(&cwd, &env, &["service", "install", "demo", "--json"]);
+        assert!(reinstalled.status.success(), "{}", stderr(&reinstalled));
+        assert_eq!(json_output(&reinstalled)["desiredRunning"], false);
+        let shown = json_output(&run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]));
+        assert_eq!(shown["serviceEnabled"], true);
+        assert_eq!(shown["serviceRunning"], false);
+
+        // Running intent left on a disabled service does not start it either.
+        let mut meta = EnvironmentService::new(&env, &cwd).get("demo").unwrap();
+        meta.service_enabled = false;
+        meta.service_running = true;
+        ocm::store::save_environment(meta, &env, &cwd).unwrap();
+        let enabled = run_ocm(&cwd, &env, &["service", "install", "demo", "--json"]);
+        assert!(enabled.status.success(), "{}", stderr(&enabled));
+        assert_eq!(json_output(&enabled)["desiredRunning"], false);
+        let shown = json_output(&run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]));
+        assert_eq!(shown["serviceEnabled"], true);
+        assert_eq!(shown["serviceRunning"], false);
+    }
+}
+
+#[test]
 fn service_start_preserves_native_cli_identity_across_service_boundaries() {
     for systemd in [false, true] {
         let root = TestDir::new("service-native-cli-identity");

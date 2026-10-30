@@ -2343,7 +2343,7 @@ pub fn service_command_help(cmd: &str, action: &str) -> Option<String> {
     Some(match action {
         "install" => render_leaf(
             "Enable an env in the OCM background service",
-            "Enable one env in the shared OCM background service without marking it as running yet.",
+            "Enable one env in the shared OCM background service. A stopped env stays stopped; an env whose service is already running keeps running.",
             vec![format!("{cmd} service install <env> [--raw] [--json]")],
             &[
                 (
