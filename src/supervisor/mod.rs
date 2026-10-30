@@ -40,9 +40,9 @@ use crate::service::platform::{
 use crate::store::{
     adopt_supervisor_child_log_file, display_path, ensure_dir, ensure_store, list_environments,
     lock_file, now_utc, openclaw_port_family_available, openclaw_port_family_range, read_json,
-    resolve_ocm_home, supervisor_child_case_distinct_log_path, supervisor_child_log_destination,
-    supervisor_child_log_file, supervisor_child_log_path, supervisor_logs_dir,
-    supervisor_runtime_path, supervisor_state_path, write_json,
+    resolve_ocm_home, same_ocm_home, supervisor_child_case_distinct_log_path,
+    supervisor_child_log_destination, supervisor_child_log_file, supervisor_child_log_path,
+    supervisor_logs_dir, supervisor_runtime_path, supervisor_state_path, write_json,
 };
 
 mod openclaw_handoff;
@@ -735,7 +735,10 @@ impl<'a> SupervisorService<'a> {
                 return Ok(());
             };
             if runtime.kind != SUPERVISOR_RUNTIME_KIND
-                || runtime.ocm_home != display_path(&resolve_ocm_home(self.env, self.cwd)?)
+                || !same_ocm_home(
+                    &runtime.ocm_home,
+                    &display_path(&resolve_ocm_home(self.env, self.cwd)?),
+                )
             {
                 return Err(format!(
                     "cannot verify background service ownership before {action}"
@@ -818,7 +821,10 @@ impl<'a> SupervisorService<'a> {
     ) -> Result<Option<SupervisorChildSpec>, String> {
         let (_, state) = self.read_persisted_state()?;
         if state.kind != SUPERVISOR_STATE_KIND
-            || state.ocm_home != display_path(&resolve_ocm_home(self.env, self.cwd)?)
+            || !same_ocm_home(
+                &state.ocm_home,
+                &display_path(&resolve_ocm_home(self.env, self.cwd)?),
+            )
         {
             return Err("saved service log paths belong to another store".to_string());
         }
@@ -906,7 +912,9 @@ impl<'a> SupervisorService<'a> {
         .filter(|runtime| checked || daemon.running || !runtime.retained_envs().is_empty());
 
         if checked && let Some(runtime) = &runtime {
-            if runtime.kind != SUPERVISOR_RUNTIME_KIND || runtime.ocm_home != daemon.ocm_home {
+            if runtime.kind != SUPERVISOR_RUNTIME_KIND
+                || !same_ocm_home(&runtime.ocm_home, &daemon.ocm_home)
+            {
                 return Err(
                     "supervisor runtime observation does not belong to this store".to_string(),
                 );
@@ -1246,7 +1254,7 @@ impl<'a> SupervisorService<'a> {
                     })? {
                         let previous: SupervisorState = read_json(&path)?;
                         if previous.kind != SUPERVISOR_STATE_KIND
-                            || previous.ocm_home != display_path(&ocm_home)
+                            || !same_ocm_home(&previous.ocm_home, &display_path(&ocm_home))
                         {
                             return Err(
                                 "service preparation found an incompatible saved service plan"
@@ -1598,7 +1606,8 @@ impl<'a> SupervisorService<'a> {
         }
         let runtime = self.read_runtime_state()?;
         if let Some(runtime) = &runtime
-            && (runtime.kind != SUPERVISOR_RUNTIME_KIND || runtime.ocm_home != ocm_home)
+            && (runtime.kind != SUPERVISOR_RUNTIME_KIND
+                || !same_ocm_home(&runtime.ocm_home, &ocm_home))
         {
             return Err(format!(
                 "supervisor runtime state does not belong to OCM_HOME {ocm_home}"
@@ -1677,7 +1686,9 @@ impl<'a> SupervisorService<'a> {
             let runtime = self
                 .read_runtime_state()?
                 .ok_or_else(|| "the running daemon has no runtime ownership record".to_string())?;
-            if runtime.kind != SUPERVISOR_RUNTIME_KIND || runtime.ocm_home != ocm_home {
+            if runtime.kind != SUPERVISOR_RUNTIME_KIND
+                || !same_ocm_home(&runtime.ocm_home, &ocm_home)
+            {
                 return Err("the daemon runtime record belongs to another owner".to_string());
             }
             let capability = runtime.gateway_admission.ok_or_else(|| {

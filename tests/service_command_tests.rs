@@ -2221,6 +2221,57 @@ fn service_start_accepts_reformatted_same_store_plist() {
     assert!(stopped.status.success(), "{}", stderr(&stopped));
 }
 
+#[cfg(unix)]
+#[test]
+fn service_lifecycle_accepts_another_spelling_of_the_same_store() {
+    for systemd in [false, true] {
+        let root = TestDir::new(if systemd {
+            "service-store-alias-systemd"
+        } else {
+            "service-store-alias-launchd"
+        });
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut env = if systemd {
+            systemd_env(&root)
+        } else {
+            launchd_env(&root)
+        };
+        setup_launcher_env(&cwd, &env);
+        let started = run_ocm(&cwd, &env, &["service", "start", "demo"]);
+        assert!(started.status.success(), "{}", stderr(&started));
+
+        // The saved service plan and the running daemon's runtime ownership
+        // record both carry the installed spelling of the store.
+        support::enable_fake_daemon_gateway_admission(&root, &mut env);
+        let alias = root.child("store-alias");
+        std::os::unix::fs::symlink(&env["OCM_HOME"], &alias).unwrap();
+        let mut alias_env = env.clone();
+        alias_env.insert("OCM_HOME".to_string(), path_string(&alias));
+
+        let recovered = run_ocm(&cwd, &alias_env, &["service", "recover", "demo", "--json"]);
+        assert!(recovered.status.success(), "{}", stderr(&recovered));
+        let recovery = serde_json::from_slice::<Value>(&recovered.stdout).unwrap();
+        // Recovery reaches the plan itself instead of refusing the store.
+        let blockers = recovery["blockers"].to_string();
+        assert!(!blockers.contains("another store"), "{recovery}");
+        assert!(
+            blockers.contains("target remains in the desired supervisor plan"),
+            "{recovery}"
+        );
+
+        for args in [
+            &["start", "demo"][..],
+            &["service", "stop", "demo"],
+            &["service", "uninstall", "demo"],
+        ] {
+            let output = run_ocm(&cwd, &alias_env, args);
+            assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+        }
+        assert!(!managed_service_definition_path(&env, &cwd, "ocm").exists());
+    }
+}
+
 #[test]
 fn service_start_rejects_a_daemon_owned_by_another_store() {
     let root = TestDir::new("service-start-other-store-owner");

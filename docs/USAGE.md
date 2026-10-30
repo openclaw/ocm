@@ -2273,6 +2273,11 @@ the LaunchAgent plist. Plist-aware editors can reformat the definition or
 convert it to binary without changing ownership. A different, missing, or
 invalid owner still prevents OCM from replacing or controlling that service.
 
+On every platform, the recorded `OCM_HOME` matches the current one when both
+resolve to the same existing directory. The same store reached through a
+symlinked store or `HOME`, `/tmp` versus `/private/tmp`, or a relative
+`OCM_HOME` keeps control of its service and supervisor records.
+
 ## Safety notes
 
 `ocm` keeps safety checks around destructive actions.

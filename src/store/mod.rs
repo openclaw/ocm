@@ -79,7 +79,7 @@ pub use layout::{
     validate_name,
 };
 pub(crate) use layout::{
-    adopt_supervisor_child_log_file, source_watch_case_distinct_override_path,
+    adopt_supervisor_child_log_file, same_ocm_home, source_watch_case_distinct_override_path,
     supervisor_child_case_distinct_log_path, supervisor_child_log_destination,
     supervisor_child_log_file,
 };

@@ -10,7 +10,7 @@ use std::process::{Command, Output};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use crate::store::{display_path, lock_file, resolve_user_home};
+use crate::store::{display_path, lock_file, resolve_user_home, same_ocm_home};
 
 pub(crate) const OCM_SERVICE_LABEL: &str = "ai.openclaw.ocm";
 const SERVICE_MANAGER_OVERRIDE: &str = "OCM_INTERNAL_SERVICE_MANAGER";
@@ -321,7 +321,7 @@ pub(crate) fn managed_service_owner_matches(
                 .and_then(plist::Value::as_dictionary)
                 .and_then(|dict| dict.get("OCM_HOME"))
                 .and_then(plist::Value::as_string)
-                == Some(ocm_home))
+                .is_some_and(|recorded| same_ocm_home(recorded, ocm_home)))
         }
         ServiceManagerKind::SystemdUser => {
             let raw = std::str::from_utf8(&raw).map_err(|error| {
@@ -338,10 +338,52 @@ pub(crate) fn managed_service_owner_matches(
                 ),
             ]
             .iter()
-            .any(|marker| raw.contains(marker)))
+            .any(|marker| raw.contains(marker))
+                || systemd_recorded_ocm_homes(raw)
+                    .iter()
+                    .any(|recorded| same_ocm_home(recorded, ocm_home)))
         }
         ServiceManagerKind::Unsupported => Ok(true),
     }
+}
+
+/// Decodes each `Environment="OCM_HOME=..."` line under the current and the
+/// legacy escaping, so another spelling of the same store can be recognized.
+fn systemd_recorded_ocm_homes(raw: &str) -> Vec<String> {
+    raw.lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("Environment=\"OCM_HOME=")?
+                .strip_suffix('"')
+        })
+        .flat_map(|value| {
+            [
+                systemd_unescape(value, true),
+                systemd_unescape(value, false),
+            ]
+        })
+        .flatten()
+        .collect()
+}
+
+fn systemd_unescape(value: &str, percent_escaped: bool) -> Option<String> {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => match chars.next()? {
+                escaped @ ('\\' | '"') => out.push(escaped),
+                _ => return None,
+            },
+            '"' => return None,
+            '%' if percent_escaped => match chars.next()? {
+                '%' => out.push('%'),
+                _ => return None,
+            },
+            other => out.push(other),
+        }
+    }
+    Some(out)
 }
 
 pub(crate) fn validate_managed_service_executable(
@@ -1929,6 +1971,67 @@ mod tests {
             error.contains("failed to parse existing service definition"),
             "{error}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_owner_accepts_another_spelling_of_the_same_store() {
+        for manager in ["launchd", "systemd-user"] {
+            let root = tempfile::tempdir().unwrap();
+            let env = BTreeMap::from([(
+                "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
+                manager.to_string(),
+            )]);
+            // Quotes, backslashes and percent signs exercise the systemd escaping.
+            let store = root.path().join("store 50% \"q\" \\x");
+            fs::create_dir_all(&store).unwrap();
+            let alias = root.path().join("store-alias");
+            std::os::unix::fs::symlink(&store, &alias).unwrap();
+            let other = root.path().join("other-store");
+            fs::create_dir_all(&other).unwrap();
+            let definition_for = |ocm_home: &Path| ManagedServiceDefinition {
+                label: OCM_SERVICE_LABEL.to_string(),
+                description: "owner fixture".to_string(),
+                definition_path: root.path().join("owner.definition"),
+                program_arguments: vec!["/bin/true".to_string()],
+                working_directory: root.path().to_path_buf(),
+                stdout_path: root.path().join("stdout.log"),
+                stderr_path: root.path().join("stderr.log"),
+                environment: BTreeMap::from([("OCM_HOME".to_string(), display_path(ocm_home))]),
+            };
+            let installed = definition_for(&store);
+            write_managed_service_definition(&installed, &env).unwrap();
+            let original = fs::read(&installed.definition_path).unwrap();
+
+            super::validate_managed_service_owner(&definition_for(&alias), &env).unwrap();
+            let error =
+                super::validate_managed_service_owner(&definition_for(&other), &env).unwrap_err();
+            assert!(
+                error.contains("already bound to a different OCM_HOME"),
+                "{manager}: {error}"
+            );
+            assert_eq!(fs::read(&installed.definition_path).unwrap(), original);
+
+            if manager == "systemd-user" {
+                let legacy = String::from_utf8(original.clone())
+                    .unwrap()
+                    .replace("%%", "%");
+                fs::write(&installed.definition_path, legacy).unwrap();
+                super::validate_managed_service_owner(&definition_for(&alias), &env).unwrap();
+                fs::write(&installed.definition_path, &original).unwrap();
+            }
+
+            // A recorded store that no longer exists matches no other spelling.
+            fs::rename(&store, root.path().join("moved-store")).unwrap();
+            for current in [&alias, &other] {
+                let error = super::validate_managed_service_owner(&definition_for(current), &env)
+                    .unwrap_err();
+                assert!(
+                    error.contains("already bound to a different OCM_HOME"),
+                    "{manager}: {error}"
+                );
+            }
+        }
     }
 
     #[test]
