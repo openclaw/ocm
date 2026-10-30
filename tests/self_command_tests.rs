@@ -461,6 +461,49 @@ fn self_update_through_a_symlink_replaces_the_real_binary() {
 
 #[cfg(unix)]
 #[test]
+fn self_update_through_a_symlink_accepts_a_service_installed_through_it() {
+    let root = TestDir::new("self-update-symlinked-service");
+    let real = fs::canonicalize(copied_ocm(&root)).unwrap();
+    let linked = root.child("link/ocm");
+    fs::create_dir_all(linked.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink("../bin/ocm", &linked).unwrap();
+    let (release, _asset) = serve_candidate_release(&root, 1);
+    let mut env = release_env(&root, &release.url());
+    env.insert(
+        "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
+        "launchd".to_string(),
+    );
+    install_fake_launchctl(&root, &mut env);
+    for args in [
+        vec!["launcher", "add", "stable", "--command", "openclaw"],
+        vec!["env", "create", "demo", "--launcher", "stable"],
+        vec!["service", "install", "demo"],
+    ] {
+        let output = run_ocm_binary(&linked, root.path(), &env, &args);
+        assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+    }
+    // Leave the definition installed with no loaded daemon.
+    let bootout = Command::new(&env["OCM_INTERNAL_LAUNCHCTL_BIN"])
+        .arg("bootout")
+        .output()
+        .unwrap();
+    assert!(bootout.status.success());
+
+    let update = run_ocm_binary(&linked, root.path(), &env, &["self", "update", "--json"]);
+    assert!(update.status.success(), "{}", stderr(&update));
+    let summary: serde_json::Value = serde_json::from_slice(&update.stdout).unwrap();
+    assert_eq!(summary["status"], "updated");
+    assert_eq!(summary["binaryPath"], path_string(&real));
+    let version = Command::new(&real)
+        .arg("--version")
+        .env_clear()
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8(version.stdout).unwrap(), "9.9.9\n");
+}
+
+#[cfg(unix)]
+#[test]
 fn self_update_through_a_symlink_refuses_a_read_only_target_before_downloading() {
     use std::os::unix::fs::PermissionsExt;
 
