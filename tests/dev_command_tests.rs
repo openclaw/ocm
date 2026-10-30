@@ -9879,3 +9879,279 @@ fn foreground_final_spawn_refuses_claim_published_during_preparation() {
         }
     }
 }
+
+// On case-insensitive storage `Alpha.session` is `alpha.session`. A hard link
+// gives Linux the same aliasing; where the volume already folds case the link
+// reports that the name exists.
+#[cfg(unix)]
+fn alias_source_watch_file(root: &TestDir, from: &str, to: &str) {
+    if let Err(error) = fs::hard_link(
+        root.child(format!("ocm-home/source-watch/{from}")),
+        root.child(format!("ocm-home/source-watch/{to}")),
+    ) {
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+}
+
+#[cfg(unix)]
+fn case_distinct_source_watch_path(root: &TestDir, name: &str, extension: &str) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let key = Sha256::digest(name.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    root.child(format!(
+        "ocm-home/source-watch/case-distinct/{key}.{extension}"
+    ))
+}
+
+#[cfg(unix)]
+fn source_watch_session_owner(path: &Path) -> (String, bool) {
+    let session: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+    (
+        session["envName"].as_str().unwrap().to_string(),
+        session["closed"].as_bool().unwrap(),
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn case_distinct_environments_keep_separate_source_watch_state_on_shared_files() {
+    let root = TestDir::new("dev-case-distinct-source-watch");
+    let repo = init_openclaw_repo(&root);
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    install_fake_dev_runners(&root, &mut env);
+    let repo = path_string(&repo);
+    let ok = |args: &[&str]| {
+        let output = run_ocm(&cwd, &env, args);
+        assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+        output
+    };
+
+    // A plain environment beside a case-distinct dev environment.
+    let alpha_root = path_string(&root.child("AlphaRoot"));
+    ok(&["env", "create", "Alpha", "--root", &alpha_root]);
+    ok(&["dev", "alpha", "--repo", &repo, "--no-watch", "--no-ui"]);
+    let shared = root.child("ocm-home/source-watch/alpha.session");
+    let separate = case_distinct_source_watch_path(&root, "Alpha", "session");
+    assert_eq!(source_watch_session_owner(&shared), ("alpha".into(), true));
+    alias_source_watch_file(&root, "alpha.session", "Alpha.session");
+    alias_source_watch_file(&root, "alpha.lock", "Alpha.lock");
+    ok(&["env", "create", "beta"]);
+    let snapshot = ok(&["env", "snapshot", "create", "beta", "--json"]);
+    let snapshot: Value = serde_json::from_str(&stdout(&snapshot)).unwrap();
+    let snapshot = snapshot["id"].as_str().unwrap().to_string();
+
+    ok(&["env", "status", "Alpha"]);
+    ok(&["env", "exec", "Alpha", "--", "true"]);
+    ok(&["dev", "stop", "Alpha"]);
+    ok(&["env", "snapshot", "restore", "beta", &snapshot]);
+    ok(&["env", "remove", "beta"]);
+    assert!(!separate.exists());
+
+    // Each name keeps its own dev session; neither replaces the other's.
+    ok(&["env", "remove", "Alpha", "--force"]);
+    ok(&[
+        "dev",
+        "Alpha",
+        "--repo",
+        &repo,
+        "--root",
+        &alpha_root,
+        "--no-watch",
+        "--no-ui",
+    ]);
+    assert_eq!(
+        source_watch_session_owner(&separate),
+        ("Alpha".into(), true)
+    );
+    assert_eq!(source_watch_session_owner(&shared), ("alpha".into(), true));
+    // Gateway admission stays one lock per name, shared like operation locks.
+    assert!(!case_distinct_source_watch_path(&root, "Alpha", "admission").exists());
+    assert!(root.child("ocm-home/source-watch/Alpha.admission").exists());
+    ok(&["dev", "alpha", "--no-watch", "--no-ui"]);
+    ok(&["dev", "Alpha", "--no-watch", "--no-ui"]);
+    assert_eq!(
+        source_watch_session_owner(&separate),
+        ("Alpha".into(), true)
+    );
+    assert_eq!(source_watch_session_owner(&shared), ("alpha".into(), true));
+    ok(&["env", "status", "alpha"]);
+    ok(&["env", "status", "Alpha"]);
+    // The separate location stays short for the longest accepted names.
+    let long = "A".repeat(128);
+    let long_root = path_string(&root.child("long-root"));
+    ok(&["env", "create", &long, "--root", &long_root]);
+    ok(&["env", "status", &long]);
+    ok(&["env", "remove", &long]);
+
+    // Removing the environment that holds the shared files leaves the peer's
+    // state where it is, and each removal deletes only its own session.
+    ok(&["env", "remove", "alpha", "--force"]);
+    assert!(!shared.exists());
+    assert_eq!(
+        source_watch_session_owner(&separate),
+        ("Alpha".into(), true)
+    );
+    ok(&["env", "status", "Alpha"]);
+    ok(&["env", "remove", "Alpha", "--force"]);
+    assert!(!separate.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn source_watch_state_still_refuses_another_environments_session() {
+    let root = TestDir::new("dev-foreign-source-watch-session");
+    let repo = init_openclaw_repo(&root);
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    install_fake_dev_runners(&root, &mut env);
+    let dev = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "dev",
+            "alpha",
+            "--repo",
+            &path_string(&repo),
+            "--no-watch",
+            "--no-ui",
+        ],
+    );
+    assert!(dev.status.success(), "{}", stderr(&dev));
+    let session = fs::read(root.child("ocm-home/source-watch/alpha.session")).unwrap();
+    let probe = root.child("ocm-home/source-watch/Probe");
+    fs::write(&probe, b"").unwrap();
+    let case_sensitive = !root.child("ocm-home/source-watch/probe").exists();
+    fs::remove_file(&probe).unwrap();
+
+    // A record for another name is not this environment's session, even when
+    // the names differ only by case, unless it is that environment's own file.
+    let mut copies = vec!["bravo"];
+    if case_sensitive {
+        copies.push("Alpha");
+    }
+    for name in copies {
+        let created = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "env",
+                "create",
+                name,
+                "--root",
+                &path_string(&root.child(name)),
+            ],
+        );
+        assert!(created.status.success(), "{}", stderr(&created));
+        fs::write(
+            root.child(format!("ocm-home/source-watch/{name}.session")),
+            &session,
+        )
+        .unwrap();
+        let status = run_ocm(&cwd, &env, &["env", "status", name]);
+        assert!(!status.status.success());
+        assert!(
+            stderr(&status).contains(&format!(
+                "source watch ownership metadata for env \"{name}\" is invalid"
+            )),
+            "{}",
+            stderr(&status)
+        );
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_open_source_watch_session(path: &Path, env_name: &str) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Ok(bytes) = fs::read(path)
+            && let Ok(session) = serde_json::from_slice::<Value>(&bytes)
+            && session["envName"] == env_name
+            && session["closed"] != true
+            && session["child"]["pid"].as_u64().is_some()
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{env_name} session did not start"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn case_distinct_environments_run_independent_active_dev_sessions() {
+    let root = TestDir::new("dev-case-distinct-active-watch");
+    let repo = init_openclaw_repo(&root);
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    let (started, _release, _log) = install_blocking_fake_dev_runners(&root, &mut env);
+    let repo = path_string(&repo);
+    let ok = |args: &[&str]| {
+        let output = run_ocm(&cwd, &env, args);
+        assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+    };
+    ok(&["env", "create", "beta"]);
+    let shared = root.child("ocm-home/source-watch/alpha.session");
+    let separate = case_distinct_source_watch_path(&root, "Alpha", "session");
+
+    let alpha = DevWatchFixture::spawn(
+        &root,
+        &cwd,
+        &env,
+        &["dev", "alpha", "--repo", &repo, "--no-watch", "--no-ui"],
+    );
+    assert!(wait_for_path(&started, Duration::from_secs(20)));
+    wait_for_open_source_watch_session(&shared, "alpha");
+    assert!(wait_for_path(
+        &source_watch_override_path(&root, "alpha"),
+        Duration::from_secs(20)
+    ));
+    // Alias the active session, held lease and source override.
+    alias_source_watch_file(&root, "alpha.session", "Alpha.session");
+    alias_source_watch_file(&root, "alpha.lock", "Alpha.lock");
+    alias_source_watch_file(&root, "alpha.json", "Alpha.json");
+
+    // An active peer session neither blocks the other name nor removal of
+    // unrelated environments.
+    fs::remove_file(&started).unwrap();
+    let alpha_root = path_string(&root.child("AlphaRoot"));
+    let upper = DevWatchFixture::spawn_caller(
+        &root,
+        &cwd,
+        &env,
+        &[
+            "dev",
+            "Alpha",
+            "--repo",
+            &repo,
+            "--root",
+            &alpha_root,
+            "--no-watch",
+            "--no-ui",
+        ],
+    );
+    assert!(wait_for_path(&started, Duration::from_secs(20)));
+    wait_for_open_source_watch_session(&separate, "Alpha");
+    wait_for_open_source_watch_session(&shared, "alpha");
+    ok(&["env", "status", "alpha"]);
+    ok(&["env", "status", "Alpha"]);
+    ok(&["env", "remove", "beta"]);
+
+    let upper = upper.finish();
+    assert!(upper.status.success(), "{}", stderr(&upper));
+    let alpha = alpha.finish();
+    assert!(alpha.status.success(), "{}", stderr(&alpha));
+    assert_eq!(
+        source_watch_session_owner(&separate),
+        ("Alpha".into(), true)
+    );
+    assert_eq!(source_watch_session_owner(&shared), ("alpha".into(), true));
+}

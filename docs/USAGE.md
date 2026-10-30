@@ -1949,6 +1949,12 @@ without removing its environment or source. Repeating the same source, launch
 endpoint and effective backend watching/UI choices reuses the session; changing
 those choices requires stopping it first. `dev status --json` reports active
 ownership separately from `sourceWatch.watching`.
+On case-insensitive storage, accepted case-distinct environment names such as
+`alpha` and `Alpha` keep separate dev session records. One environment's
+session, active or finished, does not block commands for the other name or
+removal and restore of other environments. The two names still share their
+environment operation and Gateway admission locks, so those steps for one name
+wait for the other.
 `--force` temporarily takes over a running background service while backend watching is enabled and restores it on exit only if no later service policy request supersedes the takeover; it rejects `--no-watch` or `--service`.
 Temporary takeovers resolve `--repo` to its canonical checkout before preparation.
 Changing a selected path alias while the session runs does not redirect the

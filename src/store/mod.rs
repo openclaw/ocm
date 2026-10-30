@@ -67,7 +67,6 @@ pub(crate) use gateway_ports::{
 };
 pub(crate) use launchers::find_launcher;
 pub use launchers::{add_launcher, get_launcher, list_launchers, remove_launcher};
-pub(crate) use layout::supervisor_child_log_destination;
 pub use layout::{
     EnvPaths, StorePaths, clean_path, default_env_root, derive_env_paths, display_path,
     env_registry_path, launcher_meta_path, resolve_absolute_path, resolve_ocm_home,
@@ -77,6 +76,9 @@ pub use layout::{
     supervisor_runtime_path, supervisor_state_path, upgrade_history_env_dir,
     upgrade_history_meta_path, upgrade_history_recovery_dir, upgrade_history_runtime_recovery_dir,
     validate_name,
+};
+pub(crate) use layout::{
+    source_watch_case_distinct_override_path, supervisor_child_log_destination,
 };
 pub(crate) use openclaw_config::{
     GatewayReadinessHost, MinimumLocalConfig, OpenClawConfigAudit, OpenClawConfigRepair,

@@ -376,6 +376,28 @@ pub fn source_watch_override_path(
         .join(format!("{name}.json")))
 }
 
+/// Separate source-watch state for a name whose `source-watch/<name>.*` files
+/// already belong to a case-distinct environment on case-insensitive storage.
+/// The SHA-256 of the exact name keeps every accepted name distinct under case
+/// folding and keeps the file name short for any accepted name length.
+pub fn source_watch_case_distinct_override_path(
+    name: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<PathBuf, String> {
+    use sha2::{Digest, Sha256};
+    let stores = resolve_store_paths(env, cwd)?;
+    let key = Sha256::digest(name.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(stores
+        .home
+        .join("source-watch")
+        .join("case-distinct")
+        .join(format!("{key}.json")))
+}
+
 pub fn snapshot_archive_path(
     env_name: &str,
     snapshot_id: &str,
