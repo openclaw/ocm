@@ -72,7 +72,9 @@ until that command exits. OCM never kills an unknown PID to reclaim a lock.
 
 ## Boundaries
 
-- `--check` and unchanged releases do not restart services.
+- `--check` and unchanged releases do not restart services. An unchanged
+  release creates no journal or lock, so it needs no write access beside the
+  executable; an existing unfinished receipt still blocks it.
 - Recovery is local and explicit after a helper crash or reboot. This is not a
   boot-time recovery service or a zero-downtime update.
 - The previous executable and latest receipt remain until the next admitted

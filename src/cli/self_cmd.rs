@@ -339,8 +339,12 @@ impl Cli {
         let current_version = env!("CARGO_PKG_VERSION").to_string();
         let binary_path = self.current_binary_path()?;
         let asset_name = self.current_release_asset_name()?;
-        let transaction = Transaction::open(&binary_path, false)?;
-        transaction.admit()?;
+        // An unfinished update still blocks before the release query; a new
+        // journal waits until there is something to install.
+        let existing = Transaction::open_existing(&binary_path)?;
+        if let Some(transaction) = &existing {
+            transaction.admit()?;
+        }
         let release = self.fetch_self_release(version)?;
         let target_version = display_version_from_tag(&release.tag_name)?;
 
@@ -358,6 +362,14 @@ impl Cli {
                 package_manager_note: None,
             });
         }
+        let transaction = match existing {
+            Some(transaction) => transaction,
+            None => {
+                let transaction = Transaction::open(&binary_path, false)?;
+                transaction.admit()?;
+                transaction
+            }
+        };
 
         let asset = release
             .assets
