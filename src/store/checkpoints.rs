@@ -2220,6 +2220,28 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn checkpoint_refuses_a_hot_journal_of_a_multi_database_transaction() {
+        use crate::infra::sqlite_snapshot::{name_super_journal, plant_hot_journal};
+
+        let source = tempfile::tempdir().unwrap();
+        let database = source.path().join("app.db");
+        let _ = plant_hot_journal(&database);
+        let outside = tempfile::tempdir().unwrap();
+        let super_journal = outside.path().join("transaction-mj");
+        fs::write(&super_journal, b"").unwrap();
+        name_super_journal(&database, &super_journal);
+        let destination_parent = tempfile::tempdir().unwrap();
+
+        let error =
+            super::create_tree_checkpoint(source.path(), &destination_parent.path().join("c"))
+                .unwrap_err();
+
+        assert!(error.contains("multi-database transaction"), "{error}");
+        assert!(super_journal.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn checkpoint_refuses_a_journal_copied_from_a_database_in_use() {
         use crate::infra::sqlite_snapshot::plant_hot_journal;
 

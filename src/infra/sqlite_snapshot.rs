@@ -102,6 +102,15 @@ fn recover_hot_journal_with_flags(
     {
         return Ok(None);
     }
+    // Replay of a multi-database transaction depends on its super-journal,
+    // a file named inside the journal and outside this copy, which SQLite
+    // consults and may delete. Recover only self-contained journals.
+    if journal_names_super_journal(&journal_path(&copy))? {
+        return Err(format!(
+            "cannot recover SQLite database {}: its rollback journal belongs to an interrupted multi-database transaction; open the database with SQLite to recover it, then retry",
+            source.display()
+        ));
+    }
     let recovered = Connection::open_with_flags(
         &copy,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -140,6 +149,27 @@ fn journal_is_hot(source: &Path, flags: OpenFlags, vfs: Option<&CStr>) -> Result
             source.display()
         )),
     }
+}
+
+/// Whether a rollback journal ends with a super-journal record, the trailer
+/// SQLite reads before replay: name length, checksum and the journal magic.
+fn journal_names_super_journal(journal: &Path) -> Result<bool, String> {
+    const JOURNAL_MAGIC: [u8; 8] = [0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7];
+    let mut file = File::open(journal)
+        .map_err(|error| format!("failed to open {}: {error}", journal.display()))?;
+    let length = file
+        .metadata()
+        .map_err(|error| format!("failed to inspect {}: {error}", journal.display()))?
+        .len();
+    if length < 16 {
+        return Ok(false);
+    }
+    let mut trailer = [0_u8; 16];
+    file.seek(SeekFrom::Start(length - 16))
+        .and_then(|_| file.read_exact(&mut trailer))
+        .map_err(|error| format!("failed to read {}: {error}", journal.display()))?;
+    let name_length = u32::from_be_bytes(trailer[..4].try_into().unwrap());
+    Ok(trailer[8..] == JOURNAL_MAGIC && name_length != 0)
 }
 
 fn journal_path(database: &Path) -> PathBuf {
@@ -503,6 +533,28 @@ pub(crate) fn plant_hot_journal(database: &Path) -> u64 {
     u64::try_from(untouched_page).unwrap()
 }
 
+/// Appends the super-journal record of a multi-database transaction naming
+/// `super_journal`, as SQLite writes it at the end of each child journal.
+#[cfg(all(test, unix))]
+pub(crate) fn name_super_journal(database: &Path, super_journal: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    let name = super_journal.as_os_str().as_bytes();
+    let checksum = name
+        .iter()
+        .fold(0_u32, |sum, byte| sum.wrapping_add(u32::from(*byte)));
+    let mut record = 0x4000_0001_u32.to_be_bytes().to_vec();
+    record.extend_from_slice(name);
+    record.extend_from_slice(&u32::try_from(name.len()).unwrap().to_be_bytes());
+    record.extend_from_slice(&checksum.to_be_bytes());
+    record.extend_from_slice(&[0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7]);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(journal_path(database))
+        .unwrap()
+        .write_all(&record)
+        .unwrap();
+}
+
 /// Overwrites the start of the page at `offset` so integrity checks fail.
 #[cfg(all(test, unix))]
 pub(crate) fn damage_page(database: &Path, offset: u64) {
@@ -664,6 +716,36 @@ mod tests {
             error.contains("integrity check failed") || error.contains("malformed"),
             "{error}"
         );
+        assert_eq!(
+            [
+                fs::read(&database).unwrap(),
+                fs::read(journal_path(&database)).unwrap()
+            ],
+            before
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hot_journal_recovery_refuses_a_multi_database_transaction() {
+        let source = tempfile::tempdir().unwrap();
+        let database = source.path().join("app.db");
+        let _ = plant_hot_journal(&database);
+        let outside = tempfile::tempdir().unwrap();
+        let super_journal = outside.path().join("transaction-mj");
+        fs::write(&super_journal, b"").unwrap();
+        name_super_journal(&database, &super_journal);
+        let before = [
+            fs::read(&database).unwrap(),
+            fs::read(journal_path(&database)).unwrap(),
+        ];
+
+        let error = recover_hot_journal(&database).err().unwrap();
+        assert!(error.contains("multi-database transaction"), "{error}");
+        let error = create_sqlite_snapshot(&database).err().unwrap();
+        assert!(error.contains("multi-database transaction"), "{error}");
+
+        assert!(super_journal.exists());
         assert_eq!(
             [
                 fs::read(&database).unwrap(),
