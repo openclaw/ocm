@@ -7,7 +7,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::support::{TestDir, path_string, stderr, write_executable_script};
+use crate::support::{TestDir, path_string, stderr, stdout, write_executable_script};
 
 fn installer_requested_urls(os: &str, arch: &str, version: Option<&str>) -> Vec<String> {
     let root = TestDir::new("install-release-urls");
@@ -404,4 +404,95 @@ fn installer_refuses_a_directory_at_the_destination() {
     );
     assert_eq!(directory_entries(&bin_dir), ["ocm"]);
     assert!(directory_entries(&bin_dir.join("ocm")).is_empty());
+}
+
+fn installer_command(root: &TestDir, fake_bin: &Path, archive: &Path) -> Command {
+    let mut command = Command::new("bash");
+    command
+        .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("install.sh"))
+        .env_clear()
+        .env("TEST_ARCHIVE", archive)
+        .env(
+            "PATH",
+            format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap()),
+        );
+    // The installer's own scratch space is unrelated to HOME.
+    command.env("TMPDIR", root.child("tmp"));
+    fs::create_dir_all(root.child("tmp")).unwrap();
+    command
+}
+
+#[test]
+fn installer_prints_usage_without_home() {
+    let root = TestDir::new("install-help-without-home");
+    let (fake_bin, archive) = standalone_release(&root);
+    for flag in ["--help", "-h"] {
+        let output = installer_command(&root, &fake_bin, &archive)
+            .arg(flag)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{flag}: {}", stderr(&output));
+        assert!(stdout(&output).contains("Usage:"), "{flag}");
+    }
+}
+
+#[test]
+fn installer_installs_to_an_explicit_directory_without_home() {
+    for (option, relative) in [("--bin-dir", "dest/ocm"), ("--prefix", "dest/bin/ocm")] {
+        let root = TestDir::new("install-explicit-dir-without-home");
+        let (fake_bin, archive) = standalone_release(&root);
+        let directory = root.child("dest");
+        let output = installer_command(&root, &fake_bin, &archive)
+            .args([option, &path_string(&directory)])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{option}: {}", stderr(&output));
+        assert_eq!(
+            fs::read(root.child(relative)).unwrap(),
+            STANDALONE_BINARY,
+            "{option}"
+        );
+        assert_eq!(
+            fs::metadata(root.child(relative))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755,
+            "{option}"
+        );
+    }
+}
+
+#[test]
+fn installer_without_home_or_a_destination_asks_for_one_before_downloading() {
+    let root = TestDir::new("install-no-home-no-destination");
+    let (fake_bin, archive) = standalone_release(&root);
+    let output = installer_command(&root, &fake_bin, &archive)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert_eq!(
+        stderr(&output),
+        "error: HOME is not set; pass --prefix or --bin-dir to choose where to install ocm\n"
+    );
+    assert!(!stdout(&output).contains("Downloading"));
+}
+
+#[test]
+fn installer_with_home_still_defaults_to_its_local_prefix() {
+    let root = TestDir::new("install-home-default-prefix");
+    let (fake_bin, archive) = standalone_release(&root);
+    let home = root.child("home");
+    let output = installer_command(&root, &fake_bin, &archive)
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        fs::read(home.join(".local/bin/ocm")).unwrap(),
+        STANDALONE_BINARY
+    );
 }
