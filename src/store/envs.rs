@@ -24,7 +24,8 @@ use super::common::{
 };
 use super::dev_sources::{DevSourceRemoval, ensure_root_outside_dev_sources};
 use super::gateway_ports::{
-    DEFAULT_GATEWAY_PORT, choose_available_gateway_port, resolve_effective_gateway_ports,
+    DEFAULT_GATEWAY_PORT, choose_available_gateway_port,
+    choose_available_gateway_port_beside_plain_home, resolve_effective_gateway_ports,
     resolve_env_gateway_port,
 };
 use super::layout::{
@@ -579,7 +580,7 @@ pub fn create_environment(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<EnvMeta, String> {
-    create_environment_with_runtime_validation(options, false, env, cwd)
+    create_environment_with_runtime_validation(options, false, None, env, cwd)
 }
 
 fn ensure_root_outside_environments(
@@ -629,12 +630,24 @@ pub(crate) fn create_environment_with_validated_runtime(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<EnvMeta, String> {
-    create_environment_with_runtime_validation(options, true, env, cwd)
+    create_environment_with_runtime_validation(options, true, None, env, cwd)
+}
+
+/// Creates an environment copied from a plain OpenClaw home configured for
+/// `plain_home_port`, keeping an automatic port clear of that port's family.
+pub(crate) fn create_environment_beside_plain_home(
+    options: CreateEnvironmentOptions,
+    plain_home_port: Option<u32>,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<EnvMeta, String> {
+    create_environment_with_runtime_validation(options, true, plain_home_port, env, cwd)
 }
 
 fn create_environment_with_runtime_validation(
     options: CreateEnvironmentOptions,
     validate_runtime: bool,
+    plain_home_port: Option<u32>,
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<EnvMeta, String> {
@@ -713,7 +726,15 @@ fn create_environment_with_runtime_validation(
     let gateway_port_auto_assigned = options.gateway_port.is_none();
     let gateway_port = Some(match options.gateway_port {
         Some(port) => port,
-        None => choose_available_gateway_port(DEFAULT_GATEWAY_PORT, &registry.envs, env)?,
+        None => match plain_home_port {
+            Some(plain_home_port) => choose_available_gateway_port_beside_plain_home(
+                DEFAULT_GATEWAY_PORT,
+                &registry.envs,
+                plain_home_port,
+                env,
+            )?,
+            None => choose_available_gateway_port(DEFAULT_GATEWAY_PORT, &registry.envs, env)?,
+        },
     });
 
     // Registration repeats this. Doing it after validation keeps the earlier

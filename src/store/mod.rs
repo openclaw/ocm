@@ -53,7 +53,8 @@ pub use envs::{
 };
 pub(crate) use envs::{
     clone_environment_for_simulation, clone_environment_with_sandbox_origin,
-    create_environment_with_validated_runtime, import_environment_with_sandbox_origin,
+    create_environment_beside_plain_home, create_environment_with_validated_runtime,
+    import_environment_with_sandbox_origin,
 };
 pub(crate) use envs::{
     save_environment_with_dev_registration, save_environment_with_runtime_guard,
@@ -62,8 +63,8 @@ pub(crate) use envs::{
     with_locked_environments,
 };
 pub(crate) use gateway_ports::{
-    openclaw_port_family_available, openclaw_port_family_range, resolve_config_gateway_port,
-    resolve_effective_gateway_ports,
+    openclaw_port_family_available, openclaw_port_family_range, read_plain_home_gateway_port,
+    resolve_config_gateway_port, resolve_effective_gateway_ports,
 };
 pub use launchers::{add_launcher, get_launcher, list_launchers, remove_launcher};
 pub(crate) use launchers::{find_launcher, get_launcher_verified};

@@ -928,6 +928,93 @@ fn migrate_resets_or_replaces_a_copied_public_sandbox_origin() {
 }
 
 #[test]
+fn migrate_and_adopt_keep_an_explicit_source_homes_gateway_ports_free() {
+    let root = TestDir::new("migrate-explicit-source-port");
+    let cwd = root.child("workspace");
+    let source_home = root.child("legacy/.openclaw");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(&source_home).unwrap();
+    // 18850's family overlaps 18789's, the first automatic candidate.
+    let source_config = "{ \"gateway\": { \"port\": 18850 } }\n";
+    fs::write(source_home.join("openclaw.json"), source_config).unwrap();
+    let env = ocm_env(&root);
+    let source = source_home.to_string_lossy();
+
+    for (name, args) in [
+        ("moved", vec!["migrate", "moved", source.as_ref()]),
+        (
+            "adopted",
+            vec!["adopt", "import", "--name", "adopted", source.as_ref()],
+        ),
+    ] {
+        let output = run_ocm(&cwd, &env, &args);
+        assert!(output.status.success(), "{}", stderr(&output));
+        let show = run_ocm(&cwd, &env, &["env", "show", name, "--json"]);
+        assert!(show.status.success(), "{}", stderr(&show));
+        let port =
+            serde_json::from_str::<serde_json::Value>(&stdout(&show)).unwrap()["gatewayPort"]
+                .as_u64()
+                .unwrap();
+        assert!(
+            port + 110 < 18_850 || port > 18_960,
+            "{name} got {port}, inside the source home's port family"
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(source_home.join("openclaw.json")).unwrap(),
+        source_config
+    );
+
+    // A relative source whose port comes from an absolute include authored
+    // under the process cwd's physical spelling of the home.
+    let included_home = root.child("workspace/included/.openclaw");
+    fs::create_dir_all(&included_home).unwrap();
+    let authored = fs::canonicalize(&cwd).unwrap().join("included/.openclaw");
+    fs::write(
+        included_home.join("openclaw.json"),
+        serde_json::json!({"gateway": {"$include": authored.join("gw.json")}}).to_string(),
+    )
+    .unwrap();
+    fs::write(included_home.join("gw.json"), "{ \"port\": 18850 }\n").unwrap();
+    let output = run_ocm(&cwd, &env, &["migrate", "included", "included/.openclaw"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let show = run_ocm(&cwd, &env, &["env", "show", "included", "--json"]);
+    assert!(show.status.success(), "{}", stderr(&show));
+    let port = serde_json::from_str::<serde_json::Value>(&stdout(&show)).unwrap()["gatewayPort"]
+        .as_u64()
+        .unwrap();
+    assert!(
+        port + 110 < 18_850 || port > 18_960,
+        "included got {port}, inside the source home's port family"
+    );
+
+    // Control: migrating the default home without a path still keeps clear
+    // of its family.
+    let default_root = TestDir::new("migrate-default-source-port");
+    let default_cwd = default_root.child("workspace");
+    fs::create_dir_all(&default_cwd).unwrap();
+    let default_home = default_root.child("home/.openclaw");
+    fs::create_dir_all(&default_home).unwrap();
+    fs::write(default_home.join("openclaw.json"), source_config).unwrap();
+    let default_env = ocm_env(&default_root);
+    let output = run_ocm(&default_cwd, &default_env, &["migrate", "home"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let show = run_ocm(
+        &default_cwd,
+        &default_env,
+        &["env", "show", "home", "--json"],
+    );
+    assert!(show.status.success(), "{}", stderr(&show));
+    let port = serde_json::from_str::<serde_json::Value>(&stdout(&show)).unwrap()["gatewayPort"]
+        .as_u64()
+        .unwrap();
+    assert!(
+        port + 110 < 18_850 || port > 18_960,
+        "home got {port}, inside the default home's port family"
+    );
+}
+
+#[test]
 fn migrate_rejects_include_owned_sandbox_configuration_before_creating_the_target() {
     let root = TestDir::new("migrate-include-owned-sandbox-origin");
     let cwd = root.child("workspace");

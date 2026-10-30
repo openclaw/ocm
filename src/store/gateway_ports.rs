@@ -1,13 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::TcpListener;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
 use crate::env::EnvMeta;
 
 use super::layout::{derive_env_paths, resolve_user_home};
-use super::openclaw_workspaces::load_effective_openclaw_config;
+use super::openclaw_workspaces::{
+    load_effective_openclaw_config, load_effective_openclaw_config_with_config_roots,
+};
 
 pub(crate) const DEFAULT_GATEWAY_PORT: u32 = 18_789;
 const OPENCLAW_PORT_FAMILY_END_OFFSET: u32 = 110;
@@ -75,6 +77,34 @@ pub(crate) fn choose_available_gateway_port(
 ) -> Result<u32, String> {
     let (claimed, allocation_error) = registered_port_claims(envs, env);
     choose_unclaimed_gateway_port(preferred_port, claimed, allocation_error, &[], env)
+}
+
+/// Selects a port as `choose_available_gateway_port` does, also keeping clear
+/// of the family of `plain_home_port`, the port of the plain OpenClaw home
+/// being copied, as the default `~/.openclaw` home's family is kept clear.
+pub(crate) fn choose_available_gateway_port_beside_plain_home(
+    preferred_port: u32,
+    envs: &[EnvMeta],
+    plain_home_port: u32,
+    env: &BTreeMap<String, String>,
+) -> Result<u32, String> {
+    let (mut claimed, allocation_error) = registered_port_claims(envs, env);
+    reserve_openclaw_port_family(plain_home_port, &mut claimed);
+    choose_unclaimed_gateway_port(preferred_port, claimed, allocation_error, &[], env)
+}
+
+/// Reads the Gateway port a plain OpenClaw home configures, inline or through
+/// `$include`, admitting includes authored under any of `source_config_roots`
+/// as migration does.
+pub(crate) fn read_plain_home_gateway_port(
+    state_dir: &Path,
+    source_config_roots: &[PathBuf],
+) -> Result<Option<u32>, String> {
+    let config = load_effective_openclaw_config_with_config_roots(
+        &state_dir.join("openclaw.json"),
+        source_config_roots,
+    )?;
+    Ok(config.and_then(|config| read_port_number(config.value.get("gateway")?.get("port")?)))
 }
 
 /// Keeps `port` unless one of `envs` claims part of its port family, and
@@ -270,6 +300,48 @@ mod tests {
         }
         assert!(next_available_gateway_port(65_536, &BTreeSet::new()).is_err());
         assert!(next_available_gateway_port(u32::MAX, &BTreeSet::new()).is_err());
+    }
+
+    #[test]
+    fn plain_home_allocation_avoids_the_homes_port_family() {
+        let home = tempfile::tempdir().unwrap();
+        let env = BTreeMap::from([("HOME".to_string(), home.path().display().to_string())]);
+        let port = choose_available_gateway_port_beside_plain_home(
+            DEFAULT_GATEWAY_PORT,
+            &[],
+            18_850,
+            &env,
+        )
+        .unwrap();
+        let (start, end) = openclaw_port_family_range(port);
+        assert!(
+            end < 18_850 || start > 18_960,
+            "{port} overlaps 18850..=18960"
+        );
+    }
+
+    #[test]
+    fn plain_home_port_reads_includes_authored_under_a_supplied_root() {
+        let root = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(root.path()).unwrap().join("legacy");
+        std::fs::create_dir_all(home.join("sub")).unwrap();
+        // Authored under a spelling of the home that only the supplied roots admit.
+        let authored = home.join("sub/..");
+        std::fs::write(
+            home.join("openclaw.json"),
+            serde_json::json!({"gateway": {"$include": authored.join("gw.json")}}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(home.join("gw.json"), "{ \"port\": 18850 }\n").unwrap();
+
+        assert_eq!(
+            read_plain_home_gateway_port(&home, &[home.clone(), authored]),
+            Ok(Some(18_850))
+        );
+        assert_eq!(
+            read_plain_home_gateway_port(&root.path().join("missing"), &[]),
+            Ok(None)
+        );
     }
 
     #[test]
