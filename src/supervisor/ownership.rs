@@ -47,7 +47,7 @@ impl SupervisorRuntimeState {
     }
 
     pub(super) fn validate_ownership(&self, home: &str) -> Result<(), String> {
-        if self.kind != SUPERVISOR_RUNTIME_KIND || self.ocm_home != home {
+        if self.kind != SUPERVISOR_RUNTIME_KIND || !same_ocm_home(&self.ocm_home, home) {
             return Err("supervisor runtime ownership belongs to another store or kind".into());
         }
         let rows = self.row_envs();
@@ -274,7 +274,10 @@ impl SupervisorService<'_> {
                 let state: SupervisorState = serde_json::from_slice(&bytes)
                     .map_err(|error| format!("cannot inspect desired supervisor state: {error}"))?;
                 if state.kind != SUPERVISOR_STATE_KIND
-                    || state.ocm_home != display_path(&resolve_ocm_home(self.env, self.cwd)?)
+                    || !same_ocm_home(
+                        &state.ocm_home,
+                        &display_path(&resolve_ocm_home(self.env, self.cwd)?),
+                    )
                 {
                     return Err("desired supervisor state belongs to another store or kind".into());
                 }
