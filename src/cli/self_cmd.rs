@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use semver::Version;
 use serde::Serialize;
 
-use super::self_update_transaction::{Phase, Transaction};
+use super::self_update_transaction::{Phase, Transaction, current_executable};
 use crate::infra::archive::extract_tar_gz;
 use crate::infra::download::{download_to_file, http_agent, verify_file_sha256};
 use crate::infra::install_owner::NpmInstallation;
@@ -442,8 +442,7 @@ impl Cli {
     }
 
     fn current_binary_path(&self) -> Result<PathBuf, String> {
-        std::env::current_exe()
-            .map_err(|error| format!("failed to resolve the current ocm binary: {error}"))
+        current_executable()
     }
 
     fn current_release_asset_name(&self) -> Result<String, String> {

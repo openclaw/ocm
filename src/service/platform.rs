@@ -352,21 +352,47 @@ pub(crate) fn validate_managed_service_executable(
         return Ok(());
     }
     let raw = fs::read_to_string(&definition.definition_path).map_err(|e| e.to_string())?;
-    let marker = match service_manager_kind(env) {
-        ServiceManagerKind::Launchd => format!(
+    let kind = service_manager_kind(env);
+    let marker = |executable: &str| match kind {
+        ServiceManagerKind::Launchd => Some(format!(
             "<key>ProgramArguments</key>\n    <array>\n      <string>{}</string>",
-            plist_escape(&definition.program_arguments[0])
-        ),
-        ServiceManagerKind::SystemdUser => format!(
+            plist_escape(executable)
+        )),
+        ServiceManagerKind::SystemdUser => Some(format!(
             "\nExecStart={} __daemon run\n",
-            systemd_quote(&definition.program_arguments[0])
-        ),
-        ServiceManagerKind::Unsupported => return Err(unsupported_service_manager_message().into()),
+            systemd_quote(executable)
+        )),
+        ServiceManagerKind::Unsupported => None,
     };
-    if !raw.contains(&marker) {
-        return Err("managed daemon uses a different executable or a nonstandard service definition; refusing self-update".into());
+    let expected = &definition.program_arguments[0];
+    let Some(expected_marker) = marker(expected) else {
+        return Err(unsupported_service_manager_message().into());
+    };
+    if raw.contains(&expected_marker) {
+        return Ok(());
     }
-    Ok(())
+    // macOS reports a symlinked executable as the link, so a daemon installed
+    // through one names it; that link still runs the file being updated.
+    if kind == ServiceManagerKind::Launchd
+        && let Some(recorded) = plist::Value::from_reader(std::io::Cursor::new(raw.as_bytes()))
+            .ok()
+            .and_then(|value| {
+                value
+                    .as_dictionary()?
+                    .get("ProgramArguments")?
+                    .as_array()?
+                    .first()?
+                    .as_string()
+                    .map(str::to_owned)
+            })
+        && marker(&recorded).is_some_and(|marker| raw.contains(&marker))
+        && let (Ok(recorded), Ok(expected)) =
+            (fs::canonicalize(&recorded), fs::canonicalize(expected))
+        && recorded == expected
+    {
+        return Ok(());
+    }
+    Err("managed daemon uses a different executable or a nonstandard service definition; refusing self-update".into())
 }
 
 pub(crate) fn deactivate_managed_service(

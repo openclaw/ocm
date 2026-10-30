@@ -45,6 +45,9 @@ original error, and any rollback error. It contains no saved process environment
 The receipt and retained executable live in `.<binary-name>.self-update` beside
 the executable. For an executable named `ocm`, that directory is
 `.ocm.self-update`. The command prints its recovery executable path before waiting.
+When OCM runs through a symlink to its executable, the update, `--check`,
+`--status`, and `--recover` act on the file the symlink resolves to, and the
+journal lives beside that file. The symlink is left unchanged.
 
 If activation or health checks fail, the helper restores the previous CLI and
 refreshes the daemon back to that version. `rolledBack` means recovery succeeded,
@@ -80,9 +83,10 @@ until that command exits. OCM never kills an unknown PID to reclaim a lock.
 - The previous executable and latest receipt remain until the next admitted
   update. This is not a release history or a manual downgrade facility.
 - OCM refuses unknown or already-skewed running daemon versions, another store's
-  daemon, and service definitions bound to another executable. Resolve that
-  existing state before updating. Customized service definitions can require a
-  separate service refresh before admission.
+  daemon, and service definitions bound to another executable. A launchd
+  definition that names a symlink to the executable being updated is bound to
+  that executable. Resolve that existing state before updating. Customized
+  service definitions can require a separate service refresh before admission.
 - The helper preserves current gateway desired state. It does not change
   runtime bindings, gateway configuration, snapshots, or OpenClaw versions.
 - Supported release targets remain macOS x86_64/arm64 and Linux x86_64.
