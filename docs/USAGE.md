@@ -1911,6 +1911,16 @@ filesystem resolves the new name to one of those files. For daemon-named
 environments, name reuse clears only their separate `.<env>.stdout.log` and
 `.<env>.stderr.log` child output; the legacy `daemon.*.log` files remain preserved.
 
+An environment that owns a Git worktree, such as a temporary environment from
+`upgrade simulate --to <local repo>`, has that worktree removed with it. OCM moves
+the worktree's files aside to `.<env>.ocm-removing` beside it before Git
+unregisters the worktree, then deletes them. If deleting them fails, for example
+on an immutable file or while another process is still writing there, the command
+exits with an error that names that directory and the environment stays listed.
+Re-run the same command after fixing the cause to finish the removal. Removal
+still refuses any other directory at the worktree path that is not registered to
+the OpenClaw checkout.
+
 For legacy layouts created before overlapping roots were rejected, removal refuses
 to delete another registered environment's root or a link needed to reach it,
 including through an owned development worktree or its Git registration directory.

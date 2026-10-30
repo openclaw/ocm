@@ -994,7 +994,8 @@ pub(crate) fn ensure_openclaw_worktree(
 
     if worktree_registered {
         if !worktree_root.exists() {
-            remove_registered_worktree(&repo_root, &worktree_root)?;
+            let staged = staged_worktree_removal_root(&worktree_root)?;
+            remove_registered_worktree(&repo_root, &worktree_root, &staged)?;
         } else if is_existing_openclaw_worktree(&repo_root, &worktree_root) {
             return Ok(OpenClawWorktree {
                 root: worktree_root,
@@ -1080,11 +1081,40 @@ pub(crate) fn prepare_openclaw_simulation_worktree_cleanup(
     remove_generated_simulation_outputs(worktree_root)
 }
 
+// The files are moved aside before Git unregisters the worktree, because
+// `git worktree remove` drops the registration even when it fails to delete
+// the files. A failed delete then leaves only this staging path, which is
+// derived from the recorded worktree path, so a retry can finish it while the
+// registration guard keeps refusing any other unregistered path.
 fn remove_openclaw_worktree_checked(repo_root: &Path, worktree_root: &Path) -> Result<(), String> {
-    if !ensure_registered_worktree_identity(repo_root, worktree_root)? {
+    let staged = staged_worktree_removal_root(worktree_root)?;
+    if ensure_registered_worktree_identity(repo_root, worktree_root)? {
+        remove_registered_worktree(repo_root, worktree_root, &staged)?;
+    }
+    if fs::symlink_metadata(&staged).is_err() {
         return Ok(());
     }
-    remove_registered_worktree(repo_root, worktree_root)
+    crate::store::remove_owned_tree(&staged).map_err(|error| {
+        format!(
+            "git worktree {} is no longer registered, but its files at {} could not be deleted: {error}; fix the cause (such as permissions, an immutable flag, or a process still writing there) and re-run the command to finish removing them",
+            display_path(worktree_root),
+            display_path(&staged)
+        )
+    })
+}
+
+fn staged_worktree_removal_root(worktree_root: &Path) -> Result<PathBuf, String> {
+    let worktree_root = clean_path(worktree_root);
+    let (Some(parent), Some(name)) = (worktree_root.parent(), worktree_root.file_name()) else {
+        return Err(format!(
+            "refusing to remove worktree without a parent directory: {}",
+            display_path(&worktree_root)
+        ));
+    };
+    let mut staged = OsString::from(".");
+    staged.push(name);
+    staged.push(".ocm-removing");
+    Ok(parent.join(staged))
 }
 
 fn ensure_registered_worktree_identity(
@@ -1153,24 +1183,60 @@ fn remove_generated_simulation_outputs(worktree_root: &Path) -> Result<(), Strin
     ))
 }
 
-fn remove_registered_worktree(repo_root: &Path, worktree_root: &Path) -> Result<(), String> {
+fn remove_registered_worktree(
+    repo_root: &Path,
+    worktree_root: &Path,
+    staged: &Path,
+) -> Result<(), String> {
     ensure_worktree_clean(worktree_root)?;
 
-    let output = git_command()
+    let moved = fs::symlink_metadata(worktree_root).is_ok();
+    if moved {
+        // Only an earlier interrupted removal of this worktree leaves files here.
+        if fs::symlink_metadata(staged).is_ok() {
+            crate::store::remove_owned_tree(staged).map_err(|error| {
+                format!(
+                    "could not delete files left by an earlier removal of git worktree {} at {}: {error}; fix the cause and re-run the command",
+                    display_path(worktree_root),
+                    display_path(staged)
+                )
+            })?;
+        }
+        fs::rename(worktree_root, staged).map_err(|error| {
+            format!(
+                "could not move git worktree {} aside for removal: {error}; it is still registered, so fix the cause and re-run the command",
+                display_path(worktree_root)
+            )
+        })?;
+    }
+
+    let result = git_command()
         .arg("-C")
         .arg(repo_root)
         .args(["worktree", "remove", "--force"])
         .arg(worktree_root)
         .output()
-        .map_err(|error| format!("failed to run git worktree remove: {error}"))?;
-    if output.status.success() {
+        .map_err(|error| format!("failed to run git worktree remove: {error}"))
+        .and_then(|output| {
+            if output.status.success() {
+                return Ok(());
+            }
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let detail = if !stderr.is_empty() { stderr } else { stdout };
+            Err(format!("git worktree remove failed: {detail}"))
+        });
+    let Err(error) = result else {
         return Ok(());
+    };
+    if moved && let Err(restore) = fs::rename(staged, worktree_root) {
+        return Err(format!(
+            "{error}; its files remain at {} and could not be moved back to {}: {restore}",
+            display_path(staged),
+            display_path(worktree_root)
+        ));
     }
-
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let detail = if !stderr.is_empty() { stderr } else { stdout };
-    Err(format!("git worktree remove failed: {detail}"))
+    Err(error)
 }
 
 fn ensure_worktree_clean(worktree_root: &Path) -> Result<(), String> {
@@ -2476,6 +2542,152 @@ mod tests {
             fs::read_to_string(worktree.join("dist/operator-output.txt")).unwrap(),
             "preserve\n"
         );
+    }
+
+    fn registered(repo: &std::path::Path, worktree: &std::path::Path) -> bool {
+        super::contains_worktree_path(&super::registered_worktree_paths(repo).unwrap(), worktree)
+    }
+
+    fn staged_root(worktree: &std::path::Path) -> PathBuf {
+        super::staged_worktree_removal_root(worktree).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_worktree_removal_deletes_read_only_ignored_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_temp, repo) = init_openclaw_repo();
+        let worktree = ensure_openclaw_worktree(&repo, "demo-sim").unwrap().root;
+        let read_only = worktree.join("node_modules/pkg/sub");
+        fs::create_dir_all(&read_only).unwrap();
+        fs::write(read_only.join("f"), "x\n").unwrap();
+        fs::set_permissions(&read_only, fs::Permissions::from_mode(0o555)).unwrap();
+
+        remove_openclaw_worktree(&repo, &worktree).unwrap();
+
+        assert!(!worktree.exists());
+        assert!(!staged_root(&worktree).exists());
+        assert!(!registered(&repo, &worktree));
+    }
+
+    #[test]
+    fn owned_worktree_removal_finishes_files_left_after_git_unregistered_it() {
+        let (_temp, repo) = init_openclaw_repo();
+        let worktree = ensure_openclaw_worktree(&repo, "demo-sim").unwrap().root;
+        let staged = staged_root(&worktree);
+        fs::create_dir_all(worktree.join("node_modules/pkg")).unwrap();
+        fs::write(worktree.join("node_modules/pkg/index.js"), "x\n").unwrap();
+        // The state an earlier attempt leaves when deleting the moved files failed.
+        fs::rename(&worktree, &staged).unwrap();
+        run_git(
+            &repo,
+            &["worktree", "remove", "--force", worktree.to_str().unwrap()],
+        );
+        assert!(!registered(&repo, &worktree));
+
+        remove_openclaw_worktree(&repo, &worktree).unwrap();
+
+        assert!(!staged.exists());
+        assert!(!worktree.exists());
+    }
+
+    #[test]
+    fn owned_worktree_removal_finishes_after_interruption_before_git_ran() {
+        let (_temp, repo) = init_openclaw_repo();
+        let worktree = ensure_openclaw_worktree(&repo, "demo-sim").unwrap().root;
+        let staged = staged_root(&worktree);
+        fs::rename(&worktree, &staged).unwrap();
+        assert!(registered(&repo, &worktree));
+
+        remove_openclaw_worktree(&repo, &worktree).unwrap();
+
+        assert!(!staged.exists());
+        assert!(!registered(&repo, &worktree));
+    }
+
+    #[test]
+    fn owned_worktree_removal_restores_files_when_git_refuses() {
+        let (_temp, repo) = init_openclaw_repo();
+        let worktree = ensure_openclaw_worktree(&repo, "demo-sim").unwrap().root;
+        run_git(&repo, &["worktree", "lock", worktree.to_str().unwrap()]);
+
+        let error = remove_openclaw_worktree(&repo, &worktree).unwrap_err();
+
+        assert!(error.contains("git worktree remove failed"), "{error}");
+        assert!(worktree.join("package.json").is_file());
+        assert!(!staged_root(&worktree).exists());
+        assert!(registered(&repo, &worktree));
+        run_git(&repo, &["worktree", "unlock", worktree.to_str().unwrap()]);
+        remove_openclaw_worktree(&repo, &worktree).unwrap();
+        assert!(!worktree.exists());
+    }
+
+    #[test]
+    fn owned_worktree_removal_refuses_replaced_unregistered_checkout() {
+        let (_temp, repo) = init_openclaw_repo();
+        let worktree = ensure_openclaw_worktree(&repo, "demo-sim").unwrap().root;
+        run_git(
+            &repo,
+            &["worktree", "remove", "--force", worktree.to_str().unwrap()],
+        );
+        fs::create_dir_all(&worktree).unwrap();
+        fs::write(worktree.join("operator-notes.txt"), "preserve\n").unwrap();
+        let init = Command::new("git")
+            .arg("init")
+            .arg(&worktree)
+            .output()
+            .unwrap();
+        assert!(init.status.success());
+
+        let error = remove_openclaw_worktree(&repo, &worktree).unwrap_err();
+
+        assert!(error.contains("not registered"), "{error}");
+        assert_eq!(
+            fs::read_to_string(worktree.join("operator-notes.txt")).unwrap(),
+            "preserve\n"
+        );
+        assert!(!staged_root(&worktree).exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn owned_worktree_removal_retries_after_an_immutable_file_is_cleared() {
+        let (_temp, repo) = init_openclaw_repo();
+        let worktree = ensure_openclaw_worktree(&repo, "demo-sim").unwrap().root;
+        let staged = staged_root(&worktree);
+        let locked = worktree.join("node_modules/pkg/locked");
+        fs::create_dir_all(locked.parent().unwrap()).unwrap();
+        fs::write(&locked, "x\n").unwrap();
+        let chflags = |flag: &str, path: &std::path::Path| {
+            let status = Command::new("chflags")
+                .arg(flag)
+                .arg(path)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+        chflags("uchg", &locked);
+
+        let first = remove_openclaw_worktree(&repo, &worktree).unwrap_err();
+        let retry = remove_openclaw_worktree(&repo, &worktree).unwrap_err();
+
+        let staged_locked = staged.join("node_modules/pkg/locked");
+        chflags("nouchg", &staged_locked);
+        for error in [&first, &retry] {
+            assert!(
+                error.contains(&crate::store::display_path(&staged)),
+                "{error}"
+            );
+            assert!(error.contains("re-run the command"), "{error}");
+            assert!(!error.contains("not registered to this"), "{error}");
+        }
+        assert!(!worktree.exists());
+        assert!(!registered(&repo, &worktree));
+
+        remove_openclaw_worktree(&repo, &worktree).unwrap();
+
+        assert!(!staged.exists());
     }
 
     #[cfg(unix)]
