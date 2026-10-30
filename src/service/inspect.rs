@@ -363,6 +363,7 @@ fn build_service_summary(
             &supervisor_child_log_path(&logs_dir, &meta.name, stream),
             &meta.name,
             stream,
+            crate::supervisor::registered_env(env, cwd),
         ))
     };
     let fallback_stdout = fallback_log("stdout");

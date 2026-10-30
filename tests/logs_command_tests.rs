@@ -469,73 +469,134 @@ fn creating_a_case_variant_name_keeps_the_registered_envs_logs() {
 }
 
 #[cfg(unix)]
-#[test]
-fn case_distinct_envs_keep_separate_service_output() {
-    use crate::support::{install_fake_service_manager, write_executable_script};
+struct ServiceLogFixture {
+    root: TestDir,
+    cwd: std::path::PathBuf,
+    env: std::collections::BTreeMap<String, String>,
+}
 
-    let root = TestDir::new("logs-case-distinct-service-output");
-    let cwd = root.child("workspace");
-    fs::create_dir_all(&cwd).unwrap();
-    let mut env = ocm_env(&root);
-    install_fake_service_manager(&root, &mut env);
-    let probe = root.child("case-probe");
-    fs::write(&probe, "").unwrap();
-    let case_insensitive = root.child("CASE-PROBE").exists();
-    let gateway = root.child("gateway.sh");
-    write_executable_script(
-        &gateway,
-        "#!/bin/sh\necho \"service-out $OCM_ACTIVE_ENV\"\necho \"service-err $OCM_ACTIVE_ENV\" >&2\nsleep 1\n",
-    );
-    let run = |args: &[&str]| {
-        let output = run_ocm(&cwd, &env, args);
+#[cfg(unix)]
+impl ServiceLogFixture {
+    fn new(label: &str) -> Self {
+        use crate::support::{install_fake_service_manager, write_executable_script};
+
+        let root = TestDir::new(label);
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut env = ocm_env(&root);
+        install_fake_service_manager(&root, &mut env);
+        let gateway = root.child("gateway.sh");
+        write_executable_script(
+            &gateway,
+            "#!/bin/sh\necho \"service-out $OCM_ACTIVE_ENV\"\necho \"service-err $OCM_ACTIVE_ENV\" >&2\nsleep 1\n",
+        );
+        let fixture = Self { root, cwd, env };
+        fixture.run(&["launcher", "add", "gw", "--command", &path_string(&gateway)]);
+        fixture
+    }
+
+    fn case_insensitive(&self) -> bool {
+        fs::write(self.root.child("case-probe"), "").unwrap();
+        self.root.child("CASE-PROBE").exists()
+    }
+
+    fn run(&self, args: &[&str]) {
+        let output = run_ocm(&self.cwd, &self.env, args);
         assert!(output.status.success(), "{args:?}: {}", stderr(&output));
-    };
-    let service_output = |name: &str| {
-        let output = run_ocm(&cwd, &env, &["logs", name, "--json"]);
+    }
+
+    fn create_and_start(&self, name: &str, root: &str) {
+        let root = path_string(&self.root.child(root));
+        self.run(&["env", "create", name, "--launcher", "gw", "--root", &root]);
+        self.run(&["service", "start", name]);
+    }
+
+    fn service_output(&self, name: &str) -> String {
+        let output = run_ocm(&self.cwd, &self.env, &["logs", name, "--json"]);
         if !output.status.success() {
             return String::new();
         }
         let body: Value = serde_json::from_str(&stdout(&output)).unwrap();
         body["content"].as_str().unwrap().to_string()
-    };
-    run(&["launcher", "add", "gw", "--command", &path_string(&gateway)]);
-    run(&["env", "create", "alpha", "--launcher", "gw"]);
-    let other_root = path_string(&root.child("other-root"));
-    run(&[
-        "env",
-        "create",
-        "Alpha",
-        "--launcher",
-        "gw",
-        "--root",
-        &other_root,
-    ]);
-    run(&["service", "start", "alpha"]);
-    run(&["service", "start", "Alpha"]);
-    run(&["__daemon", "run", "--once", "--json"]);
-
-    for (name, other) in [("alpha", "Alpha"), ("Alpha", "alpha")] {
-        let content = service_output(name);
-        for stream in ["out", "err"] {
-            assert!(
-                content.contains(&format!("service-{stream} {name}\n")),
-                "{name}: {content}"
-            );
-            assert!(
-                !content.contains(&format!("service-{stream} {other}\n")),
-                "{name}: {content}"
-            );
-        }
     }
-    // Only case-insensitive storage needs the separate file.
-    let logs_dir = root.child("ocm-home/supervisor/logs");
+
+    /// The service log files `service status` reports for an env.
+    fn status_log_paths(&self, name: &str) -> Vec<std::path::PathBuf> {
+        let output = run_ocm(&self.cwd, &self.env, &["service", "status", name, "--json"]);
+        assert!(output.status.success(), "{}", stderr(&output));
+        let body: Value = serde_json::from_str(&stdout(&output)).unwrap();
+        ["stdoutPath", "stderrPath"]
+            .iter()
+            .map(|key| {
+                let path = body[*key]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{key}: {body}"));
+                std::path::PathBuf::from(path)
+            })
+            .collect()
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn case_distinct_envs_keep_separate_service_output() {
+    let fixture = ServiceLogFixture::new("logs-case-distinct-service-output");
+    let case_insensitive = fixture.case_insensitive();
+    let names = ["alpha", "Alpha", "ALPHA"];
+    for (index, name) in names.iter().enumerate() {
+        fixture.create_and_start(name, &format!("root-{index}"));
+    }
+    fixture.run(&["__daemon", "run", "--once", "--json"]);
+
+    let assert_own_output = |name: &str| {
+        let content = fixture.service_output(name);
+        let files = fixture
+            .status_log_paths(name)
+            .iter()
+            .map(|path| fs::read_to_string(path).unwrap())
+            .collect::<Vec<_>>();
+        for other in names.iter().filter(|other| **other != name) {
+            for stream in ["out", "err"] {
+                let line = format!("service-{stream} {other}\n");
+                assert!(!content.contains(&line), "{name}: {content}");
+                assert!(
+                    !files.iter().any(|file| file.contains(&line)),
+                    "{name}: {files:?}"
+                );
+            }
+        }
+        assert!(
+            content.contains(&format!("service-out {name}\n")),
+            "{name}: {content}"
+        );
+        assert!(
+            content.contains(&format!("service-err {name}\n")),
+            "{name}: {content}"
+        );
+        assert!(
+            files[0].contains(&format!("service-out {name}\n")),
+            "{name}: {files:?}"
+        );
+        assert!(
+            files[1].contains(&format!("service-err {name}\n")),
+            "{name}: {files:?}"
+        );
+    };
+    for name in names {
+        assert_own_output(name);
+    }
+    // Only case-insensitive storage needs the separate files.
+    let logs_dir = fixture.root.child("ocm-home/supervisor/logs");
     assert_eq!(logs_dir.join("case-distinct").exists(), case_insensitive);
 
+    // A stopped env without a running child still reports its own files.
+    fixture.run(&["service", "stop", "Alpha"]);
+    assert_own_output("Alpha");
+
     // A recreated name starts without the removed environment's output.
-    run(&["service", "stop", "Alpha"]);
-    run(&["env", "remove", "Alpha"]);
-    let third_root = path_string(&root.child("third-root"));
-    run(&[
+    fixture.run(&["env", "remove", "Alpha"]);
+    let third_root = path_string(&fixture.root.child("third-root"));
+    fixture.run(&[
         "env",
         "create",
         "Alpha",
@@ -544,8 +605,38 @@ fn case_distinct_envs_keep_separate_service_output() {
         "--root",
         &third_root,
     ]);
-    assert!(!service_output("Alpha").contains("service-"));
-    let content = service_output("alpha");
+    assert!(!fixture.service_output("Alpha").contains("service-"));
+    for name in ["alpha", "ALPHA"] {
+        let content = fixture.service_output(name);
+        assert!(
+            content.contains(&format!("service-out {name}\n")),
+            "{content}"
+        );
+        assert!(!content.contains("service-out Alpha\n"), "{content}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_removed_case_variants_service_logs_do_not_move_a_lone_env() {
+    let fixture = ServiceLogFixture::new("logs-case-variant-leftover");
+    fixture.create_and_start("Alpha", "alpha-upper");
+    fixture.run(&["__daemon", "run", "--once", "--json"]);
+    fixture.run(&["service", "stop", "Alpha"]);
+    fixture.run(&["env", "remove", "Alpha"]);
+
+    fixture.create_and_start("alpha", "alpha-lower");
+    fixture.run(&["__daemon", "run", "--once", "--json"]);
+    let logs_dir = fixture.root.child("ocm-home/supervisor/logs");
+    assert!(!logs_dir.join("case-distinct").exists());
+    assert_eq!(
+        fixture.status_log_paths("alpha"),
+        [
+            logs_dir.join("alpha.stdout.log"),
+            logs_dir.join("alpha.stderr.log")
+        ]
+    );
+    let content = fixture.service_output("alpha");
     assert!(content.contains("service-out alpha\n"), "{content}");
     assert!(!content.contains("service-out Alpha\n"), "{content}");
 }

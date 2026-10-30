@@ -342,31 +342,42 @@ pub fn supervisor_child_log_path(logs_dir: &Path, env_name: &str, stream: &str) 
     logs_dir.join(format!("{prefix}{env_name}.{stream}.log"))
 }
 
+/// A case-distinct file name for an exact environment name. The SHA-256 of the
+/// exact name keeps every accepted name distinct under case folding and keeps
+/// the file name short for any accepted name length.
+fn case_distinct_key(name: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(name.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// Separate service output for a name whose name-keyed file already belongs to
-/// a case-distinct environment on case-insensitive storage. Like the separate
-/// source-watch state, the SHA-256 of the exact name keeps every accepted name
-/// distinct under case folding.
+/// a registered case-distinct environment on case-insensitive storage.
 pub(crate) fn supervisor_child_case_distinct_log_path(
     logs_dir: &Path,
     env_name: &str,
     stream: &str,
 ) -> PathBuf {
-    use sha2::{Digest, Sha256};
-    let key = Sha256::digest(env_name.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
     logs_dir
         .join("case-distinct")
-        .join(format!("{key}.{stream}.log"))
+        .join(format!("{}.{stream}.log", case_distinct_key(env_name)))
 }
 
 /// The file that holds one environment's service output. On case-insensitive
 /// storage `alpha.stdout.log` can open `Alpha.stdout.log`. The directory entry
-/// keeps the spelling of the name that created it, so that name keeps the
-/// file, and the other name uses its own case-distinct file for as long as
-/// that file exists. Name-keyed files are otherwise used unchanged.
-pub(crate) fn supervisor_child_log_file(path: &Path, env_name: &str, stream: &str) -> PathBuf {
+/// keeps the spelling of the name that created it. While that name is a
+/// registered environment, it keeps the file and the other name uses its own
+/// case-distinct file, and a name keeps its case-distinct file once it exists.
+/// Every other name-keyed file, including one left by a removed environment, is
+/// used unchanged.
+pub(crate) fn supervisor_child_log_file(
+    path: &Path,
+    env_name: &str,
+    stream: &str,
+    is_registered: impl FnOnce(&str) -> bool,
+) -> PathBuf {
     let (Some(dir), Some(file_name)) = (path.parent(), path.file_name()) else {
         return path.to_path_buf();
     };
@@ -384,17 +395,29 @@ pub(crate) fn supervisor_child_log_file(path: &Path, env_name: &str, stream: &st
     if fs::symlink_metadata(path).is_err() {
         return path.to_path_buf();
     }
-    // An unreadable directory proves nothing about the spelling; keep the
-    // name-keyed file rather than hiding existing output.
-    let spelled_for_another_name = fs::read_dir(dir).is_ok_and(|entries| {
-        !entries
-            .filter_map(Result::ok)
-            .any(|entry| entry.file_name().to_str() == Some(own))
+    // A listing that cannot be read completely proves nothing about the
+    // spelling; keep the name-keyed file rather than hiding existing output.
+    let Ok(entries) = fs::read_dir(dir).and_then(|entries| entries.collect::<Result<Vec<_>, _>>())
+    else {
+        return path.to_path_buf();
+    };
+    let names = entries
+        .iter()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect::<Vec<_>>();
+    if names.iter().any(|name| name == own) {
+        return path.to_path_buf();
+    }
+    let prefix = &own[..own.len() - own_name.len()];
+    let suffix = format!(".{stream}.log");
+    let creator = names.iter().find_map(|name| {
+        name.eq_ignore_ascii_case(own)
+            .then(|| name.strip_prefix(prefix)?.strip_suffix(&suffix))
+            .flatten()
     });
-    if spelled_for_another_name {
-        separate
-    } else {
-        path.to_path_buf()
+    match creator {
+        Some(creator) if creator != env_name && is_registered(creator) => separate,
+        _ => path.to_path_buf(),
     }
 }
 
@@ -442,17 +465,12 @@ pub fn source_watch_case_distinct_override_path(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<PathBuf, String> {
-    use sha2::{Digest, Sha256};
     let stores = resolve_store_paths(env, cwd)?;
-    let key = Sha256::digest(name.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
     Ok(stores
         .home
         .join("source-watch")
         .join("case-distinct")
-        .join(format!("{key}.json")))
+        .join(format!("{}.json", case_distinct_key(name))))
 }
 
 pub fn snapshot_archive_path(

@@ -122,7 +122,12 @@ pub struct SupervisorChildSpec {
 
 impl SupervisorChildSpec {
     pub(crate) fn log_destination(&self, stream: &str) -> PathBuf {
-        supervisor_child_log_file(&self.saved_log_destination(stream), &self.env_name, stream)
+        supervisor_child_log_file(
+            &self.saved_log_destination(stream),
+            &self.env_name,
+            stream,
+            registered_env(&self.process_env, Path::new(&self.run_dir)),
+        )
     }
 
     fn saved_log_destination(&self, stream: &str) -> PathBuf {
@@ -388,8 +393,8 @@ pub fn sync_supervisor_env_if_present(
 ///
 /// The name's separate case-distinct files are always its own. On a
 /// case-insensitive filesystem the name-keyed path can also resolve to a file
-/// that belongs to someone else: one created under a name that differs only in
-/// case, one a registered env still uses, or the daemon's own
+/// that belongs to someone else: one created under a registered name that
+/// differs only in case, one a registered env still uses, or the daemon's own
 /// daemon.<stream>.log. Those files are kept.
 pub(crate) fn discard_child_logs<'n>(
     env_name: &str,
@@ -398,11 +403,11 @@ pub(crate) fn discard_child_logs<'n>(
     cwd: &Path,
 ) -> Result<(), String> {
     let logs_dir = supervisor_logs_dir(env, cwd)?;
-    let owners = registered
+    let registered = registered
         .into_iter()
-        .filter(|name| *name != env_name)
-        .map(|name| (logs_dir.clone(), name.to_string()))
+        .map(str::to_string)
         .collect::<Vec<_>>();
+    let is_registered = |name: &str| registered.iter().any(|current| current == name);
     let daemon_logs_dir = if env_name.eq_ignore_ascii_case("daemon") {
         Some(SupervisorService::new(env, cwd).saved_daemon_logs_dir()?)
     } else {
@@ -414,17 +419,16 @@ pub(crate) fn discard_child_logs<'n>(
             env_name,
         )?;
         let path = supervisor_child_log_path(&logs_dir, env_name, stream);
-        if supervisor_child_log_file(&path, env_name, stream) != path
-            || owners.iter().any(|(dir, owner)| {
-                is_same_file(
-                    &path,
-                    &supervisor_child_log_file(
-                        &supervisor_child_log_path(dir, owner, stream),
-                        owner,
-                        stream,
-                    ),
-                )
-            })
+        if supervisor_child_log_file(&path, env_name, stream, is_registered) != path
+            || registered
+                .iter()
+                .filter(|owner| *owner != env_name)
+                .any(|owner| {
+                    let owner_path = supervisor_child_log_path(&logs_dir, owner, stream);
+                    is_same_file(&path, &owner_path)
+                        && supervisor_child_log_file(&owner_path, owner, stream, is_registered)
+                            == owner_path
+                })
             || daemon_logs_dir
                 .as_ref()
                 .is_some_and(|dir| is_same_file(&path, &dir.join(format!("daemon.{stream}.log"))))
@@ -444,6 +448,17 @@ fn remove_earlier_child_log(path: &Path, env_name: &str) -> Result<(), String> {
             "failed removing earlier service log {} for env \"{env_name}\": {error}",
             display_path(path)
         )),
+    }
+}
+
+/// Whether a registered environment has exactly this name. Unreadable
+/// registration proves no owner.
+pub(crate) fn registered_env<'a>(
+    env: &'a BTreeMap<String, String>,
+    cwd: &'a Path,
+) -> impl FnOnce(&str) -> bool + 'a {
+    move |name| {
+        list_environments(env, cwd).is_ok_and(|envs| envs.iter().any(|meta| meta.name == name))
     }
 }
 
@@ -780,14 +795,26 @@ impl<'a> SupervisorService<'a> {
             stream,
         );
         if !meta.name.eq_ignore_ascii_case("daemon") {
-            return Ok(supervisor_child_log_file(&default, &meta.name, stream));
+            return Ok(supervisor_child_log_file(
+                &default,
+                &meta.name,
+                stream,
+                registered_env(self.env, self.cwd),
+            ));
         }
         let path = self
             .persisted_child_for_logs(&meta.name, &meta.root)
             .ok()
             .flatten()
             .map(|child| child.log_destination(stream))
-            .unwrap_or_else(|| supervisor_child_log_file(&default, &meta.name, stream));
+            .unwrap_or_else(|| {
+                supervisor_child_log_file(
+                    &default,
+                    &meta.name,
+                    stream,
+                    registered_env(self.env, self.cwd),
+                )
+            });
         Ok(path)
     }
 

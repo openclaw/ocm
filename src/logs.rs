@@ -53,6 +53,10 @@ struct LogSources {
     stream: String,
     gateway_path: PathBuf,
     service_path: PathBuf,
+    /// The registered name and the registered names that differ from it only
+    /// in case, which decide whose name-keyed service file this is.
+    registered_name: String,
+    case_distinct_peers: Vec<String>,
     excluded_paths: Vec<PathBuf>,
     service_available: bool,
 }
@@ -70,8 +74,12 @@ impl LogSources {
     fn select(&self) -> Result<LogTarget, String> {
         // A follower selects again until a file exists. By then a case-distinct
         // name may have created the name-keyed file, which is not this env's.
-        let service_path =
-            supervisor_child_log_file(&self.service_path, &self.env_name, &self.stream);
+        let service_path = supervisor_child_log_file(
+            &self.service_path,
+            &self.registered_name,
+            &self.stream,
+            |name| self.case_distinct_peers.iter().any(|peer| peer == name),
+        );
         let gateway_modified = modified_at(&self.gateway_path);
         let service_modified = if !self.service_available {
             None
@@ -244,12 +252,19 @@ impl<'a> LogService<'a> {
         } else {
             Vec::new()
         };
+        let case_distinct_peers = crate::store::list_environments(self.env, self.cwd)?
+            .into_iter()
+            .map(|current| current.name)
+            .filter(|current| *current != meta.name && current.eq_ignore_ascii_case(&meta.name))
+            .collect();
 
         Ok(LogSources {
             env_name: name.to_string(),
             stream,
             gateway_path,
             service_path,
+            registered_name: meta.name,
+            case_distinct_peers,
             excluded_paths,
             service_available,
         })
@@ -2768,6 +2783,8 @@ mod tests {
             stream: "stderr".to_string(),
             gateway_path: gateway_path.to_path_buf(),
             service_path: service_path.to_path_buf(),
+            registered_name: "demo".to_string(),
+            case_distinct_peers: vec!["Demo".to_string()],
             excluded_paths: Vec::new(),
             service_available: true,
         }
