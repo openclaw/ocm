@@ -404,8 +404,115 @@ fn self_update_unchanged_and_check_do_not_create_a_receipt() {
         assert!(output.status.success(), "{}", stderr(&output));
         let summary: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(summary["status"], "upToDate");
-        assert!(!root.child("bin/.ocm.self-update/receipt.json").exists());
+        assert!(!root.child("bin/.ocm.self-update").exists());
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn self_update_unchanged_needs_no_write_access_beside_the_binary() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = TestDir::new("self-update-unchanged-read-only");
+    let copied = copied_ocm(&root);
+    let bin = copied.parent().unwrap().to_path_buf();
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o555)).unwrap();
+    // Permission bits do not stop a privileged user; the failure cannot be staged then.
+    if fs::write(bin.join("probe"), "").is_ok() {
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+    let current = format!(
+        "{{\"tag_name\":\"v{}\",\"assets\":[]}}",
+        env!("CARGO_PKG_VERSION")
+    );
+    let newer = "{\"tag_name\":\"v9.9.9\",\"assets\":[]}";
+    let release = TestHttpServer::serve_bytes_sequence(
+        "/release",
+        "application/json",
+        vec![
+            current.clone().into_bytes(),
+            current.into_bytes(),
+            newer.as_bytes().to_vec(),
+        ],
+    );
+    let env = release_env(&root, &release.url());
+
+    let mut outputs = Vec::new();
+    for args in [
+        vec!["self", "update", "--check", "--json"],
+        vec!["self", "update", "--json"],
+        vec!["self", "update", "--json"],
+    ] {
+        outputs.push(run_ocm_binary(&copied, root.path(), &env, &args));
+    }
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+    for output in &outputs[..2] {
+        assert!(output.status.success(), "{}", stderr(output));
+        let summary: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(summary["status"], "upToDate");
+    }
+    // A real update must still write beside the binary, so it fails clearly.
+    assert!(!outputs[2].status.success());
+    assert!(
+        stderr(&outputs[2]).contains("cannot create update journal: Permission denied"),
+        "{}",
+        stderr(&outputs[2])
+    );
+    assert!(!bin.join(".ocm.self-update").exists());
+    assert_eq!(release.requests().len(), 3);
+}
+
+#[cfg(unix)]
+#[test]
+fn self_update_unchanged_still_refuses_an_unfinished_receipt() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = TestDir::new("self-update-unchanged-unfinished");
+    // The receipt names the executable path the running binary reports.
+    let copied = fs::canonicalize(copied_ocm(&root)).unwrap();
+    let journal = copied.parent().unwrap().join(".ocm.self-update");
+    fs::create_dir(&journal).unwrap();
+    fs::set_permissions(&journal, fs::Permissions::from_mode(0o700)).unwrap();
+    let receipt = serde_json::json!({
+        "schema": 1,
+        "id": "interrupted",
+        "phase": "applying",
+        "binaryPath": copied,
+        "ocmHome": root.child("ocm-home"),
+        "userHome": root.child("home"),
+        "currentVersion": env!("CARGO_PKG_VERSION"),
+        "targetVersion": env!("CARGO_PKG_VERSION"),
+        "previousSha256": "0",
+        "candidateSha256": "0",
+        "daemonWasRunning": false,
+        "gateways": [],
+        "error": null,
+        "rollbackError": null,
+    });
+    let receipt_bytes = serde_json::to_vec_pretty(&receipt).unwrap();
+    fs::write(journal.join("receipt.json"), &receipt_bytes).unwrap();
+    let metadata = format!(
+        "{{\"tag_name\":\"v{}\",\"assets\":[]}}",
+        env!("CARGO_PKG_VERSION")
+    );
+    let release =
+        TestHttpServer::serve_bytes_times("/release", "application/json", metadata.as_bytes(), 1);
+    let env = release_env(&root, &release.url());
+
+    let output = run_ocm_binary(&copied, root.path(), &env, &["self", "update", "--json"]);
+    assert!(!output.status.success(), "{}", stdout(&output));
+    assert!(
+        stderr(&output).contains("unfinished self-update"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(
+        fs::read(journal.join("receipt.json")).unwrap(),
+        receipt_bytes
+    );
+    assert!(release.requests().is_empty());
 }
 
 #[test]
