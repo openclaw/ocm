@@ -613,13 +613,16 @@ impl<'a> EnvironmentService<'a> {
                     candidate, envs,
                 )?;
             }
+            if selected.is_empty() {
+                return Ok(Vec::new());
+            }
+            let footprints = crate::store::DevSourceFootprints::inspect(envs, self);
             Ok(selected
                 .into_iter()
                 .map(|candidate| {
-                    let blocker = crate::store::ensure_environment_removal_preserves_dev_sources(
-                        &candidate, envs, self,
-                    )
-                    .err();
+                    let blocker = footprints
+                        .ensure_environment_removal_preserves(&candidate)
+                        .err();
                     (candidate, blocker)
                 })
                 .collect::<Vec<_>>())
@@ -649,13 +652,9 @@ impl<'a> EnvironmentService<'a> {
             stopped: None,
         };
         for meta in plan.candidates {
-            match self.prune_candidate(&meta, cutoff) {
-                Ok(Some(removed)) => result.removed.push(removed),
-                Ok(None) => {}
-                Err(error) => {
-                    result.stopped = Some(error);
-                    break;
-                }
+            if let Err(error) = self.prune_candidate(&meta, cutoff, &mut result.removed) {
+                result.stopped = Some(error);
+                break;
             }
         }
         Ok(result)
@@ -665,7 +664,8 @@ impl<'a> EnvironmentService<'a> {
         &self,
         meta: &EnvMeta,
         cutoff: OffsetDateTime,
-    ) -> Result<Option<EnvMeta>, String> {
+        removed: &mut Vec<EnvMeta>,
+    ) -> Result<(), String> {
         let _lock = self.lock_operation(&meta.name)?;
         let current = self.get(&meta.name)?;
         // Waiting for an earlier candidate can outlive use, replacement or
@@ -676,9 +676,19 @@ impl<'a> EnvironmentService<'a> {
             || current.last_used_at.unwrap_or(current.created_at) >= cutoff
             || service_keeps_gateway_running(&current)
         {
-            return Ok(None);
+            return Ok(());
         }
-        self.remove_locked(&meta.name, false).map(Some)
+        // Record the removal before the supervisor sync, which can still fail
+        // after the environment is gone.
+        removed.push(remove_environment_locked(
+            &meta.name,
+            false,
+            self.env,
+            self.cwd,
+            |_| Ok(()),
+        )?);
+        sync_supervisor_env_if_present(self.env, self.cwd, &meta.name)?;
+        Ok(())
     }
 
     pub(crate) fn resolve_effective_gateway_port(

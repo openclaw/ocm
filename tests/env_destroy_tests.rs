@@ -462,6 +462,43 @@ fn env_prune_revalidates_candidates_after_waiting_for_operation_locks() {
 }
 
 #[test]
+fn env_prune_reports_a_removal_whose_supervisor_sync_failed() {
+    let root = TestDir::new("env-prune-sync-failure");
+    let cwd = root.path();
+    let env = ocm_env(&root);
+    for name in ["a-first", "b-second"] {
+        let created = run_ocm(cwd, &env, &["env", "create", name]);
+        assert!(created.status.success(), "{}", stderr(&created));
+        let mut meta = get_environment(name, &env, cwd).unwrap();
+        meta.created_at -= time::Duration::days(30);
+        save_environment(meta, &env, cwd).unwrap();
+    }
+    let first = get_environment("a-first", &env, cwd).unwrap();
+    // A supervisor state that cannot be locked fails the sync that follows
+    // each removal, after the environment is already gone.
+    let supervisor = root.child("ocm-home").join("supervisor");
+    fs::create_dir_all(supervisor.join("state.lock")).unwrap();
+    fs::write(supervisor.join("state.json"), "{}").unwrap();
+
+    let output = run_ocm(cwd, &env, &["env", "prune", "--yes", "--json"]);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let result: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert_eq!(result["code"], "partial_apply");
+    assert!(
+        result["error"]
+            .as_str()
+            .unwrap()
+            .contains("supervisor state"),
+        "{result}"
+    );
+    assert_eq!(result["count"], 1);
+    assert_eq!(result["removed"][0]["name"], "a-first");
+    assert!(get_environment("a-first", &env, cwd).is_err());
+    assert!(!Path::new(&first.root).exists());
+    assert!(get_environment("b-second", &env, cwd).is_ok());
+}
+
+#[test]
 fn env_prune_skips_environments_whose_service_keeps_the_gateway_running() {
     let root = TestDir::new("env-prune-service-backed");
     let cwd = root.child("workspace");

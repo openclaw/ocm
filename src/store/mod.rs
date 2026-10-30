@@ -30,7 +30,9 @@ pub(crate) use common::{
     read_json, remove_owned_tree, try_lock_file, write_json, write_json_detailed,
 };
 pub(crate) use dev_registration::{DevSourceRegistration, with_prepared_dev_source};
-pub(crate) use dev_sources::ensure_environment_removal_preserves_dev_sources;
+pub(crate) use dev_sources::{
+    DevSourceFootprints, ensure_environment_removal_preserves_dev_sources,
+};
 pub(crate) use dev_ui_ports::reserve as reserve_dev_ui_port;
 pub(crate) use envs::{
     EnvironmentOperationLock, ensure_environment_removal_preserves_registered_roots,
