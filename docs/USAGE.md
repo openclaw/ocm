@@ -2111,6 +2111,12 @@ ocm --color always runtime list
 - artifact export
 - remove, destroy, prune
 
+### `dev`
+
+- status
+- rebind
+- stop
+
 ### `adopt`
 
 - import

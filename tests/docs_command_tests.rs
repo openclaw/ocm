@@ -62,6 +62,19 @@ impl Help {
         let is_group = path.is_empty() || (path[0] != "help" && text.lines().any(lists_commands));
         is_group.then(|| listed_commands(&text))
     }
+
+    /// The commands a topic lists in its help: a group's, or those of a
+    /// command that also takes a name, such as `ocm dev <env>` with
+    /// `ocm dev stop`. `None` for a topic that lists none.
+    fn listing(&mut self, path: &[String]) -> Option<Vec<String>> {
+        if let Some(commands) = self.commands(path) {
+            return Some(commands);
+        }
+        let text = self.text(path)?;
+        let lists = path.first().map(String::as_str) != Some("help")
+            && text.lines().any(|line| line == "Commands:");
+        lists.then(|| listed_commands(&text))
+    }
 }
 
 /// Every command name in a help text's sections, such as `create` or
@@ -76,7 +89,7 @@ fn listed_commands(help: &str) -> Vec<String> {
         }
         if matches!(
             section,
-            "Usage" | "Examples" | "More" | "Global options" | "Get started"
+            "Usage" | "Options" | "Examples" | "Notes" | "More" | "Global options" | "Get started"
         ) || !line.starts_with("  ")
             || line.starts_with("   ")
         {
@@ -142,6 +155,25 @@ fn check_command(help: &mut Help, tokens: &[String]) -> Result<(), String> {
         }
         path.push(token.clone());
         index += 1;
+        // `artifact export` is listed by its parent but is a command of its own.
+        let completions: BTreeSet<&str> = commands
+            .iter()
+            .filter_map(|command| command.split_once(' '))
+            .filter(|(group, _)| group == token)
+            .map(|(_, rest)| rest)
+            .collect();
+        if !completions.is_empty()
+            && help.commands(&path).is_none()
+            && let Some(next) = tokens.get(index).filter(|next| is_word(next))
+        {
+            if !completions.contains(next.as_str()) {
+                return Err(format!(
+                    "`{next}` is not a command of `ocm {}`",
+                    path.join(" ")
+                ));
+            }
+            index += 1;
+        }
     }
     if path.first().map(String::as_str) == Some("help") {
         let topic: Vec<String> = tokens[index..]
@@ -160,61 +192,88 @@ fn strings(tokens: &[&str]) -> Vec<String> {
     tokens.iter().map(|token| token.to_string()).collect()
 }
 
-/// Splits one shell line into words, stopping at a control operator,
-/// redirection or comment.
-fn shell_words(line: &str) -> Vec<String> {
-    let mut words = Vec::new();
+/// Splits one shell line into its simple commands, each a list of words. A
+/// pipe, `&&`, `||` or `;` starts the next command; a redirection drops the
+/// rest of its command; a comment drops the rest of the line.
+fn shell_commands(line: &str) -> Vec<Vec<String>> {
+    let mut commands = Vec::new();
+    let mut words: Vec<String> = Vec::new();
     let mut current = String::new();
     let mut quote = None;
     let mut started = false;
+    let mut redirected = false;
     let mut chars = line.chars().peekable();
     while let Some(c) = chars.next() {
-        match quote {
-            Some(open) if c == open => quote = None,
-            Some(_) => current.push(c),
-            None => match c {
-                '\'' | '"' => {
-                    quote = Some(c);
-                    started = true;
+        if let Some(open) = quote {
+            if c == open {
+                quote = None;
+            } else if !redirected {
+                current.push(c);
+            }
+            continue;
+        }
+        let operator = matches!(c, '|' | '&' | ';');
+        if operator || c.is_whitespace() || c == '#' && !started && current.is_empty() {
+            if started || !current.is_empty() {
+                if !redirected {
+                    words.push(std::mem::take(&mut current));
                 }
-                '<' | '>' if current.is_empty() && !started => {
-                    // `<env>` is a placeholder; `> file` is a redirection.
-                    if chars.peek().is_some_and(char::is_ascii_alphabetic) {
-                        current.push(c);
-                    } else {
-                        break;
-                    }
+                current.clear();
+                started = false;
+            }
+            if c == '#' && !operator {
+                break;
+            }
+            if operator {
+                commands.push(std::mem::take(&mut words));
+                redirected = false;
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' => {
+                quote = Some(c);
+                started = true;
+            }
+            // `<env>` is a placeholder; `> file` is a redirection.
+            '<' | '>' if current.is_empty() && !started => {
+                if chars.peek().is_some_and(char::is_ascii_alphabetic) {
+                    current.push(c);
+                } else {
+                    redirected = true;
                 }
-                '>' if current.starts_with('<') => current.push(c),
-                '|' | '&' | ';' | '<' | '>' => break,
-                '#' if !started && current.is_empty() => break,
-                c if c.is_whitespace() => {
-                    if started || !current.is_empty() {
-                        words.push(std::mem::take(&mut current));
-                        started = false;
-                    }
-                }
-                c => current.push(c),
-            },
+            }
+            '>' if current.starts_with('<') => current.push(c),
+            '<' | '>' => {
+                redirected = true;
+                current.clear();
+                started = false;
+            }
+            c if !redirected => current.push(c),
+            _ => {}
         }
     }
-    if started || !current.is_empty() {
+    if (started || !current.is_empty()) && !redirected {
         words.push(current);
     }
-    words
+    commands.push(words);
+    commands
 }
 
-/// The tokens after `ocm` when `snippet` invokes the CLI, such as `ocm env
-/// list` or `"$OCM_BIN" env list`.
-fn invocation(snippet: &str) -> Option<Vec<String>> {
-    let words = shell_words(snippet.trim().trim_start_matches("$ "));
-    let mut words = words.iter().skip_while(|word| {
-        word.split_once('=')
-            .is_some_and(|(name, _)| is_word(name) && !name.contains('-'))
-    });
-    let program = words.next()?;
-    matches!(program.as_str(), "ocm" | "$OCM_BIN" | "${OCM_BIN}")
-        .then(|| words.map(String::to_string).collect())
+/// The tokens after `ocm` in each simple command of `snippet` that invokes the
+/// CLI, such as `ocm env list` or `"$OCM_BIN" env list`.
+fn invocations_in(snippet: &str) -> Vec<Vec<String>> {
+    shell_commands(snippet.trim().trim_start_matches("$ "))
+        .into_iter()
+        .filter_map(|words| {
+            let mut words = words.into_iter().skip_while(|word| {
+                word.split_once('=')
+                    .is_some_and(|(name, _)| is_word(name) && !name.contains('-'))
+            });
+            let program = words.next()?;
+            matches!(program.as_str(), "ocm" | "$OCM_BIN" | "${OCM_BIN}").then(|| words.collect())
+        })
+        .collect()
 }
 
 /// Every documented invocation with its 1-based source line.
@@ -222,11 +281,14 @@ fn invocations(markdown: &str) -> Vec<(usize, Vec<String>)> {
     let mut found = Vec::new();
     let mut in_fence = false;
     let mut pending: Option<(usize, String)> = None;
+    // An inline code span can wrap onto the next line of its paragraph.
+    let mut span: Option<(usize, String)> = None;
     for (index, line) in markdown.lines().enumerate() {
         let number = index + 1;
         if line.trim_start().starts_with("```") {
             in_fence = !in_fence;
             pending = None;
+            span = None;
             continue;
         }
         if in_fence {
@@ -238,15 +300,22 @@ fn invocations(markdown: &str) -> Vec<(usize, Vec<String>)> {
                 continue;
             }
             command.push_str(line);
-            if let Some(tokens) = invocation(&command) {
-                found.push((start, tokens));
-            }
+            found.extend(invocations_in(&command).into_iter().map(|c| (start, c)));
+        } else if line.trim().is_empty() {
+            span = None;
         } else {
-            for (position, span) in line.split('`').enumerate() {
-                if position % 2 == 1
-                    && let Some(tokens) = invocation(span)
-                {
-                    found.push((number, tokens));
+            for (position, part) in line.split('`').enumerate() {
+                if position > 0 {
+                    match span.take() {
+                        Some((start, text)) => {
+                            found.extend(invocations_in(&text).into_iter().map(|c| (start, c)))
+                        }
+                        None => span = Some((number, String::new())),
+                    }
+                }
+                if let Some((_, text)) = span.as_mut() {
+                    text.push(' ');
+                    text.push_str(part);
                 }
             }
         }
@@ -315,6 +384,7 @@ fn command_check_rejects_removed_commands_and_accepts_current_ones() {
         &["service", "restore-global"],
         &["env", "repair-marker", "mira"],
         &["env", "snapshot", "bogus"],
+        &["env", "artifact", "bogus"],
         &["help", "service", "list"],
     ] {
         assert!(
@@ -334,6 +404,9 @@ fn command_check_rejects_removed_commands_and_accepts_current_ones() {
         &["env", "protect", "mira", "on"],
         &["env", "snapshot", "create", "mira"],
         &["env", "artifact", "export", "mira"],
+        &["dev", "stop", "luna"],
+        &["dev", "shaks", "--no-ui"],
+        &["upgrade", "simulate", "mira", "--to", "beta"],
         &["--color", "always", "runtime", "list"],
         &["--version"],
         &["@mira", "--", "status"],
@@ -352,11 +425,14 @@ fn command_check_rejects_removed_commands_and_accepts_current_ones() {
 fn invocations_are_found_in_fences_continuations_and_inline_code() {
     let markdown = "\
 Use `ocm service status` or `\"$OCM_BIN\" logs <env>`, not `brew install ocm`.
+A wrapped `ocm env
+list` span precedes `ocm env doctor mira`.
 
 ```bash
 $ ocm env create mira \\
   --launcher stable
 OCM_HOME=/tmp/x ocm service install mira | cat
+ocm env list > envs.txt && ocm service status --json
 # ocm service list
 echo ocm service list
 ```
@@ -366,11 +442,15 @@ echo ocm service list
         vec![
             (1, strings(&["service", "status"])),
             (1, strings(&["logs", "<env>"])),
+            (2, strings(&["env", "list"])),
+            (3, strings(&["env", "doctor", "mira"])),
             (
-                4,
+                6,
                 strings(&["env", "create", "mira", "--launcher", "stable"])
             ),
-            (6, strings(&["service", "install", "mira"])),
+            (8, strings(&["service", "install", "mira"])),
+            (9, strings(&["env", "list"])),
+            (9, strings(&["service", "status", "--json"])),
         ]
     );
 }
@@ -425,7 +505,7 @@ fn usage_command_map_matches_the_help_listing() {
         let topic = format!("ocm help {}", path.join(" "));
         let topic = topic.trim_end();
         let listed: BTreeSet<String> = help
-            .commands(path)
+            .listing(path)
             .unwrap_or_else(|| panic!("`{topic}` lists no commands"))
             .into_iter()
             .collect();
@@ -438,7 +518,7 @@ fn usage_command_map_matches_the_help_listing() {
     let top = help.commands(&[]).expect("top-level help");
     for command in top.iter().filter(|command| !command.starts_with('-')) {
         let path = vec![command.clone()];
-        if help.commands(&path).is_some() {
+        if help.listing(&path).is_some() {
             assert!(
                 mapped.contains_key(&path),
                 "the Command map has no section for `ocm {command}`, which lists subcommands"
