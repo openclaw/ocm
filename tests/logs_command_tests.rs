@@ -687,6 +687,57 @@ fn a_recreated_name_keeps_its_output_apart_from_a_registered_case_variant() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn a_failed_takeover_of_a_leftover_service_log_keeps_the_variants_output() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = ServiceLogFixture::new("logs-case-variant-failed-takeover");
+    fixture.create_and_start("alpha", "alpha-first");
+    fixture.run(&["__daemon", "run", "--once", "--json"]);
+    let upper_root = path_string(&fixture.root.child("alpha-upper"));
+    fixture.run(&[
+        "env",
+        "create",
+        "Alpha",
+        "--launcher",
+        "gw",
+        "--root",
+        &upper_root,
+    ]);
+    fixture.run(&["service", "stop", "alpha"]);
+    fixture.run(&["env", "remove", "alpha"]);
+
+    // Alpha starts while the leftover's directory entry cannot be renamed.
+    let logs_dir = fixture.root.child("ocm-home/supervisor/logs");
+    fixture.run(&["service", "start", "Alpha"]);
+    fs::set_permissions(&logs_dir, fs::Permissions::from_mode(0o555)).unwrap();
+    let _ = run_ocm(
+        &fixture.cwd,
+        &fixture.env,
+        &["__daemon", "run", "--once", "--json"],
+    );
+    fs::set_permissions(&logs_dir, fs::Permissions::from_mode(0o755)).unwrap();
+    let before = fixture.service_output("Alpha");
+
+    // Registering alpha again must not delete output Alpha already wrote.
+    fixture.create_and_start("alpha", "alpha-second");
+    let after = fixture.service_output("Alpha");
+    assert_eq!(
+        after.matches("service-out Alpha\n").count(),
+        before.matches("service-out Alpha\n").count(),
+        "before: {before}\nafter: {after}"
+    );
+    fixture.run(&["__daemon", "run", "--once", "--json"]);
+    let content = fixture.service_output("alpha");
+    assert_eq!(
+        content.matches("service-out alpha\n").count(),
+        1,
+        "{content}"
+    );
+    assert!(!content.contains("service-out Alpha\n"), "{content}");
+}
+
 #[test]
 fn env_create_fails_when_an_earlier_service_log_cannot_be_deleted() {
     let root = TestDir::new("logs-create-undeletable");

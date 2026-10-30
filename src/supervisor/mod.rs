@@ -131,7 +131,7 @@ impl SupervisorChildSpec {
     }
 
     /// The file a newly spawned child writes; see `log_destination`.
-    fn spawn_log_destination(&self, stream: &str) -> PathBuf {
+    fn spawn_log_destination(&self, stream: &str) -> Result<PathBuf, String> {
         adopt_supervisor_child_log_file(
             &self.saved_log_destination(stream),
             &self.env_name,
@@ -2119,8 +2119,8 @@ fn spawn_supervisor_child(spec: &SupervisorChildSpec) -> Result<Child, String> {
             spec.env_name
         ));
     };
-    let stdout_path = spec.spawn_log_destination("stdout");
-    let stderr_path = spec.spawn_log_destination("stderr");
+    let stdout_path = spec.spawn_log_destination("stdout")?;
+    let stderr_path = spec.spawn_log_destination("stderr")?;
     let daemon_logs = if spec.env_name.eq_ignore_ascii_case("daemon") {
         SupervisorService::new(&spec.process_env, Path::new(&spec.run_dir)).daemon_log_paths()?
     } else {

@@ -383,20 +383,25 @@ pub(crate) fn supervisor_child_log_file(
 
 /// The file a newly spawned child writes. A file left under a removed
 /// environment's spelling is renamed to this name's spelling first, so the
-/// file stays this environment's when that spelling is registered again.
+/// file stays this environment's when that spelling is registered again. A
+/// child must not write the file under the other spelling, so a failed rename
+/// is an error.
 pub(crate) fn adopt_supervisor_child_log_file(
     path: &Path,
     env_name: &str,
     stream: &str,
     is_registered: impl FnOnce(&str) -> Option<bool>,
-) -> PathBuf {
+) -> Result<PathBuf, String> {
     let (file, leftover) = resolve_child_log_file(path, env_name, stream, is_registered);
     if let Some(leftover) = leftover {
-        // A failed rename leaves the spelling as it was; output still goes to
-        // the same file.
-        let _ = fs::rename(leftover, &file);
+        fs::rename(&leftover, &file).map_err(|error| {
+            format!(
+                "failed taking over service log {} for env \"{env_name}\": {error}",
+                display_path(&leftover)
+            )
+        })?;
     }
-    file
+    Ok(file)
 }
 
 /// The resolved file, and the entry it opens when that entry is spelled for a
@@ -547,13 +552,13 @@ mod tests {
 
         // Registration that cannot be read never moves the entry.
         assert_eq!(
-            adopt_supervisor_child_log_file(&path, "alpha", "stdout", |_| None),
+            adopt_supervisor_child_log_file(&path, "alpha", "stdout", |_| None).unwrap(),
             path
         );
         assert_eq!(entry_names(dir), ["Alpha.stdout.log"]);
 
         assert_eq!(
-            adopt_supervisor_child_log_file(&path, "alpha", "stdout", |_| Some(false)),
+            adopt_supervisor_child_log_file(&path, "alpha", "stdout", |_| Some(false)).unwrap(),
             path
         );
         let expected = if case_insensitive {
@@ -562,5 +567,29 @@ mod tests {
             "Alpha.stdout.log"
         };
         assert_eq!(entry_names(dir), [expected]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_takeover_of_a_case_variants_service_log_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("logs");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("alpha.stdout.log"), "left output\n").unwrap();
+        let case_insensitive = dir.join("ALPHA.STDOUT.LOG").exists();
+        let path = dir.join("Alpha.stdout.log");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let result = adopt_supervisor_child_log_file(&path, "Alpha", "stdout", |_| Some(false));
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        if case_insensitive {
+            let error = result.unwrap_err();
+            assert!(error.contains("failed taking over service log"), "{error}");
+        } else {
+            assert_eq!(result.unwrap(), path);
+        }
+        assert_eq!(entry_names(&dir), ["alpha.stdout.log"]);
     }
 }
