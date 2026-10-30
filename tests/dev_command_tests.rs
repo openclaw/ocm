@@ -6532,18 +6532,32 @@ fn dev_destroy_stops_the_recorded_watch_before_removing_state() {
         let guarded: Value = serde_json::from_str(&stdout(&guarded)).unwrap();
         assert_eq!(guarded["code"], "source_watch_active");
         assert_eq!(fs::read(&session_path).unwrap(), session_before);
+        let refused = run_ocm(&cwd, &env, &["env", "remove", "demo", "--force"]);
+        assert!(!refused.status.success());
+        assert!(
+            stderr(&refused).contains("unfinished ownership"),
+            "{}",
+            stderr(&refused)
+        );
+        // Prune's preview and apply agree that the watched env is blocked.
         for args in [
-            vec!["env", "remove", "demo", "--force"],
-            vec!["env", "prune", "--older-than", "1", "--yes"],
+            vec!["env", "prune", "--older-than", "1", "--json"],
+            vec!["env", "prune", "--older-than", "1", "--yes", "--json"],
         ] {
-            let refused = run_ocm(&cwd, &env, &args);
-            assert!(!refused.status.success());
+            let pruned = run_ocm(&cwd, &env, &args);
+            assert!(pruned.status.success(), "{}", stderr(&pruned));
+            let pruned: Value = serde_json::from_str(&stdout(&pruned)).unwrap();
+            assert_eq!(pruned["count"], 0, "{pruned}");
+            assert_eq!(pruned["blocked"][0]["name"], "demo", "{pruned}");
             assert!(
-                stderr(&refused).contains("unfinished ownership"),
-                "{}",
-                stderr(&refused)
+                pruned["blocked"][0]["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("unfinished ownership"),
+                "{pruned}"
             );
         }
+        assert_eq!(fs::read(&session_path).unwrap(), session_before);
         let direct = ocm::store::remove_environment("demo", true, &env, &cwd);
         assert!(direct.unwrap_err().contains("unfinished ownership"));
         let destroyed = run_ocm(&cwd, &env, &["env", "destroy", "demo", "--yes", "--json"]);
