@@ -1238,6 +1238,7 @@ sandbox port that follows it. When a copied include that sets the port is also
 included elsewhere in the config, or the copied config would still set another
 port, the command fails and names the file instead of creating an environment
 that shares a Gateway port.
+
 Migration and adoption also relocate installed-plugin records authored under either
 the supplied home spelling or its canonical path. This includes internal local
 plugins when the home is supplied through an alias. Payloads must remain inside
