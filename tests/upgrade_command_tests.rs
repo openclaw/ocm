@@ -11252,17 +11252,22 @@ fn upgrade_all_failed_entries_report_the_recorded_binding() {
     let text = run_ocm(&cwd, &env, &["upgrade", "--all", "--dry-run"]);
     assert_eq!(text.status.code(), Some(1), "{}", stdout(&text));
     let text = stdout(&text);
-    assert!(
-        text.contains("runtime-failed  from=runtime:rt-lost  to=runtime:rt-lost  outcome=failed"),
-        "{text}"
-    );
-    assert!(
-        text.contains(
-            "launcher-failed  from=launcher:lc-corrupt  to=launcher:lc-corrupt  outcome=failed"
-        ),
-        "{text}"
-    );
-    assert!(!text.contains("unknown"), "{text}");
+    for (name, binding) in [
+        ("runtime-failed", "runtime:rt-lost"),
+        ("launcher-failed", "launcher:lc-corrupt"),
+    ] {
+        let row = text
+            .lines()
+            .find(|line| line.starts_with(name))
+            .unwrap_or_else(|| panic!("missing {name} row: {text}"));
+        for part in [
+            format!("from={binding}"),
+            format!("to={binding}"),
+            "outcome=failed".to_string(),
+        ] {
+            assert!(row.contains(&part), "{row}");
+        }
+    }
 }
 
 fn setup_named_runtime_candidate_fixture(

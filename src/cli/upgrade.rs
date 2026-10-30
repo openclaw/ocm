@@ -6917,7 +6917,7 @@ fn unbound_summary(env_name: &str, env: &crate::env::EnvMeta) -> UpgradeEnvSumma
 }
 
 fn failed_summary(env: &crate::env::EnvMeta, error: String) -> UpgradeEnvSummary {
-    // `--all` upgrades in place and accepts no selector, so the entry keeps the binding it started from.
+    // An error from `upgrade_env` is raised before the binding is published, so the entry still has the binding it started from.
     let (binding_kind, binding_name) = source_binding(env);
     UpgradeEnvSummary {
         source: None,
