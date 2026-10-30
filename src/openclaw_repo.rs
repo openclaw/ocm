@@ -1096,7 +1096,7 @@ fn remove_openclaw_worktree_checked(repo_root: &Path, worktree_root: &Path) -> R
     }
     crate::store::remove_owned_tree(&staged).map_err(|error| {
         format!(
-            "git worktree {} is no longer registered, but its files at {} could not be deleted: {error}; fix the cause (such as permissions, an immutable flag, or a process still writing there) and re-run the command to finish removing them",
+            "the files of git worktree {} were moved to {} for removal but could not be deleted: {error}; fix the cause (such as permissions, an immutable flag, or a process still writing there) and re-run the command to finish removing them",
             display_path(worktree_root),
             display_path(&staged)
         )

@@ -494,6 +494,11 @@ pub(crate) fn with_prepared_dev_source<T>(
                     })
                 });
             if let Err(cleanup) = cleanup {
+                // A failed delete after the files were moved aside names
+                // their location itself.
+                if fs::symlink_metadata(&worktree.root).is_err() {
+                    return Err(format!("{error}; {cleanup}"));
+                }
                 return Err(format!(
                     "{error}; prepared worktree retained at {}: {cleanup}",
                     display_path(&worktree.root)

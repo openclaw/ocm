@@ -1913,8 +1913,9 @@ environments, name reuse clears only their separate `.<env>.stdout.log` and
 
 An environment that owns a Git worktree, such as a temporary environment from
 `upgrade simulate --to <local repo>`, has that worktree removed with it. OCM moves
-the worktree's files aside to `.<env>.ocm-removing` beside it before Git
-unregisters the worktree, then deletes them. If deleting them fails, for example
+the worktree's files aside to `.<name>.ocm-removing` beside it, where `<name>` is
+the worktree directory's name (the environment name for worktrees OCM creates),
+before Git unregisters the worktree, then deletes them. If deleting them fails, for example
 on an immutable file or while another process is still writing there, the command
 exits with an error that names that directory and the environment stays listed.
 Re-run the same command after fixing the cause to finish the removal. Removal
