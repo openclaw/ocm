@@ -1816,6 +1816,52 @@ mod tests {
     }
 
     #[test]
+    fn env_status_pretty_suggests_dev_repair_for_an_unusable_checkout() {
+        let lines = env_status(
+            &EnvStatusSummary {
+                env_name: "demo".to_string(),
+                root: "/tmp/demo".to_string(),
+                gateway_port: Some(18789),
+                gateway_port_source: Some("metadata".to_string()),
+                default_runtime: None,
+                default_launcher: None,
+                resolved_kind: Some("dev".to_string()),
+                resolved_name: Some("dev".to_string()),
+                binary_path: Some("pnpm".to_string()),
+                command: Some("pnpm openclaw".to_string()),
+                run_dir: Some("/tmp/checkout".to_string()),
+                runtime_source_kind: None,
+                runtime_release_version: None,
+                runtime_release_channel: None,
+                runtime_health: None,
+                managed_service_state: Some("absent".to_string()),
+                openclaw_state: Some("stopped".to_string()),
+                global_service_state: None,
+                service_definition_drift: None,
+                service_live_exec_unverified: None,
+                service_orphaned_live: None,
+                service_issue: None,
+                issue: Some("OpenClaw checkout not found at /tmp/checkout".to_string()),
+            },
+            RenderProfile::pretty(false),
+            "ocm",
+        );
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("OpenClaw checkout not found at /tmp/checkout"))
+        );
+        assert!(lines.iter().any(|line| line.contains("ocm env show demo")));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("ocm dev rebind demo --repo <checkout>"))
+        );
+        assert!(!lines.iter().any(|line| line.contains("ocm @demo")));
+    }
+
+    #[test]
     fn env_resolved_pretty_uses_cards() {
         let lines = env_resolved(
             &ExecutionSummary {
@@ -2496,6 +2542,22 @@ fn env_status_next_steps(status: &EnvStatusSummary, command_example: &str) -> Ve
                 "Rebind",
                 format!(
                     "{command_example} env set-launcher {} <launcher>",
+                    status.env_name
+                ),
+            ),
+        ];
+    }
+
+    if status.resolved_kind.as_deref() == Some("dev") && status.issue.is_some() {
+        return vec![
+            KeyValueRow::accent(
+                "Inspect source",
+                format!("{command_example} env show {}", status.env_name),
+            ),
+            KeyValueRow::warning(
+                "Rebind",
+                format!(
+                    "{command_example} dev rebind {} --repo <checkout>",
                     status.env_name
                 ),
             ),
