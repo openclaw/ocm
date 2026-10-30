@@ -584,6 +584,57 @@ fn service_install_enables_the_env_and_installs_the_ocm_service() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn service_commands_refuse_a_launcher_whose_working_directory_is_missing() {
+    let root = TestDir::new("service-launcher-missing-cwd");
+    let cwd = root.child("workspace");
+    let checkout = cwd.join("checkout");
+    fs::create_dir_all(&checkout).unwrap();
+    let env = launchd_env(&root);
+    let add = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "launcher",
+            "add",
+            "dev",
+            "--command",
+            "openclaw",
+            "--cwd",
+            checkout.to_str().unwrap(),
+        ],
+    );
+    assert!(add.status.success(), "{}", stderr(&add));
+    let create = run_ocm(&cwd, &env, &["env", "create", "demo", "--launcher", "dev"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let show = run_ocm(&cwd, &env, &["launcher", "show", "dev", "--json"]);
+    assert!(show.status.success(), "{}", stderr(&show));
+    let recorded = json_output(&show)["cwd"].as_str().unwrap().to_string();
+
+    let install = run_ocm(&cwd, &env, &["service", "install", "demo"]);
+    assert!(install.status.success(), "{}", stderr(&install));
+
+    fs::remove_dir_all(&checkout).unwrap();
+    let expected = format!("launcher \"dev\" working directory does not exist: {recorded}");
+    for args in [
+        &["service", "start", "demo"][..],
+        &["service", "restart", "demo"],
+        &["service", "restart", "demo", "--force"],
+        &["service", "install", "demo"],
+    ] {
+        let output = run_ocm(&cwd, &env, args);
+        assert!(!output.status.success(), "{args:?} succeeded");
+        let error = stderr(&output);
+        assert!(error.contains(&expected), "{args:?}: {error}");
+        assert!(!error.contains("failed to run"), "{args:?}: {error}");
+    }
+
+    let env_show = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
+    assert!(env_show.status.success(), "{}", stderr(&env_show));
+    assert_eq!(json_output(&env_show)["serviceRunning"], false);
+}
+
 #[test]
 fn service_install_keeps_a_running_service_in_the_supervisor_plan() {
     for systemd in [false, true] {

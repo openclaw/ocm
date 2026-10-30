@@ -3768,6 +3768,86 @@ fn upgrade_simulate_preserves_an_accepted_runtime_borrower() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn upgrade_simulate_names_a_missing_launcher_working_directory() {
+    let root = TestDir::new("upgrade-simulate-launcher-missing-cwd");
+    let cwd = root.child("workspace");
+    let checkout = cwd.join("checkout");
+    fs::create_dir_all(&checkout).unwrap();
+    write_executable_script(&checkout.join("oc.sh"), "#!/bin/sh\necho launcher-ran\n");
+
+    let tarball = openclaw_package_tarball("#!/bin/sh\nprintf '2026.3.25\\n'\n", "2026.3.25");
+    let integrity = sha512_integrity(&tarball);
+    let tarball_server = TestHttpServer::serve_bytes_times(
+        "/openclaw-2026.3.25.tgz",
+        "application/octet-stream",
+        &tarball,
+        10,
+    );
+    let packument = format!(
+        "{{\"dist-tags\":{{\"latest\":\"2026.3.25\"}},\"versions\":{{\"2026.3.25\":{{\"version\":\"2026.3.25\",\"dist\":{{\"tarball\":\"{}\",\"integrity\":\"{}\"}}}}}},\"time\":{{\"2026.3.25\":\"2026-03-26T09:00:00.000Z\"}}}}",
+        tarball_server.url(),
+        integrity
+    );
+    let packument_server = TestHttpServer::serve_bytes_times(
+        "/openclaw",
+        "application/json",
+        packument.as_bytes(),
+        10,
+    );
+    let mut env = ocm_env(&root);
+    install_fake_node_and_npm(&root, &mut env, "22.22.3");
+    env.insert(
+        "OCM_INTERNAL_OPENCLAW_RELEASES_URL".to_string(),
+        packument_server.url(),
+    );
+
+    let add = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "launcher",
+            "add",
+            "dev",
+            "--command",
+            "./oc.sh",
+            "--cwd",
+            checkout.to_str().unwrap(),
+        ],
+    );
+    assert!(add.status.success(), "{}", stderr(&add));
+    let create = run_ocm(&cwd, &env, &["env", "create", "demo", "--launcher", "dev"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let show = run_ocm(&cwd, &env, &["launcher", "show", "dev", "--json"]);
+    assert!(show.status.success(), "{}", stderr(&show));
+    let show: Value = serde_json::from_str(&stdout(&show)).unwrap();
+    let recorded = show["cwd"].as_str().unwrap().to_string();
+    fs::remove_dir_all(&checkout).unwrap();
+
+    let simulate = run_ocm(
+        &cwd,
+        &env,
+        &["upgrade", "simulate", "demo", "--to", "2026.3.25", "--json"],
+    );
+    let output = stdout(&simulate);
+    assert_eq!(simulate.status.code(), Some(1), "{output}");
+    let json: Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(json["outcome"], "failed", "{output}");
+    let plan = json["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "openclaw update plan")
+        .unwrap_or_else(|| panic!("missing update plan check: {output}"));
+    assert_eq!(plan["status"], "failed", "{output}");
+    assert_eq!(
+        plan["note"],
+        format!("launcher \"dev\" working directory does not exist: {recorded}"),
+        "{output}"
+    );
+}
+
 #[test]
 fn upgrade_simulate_errors_before_cloning_when_published_target_is_missing() {
     let root = TestDir::new("upgrade-simulate-missing-target");

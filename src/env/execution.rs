@@ -10,7 +10,7 @@ use crate::launcher::{
 };
 use crate::managed_node::apply_path_prepend_to_environment;
 use crate::runtime::resolve_runtime_launch;
-use crate::store::{display_path, get_launcher, get_runtime_verified};
+use crate::store::{display_path, get_launcher, get_launcher_verified, get_runtime_verified};
 
 use super::SourceWatchOverride;
 
@@ -182,6 +182,9 @@ pub fn resolve_gateway_process_spec(
 
     match resolve_execution_binding(env_meta, None, None)? {
         ExecutionBinding::Launcher(binding_name) => {
+            // The supervisor plans and retries a launcher whose directory is
+            // missing, so it can recover once the directory is back; commands
+            // that start or resolve it refuse it up front instead.
             let launcher = get_launcher(&binding_name, process_env, cwd)?;
             let run_dir = resolve_launcher_run_dir(&launcher, Path::new(&env_meta.root));
             let direct = resolve_direct_launcher_command(&launcher, &gateway_args, &run_dir);
@@ -634,7 +637,7 @@ impl<'a> EnvironmentService<'a> {
         let env = self.apply_effective_gateway_port(env)?;
         match resolve_execution_binding(&env, runtime_override, launcher_override)? {
             ExecutionBinding::Launcher(launcher_name) => {
-                let launcher = get_launcher(&launcher_name, self.env, self.cwd)?;
+                let launcher = get_launcher_verified(&launcher_name, self.env, self.cwd)?;
                 Ok(ResolvedExecution::Launcher {
                     launcher_name,
                     command: build_launcher_command(&launcher, &args),
