@@ -530,13 +530,19 @@ impl<'a> RuntimeService<'a> {
         mut options: UpdateRuntimeFromReleaseOptions,
     ) -> Result<RuntimeMeta, String> {
         // Case-insensitive storage accepts any spelling of a registered name.
-        // Guard and update the registered one so the guard covers the update.
-        if let Some(existing) = find_runtime(&options.name, self.env, self.cwd)? {
+        // Guard and update the registered one so the guard covers the update;
+        // a failed lookup keeps the typed name and the errors it reports.
+        if let Ok(Some(existing)) = find_runtime(&options.name, self.env, self.cwd) {
             options.name = existing.name;
         }
         let name = options.name.clone();
         self.with_unbound_runtime(&name, |guard| {
             let resolved = self.resolve_update_from_release(options)?;
+            if resolved.existing.name != name {
+                return Err(format!(
+                    "runtime \"{name}\" was replaced while waiting to update it; retry"
+                ));
+            }
             self.apply_resolved_update(resolved, true, Some(guard))
         })
     }
