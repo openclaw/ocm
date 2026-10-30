@@ -17,8 +17,8 @@ use crate::env::{
     BlockedPruneCandidate, CloneEnvironmentOptions, CreateEnvSnapshotOptions,
     CreateEnvironmentOptions, EnvMeta, EnvSnapshotSummary, EnvSummary, ExportEnvironmentOptions,
     ImportEnvironmentOptions, RemoveEnvSnapshotOptions, RestoreEnvSnapshotOptions,
-    SourceWatchSession, SourceWatchState, openclaw_command_words, openclaw_options,
-    openclaw_root_option_tokens,
+    SourceWatchSession, SourceWatchState, names_onboard_recommendations, openclaw_command_words,
+    openclaw_options,
 };
 use crate::infra::process::{run_direct, run_shell};
 use crate::infra::process_identity::ProcessIdentity;
@@ -167,31 +167,6 @@ fn should_clear_skip_bootstrap_for_openclaw_args(args: &[String]) -> bool {
         }
     }
     !(command == "setup" && system_agent_request && !onboarding_option)
-}
-
-/// Tells whether `onboard` is followed by its `recommendations` subcommand,
-/// after only OpenClaw's root options and `--json`, the one `onboard` option
-/// that subcommand accepts. After any other option the word can be that
-/// option's value, as in `onboard --workspace recommendations`.
-fn names_onboard_recommendations(args: &[String]) -> bool {
-    let mut seen_onboard = false;
-    let mut index = 0;
-    while let Some(arg) = args.get(index).map(String::as_str) {
-        let root_tokens = openclaw_root_option_tokens(args, index);
-        if root_tokens > 0 {
-            index += root_tokens;
-            continue;
-        }
-        index += 1;
-        match arg {
-            "onboard" if !seen_onboard => seen_onboard = true,
-            "recommendations" if seen_onboard => return true,
-            "--json" if seen_onboard => {}
-            _ if !seen_onboard && arg.starts_with('-') => {}
-            _ => return false,
-        }
-    }
-    false
 }
 
 impl Cli {
