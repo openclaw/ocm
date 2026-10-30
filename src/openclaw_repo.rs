@@ -1189,8 +1189,9 @@ fn remove_registered_worktree(repo_root: &Path, worktree_root: &Path) -> Result<
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let detail = if !stderr.is_empty() { stderr } else { stdout };
     // Git may already have dropped the registration of the emptied worktree,
-    // for example when the directory itself could not be removed.
-    if let Some(result) = remove_unregistered_empty_worktree(repo_root, worktree_root)? {
+    // for example when the directory itself could not be removed. Git's own
+    // error stays the report when that cannot be checked.
+    if let Ok(Some(result)) = remove_unregistered_empty_worktree(repo_root, worktree_root) {
         return result;
     }
     Err(format!("git worktree remove failed: {detail}"))
