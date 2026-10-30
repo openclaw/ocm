@@ -39,8 +39,9 @@ pub(crate) use envs::{
     remove_environment_locked, validate_gateway_port,
 };
 pub(crate) use envs::{
-    EnvironmentServicePolicyChange, environment_service_policy_revision,
-    restore_environment_service_policy, set_environment_service_policy,
+    EnvironmentServicePolicyChange, enable_environment_service_policy,
+    environment_service_policy_revision, restore_environment_service_policy,
+    set_environment_service_policy,
 };
 pub use envs::{
     clone_environment, create_environment, export_environment, get_environment, import_environment,

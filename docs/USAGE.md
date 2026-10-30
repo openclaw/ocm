@@ -643,7 +643,7 @@ ocm service list
 ocm service status mira
 ```
 
-Use `service install` when you want a background service for an environment that was created with `--no-service`, or when you want to bring an older env under background management later.
+Use `service install` when you want a background service for an environment that was created with `--no-service`, or when you want to bring an older env under background management later. Install enables the environment without starting it; running it again for an environment whose service is already running keeps that Gateway running.
 
 On Linux, OCM writes its user-service unit under `$XDG_CONFIG_HOME/systemd/user`
 when `XDG_CONFIG_HOME` is an absolute path. An unset, empty, or relative value

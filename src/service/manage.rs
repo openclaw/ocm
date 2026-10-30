@@ -17,7 +17,10 @@ use crate::infra::shell::{
     build_openclaw_dev_source_env, build_openclaw_env, render_env_scoped_login_command,
 };
 use crate::managed_node::apply_path_prepend_to_environment;
-use crate::store::{restore_environment_service_policy, set_environment_service_policy};
+use crate::store::{
+    enable_environment_service_policy, restore_environment_service_policy,
+    set_environment_service_policy,
+};
 use crate::supervisor::{SupervisorService, sync_supervisor_env_if_present};
 
 #[derive(Clone, Debug, Serialize)]
@@ -107,10 +110,12 @@ impl ServiceUpdate {
         ServiceSupervisorPolicy,
     ) {
         match self {
+            // Install enables without starting; its running intent is decided
+            // under the registry lock by `enable_environment_service_policy`.
             Self::Install => (
                 "install",
                 Some(true),
-                Some(false),
+                None,
                 true,
                 ServiceSupervisorPolicy::EnsureRunning,
             ),
@@ -594,7 +599,11 @@ fn update_service_with_observation(
     } else {
         None
     };
-    let change = set_environment_service_policy(name, service_enabled, service_running, env, cwd)?;
+    let change = if matches!(update, ServiceUpdate::Install) {
+        enable_environment_service_policy(name, env, cwd)?
+    } else {
+        set_environment_service_policy(name, service_enabled, service_running, env, cwd)?
+    };
     let mut daemon_mutation_attempted = false;
     let mut restart_request_id = None;
     let update_result = match supervisor_policy {
