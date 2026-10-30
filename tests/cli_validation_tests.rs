@@ -159,6 +159,73 @@ fn runtime_and_launcher_registration_reserve_the_clear_keyword() {
 }
 
 #[test]
+fn existing_reserved_name_runtime_can_still_be_replaced_and_removed() {
+    let root = TestDir::new("cli-reserved-binding-name-existing");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    write_executable_script(&cwd.join("openclaw"), "#!/bin/sh\nprintf '2026.8.1\\n'\n");
+    let env = ocm_env(&root);
+
+    // A registry written before the name was reserved can hold `none`.
+    let add = run_ocm(
+        &cwd,
+        &env,
+        &["runtime", "add", "legacy", "--path", "./openclaw"],
+    );
+    assert!(add.status.success(), "{}", stderr(&add));
+    let legacy_path = ocm::store::runtime_meta_path("legacy", &env, &cwd).unwrap();
+    let mut legacy: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&legacy_path).unwrap()).unwrap();
+    legacy["name"] = serde_json::Value::from("none");
+    fs::write(
+        ocm::store::runtime_meta_path("none", &env, &cwd).unwrap(),
+        serde_json::to_string_pretty(&legacy).unwrap(),
+    )
+    .unwrap();
+    fs::remove_file(&legacy_path).unwrap();
+
+    let replace = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "runtime",
+            "install",
+            "none",
+            "--path",
+            "./openclaw",
+            "--force",
+        ],
+    );
+    assert!(replace.status.success(), "{}", stderr(&replace));
+    let show = run_ocm(&cwd, &env, &["runtime", "show", "none", "--json"]);
+    assert!(show.status.success(), "{}", stderr(&show));
+    assert!(stdout(&show).contains("\"sourceKind\": \"installed\""));
+
+    let remove = run_ocm(&cwd, &env, &["runtime", "remove", "none"]);
+    assert!(remove.status.success(), "{}", stderr(&remove));
+
+    // Once it is gone, `none` is a new registration again and is refused.
+    let reinstall = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "runtime",
+            "install",
+            "none",
+            "--path",
+            "./openclaw",
+            "--force",
+        ],
+    );
+    assert_eq!(reinstall.status.code(), Some(1));
+    assert!(
+        stderr(&reinstall).contains("Runtime name \"none\" is reserved"),
+        "{}",
+        stderr(&reinstall)
+    );
+}
+
+#[test]
 fn explicit_gateway_ports_reject_invalid_values_without_environment_changes() {
     let root = TestDir::new("cli-invalid-port");
     let cwd = root.child("workspace");

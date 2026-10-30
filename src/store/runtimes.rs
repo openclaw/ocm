@@ -3180,6 +3180,22 @@ fn prepare_runtime_install_target(
     )
 }
 
+/// Validates the name of a runtime about to be installed. A new registration
+/// may not use a reserved name; replacing an existing registration keeps the
+/// name it already has.
+fn validate_runtime_registration_name(
+    name: &str,
+    replace_existing: bool,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<String, String> {
+    let name = validate_name(name, "Runtime name")?;
+    if replace_existing && path_exists(&runtime_meta_path(&name, env, cwd)?) {
+        return Ok(name);
+    }
+    validate_registration_name(&name, "Runtime name")
+}
+
 fn prepare_runtime_install_target_with_lock(
     name: String,
     replace_existing: bool,
@@ -3187,7 +3203,7 @@ fn prepare_runtime_install_target_with_lock(
     cwd: &Path,
     lock: Arc<RuntimeMutationGuard>,
 ) -> Result<RuntimeInstallTarget, String> {
-    validate_registration_name(&name, "Runtime name")?;
+    validate_runtime_registration_name(&name, replace_existing, env, cwd)?;
     let final_meta_path = runtime_meta_path(&name, env, cwd)?;
     let final_install_root = runtime_install_root(&name, env, cwd)?;
     check_runtime_publication_paths(&name, &final_meta_path, Some(&final_install_root))?;
@@ -4093,7 +4109,7 @@ pub(crate) fn install_runtime_with_context(
     context: InstallContext<'_>,
 ) -> Result<RuntimeMeta, String> {
     let InstallContext { env, cwd, .. } = context;
-    let name = validate_registration_name(&options.name, "Runtime name")?;
+    let name = validate_runtime_registration_name(&options.name, options.force, env, cwd)?;
     let target = prepare_runtime_install_target(name, options.force, context)?;
 
     let raw_path = options.path.trim();
@@ -4155,7 +4171,8 @@ pub(crate) fn install_runtime_from_url_with_context(
     options: InstallRuntimeFromUrlOptions,
     context: InstallContext<'_>,
 ) -> Result<RuntimeMeta, String> {
-    let name = validate_registration_name(&options.name, "Runtime name")?;
+    let name =
+        validate_runtime_registration_name(&options.name, options.force, context.env, context.cwd)?;
     let target = prepare_runtime_install_target(name, options.force, context)?;
 
     let file_name = artifact_file_name_from_url(&options.url)?;
@@ -4176,7 +4193,8 @@ pub(crate) fn install_runtime_from_local_openclaw_build(
     options: BuildLocalRuntimeOptions,
     context: InstallContext<'_>,
 ) -> Result<RuntimeMeta, String> {
-    let name = validate_registration_name(&options.name, "Runtime name")?;
+    let name =
+        validate_runtime_registration_name(&options.name, options.force, context.env, context.cwd)?;
     let meta_path = runtime_meta_path(&name, context.env, context.cwd)?;
     if path_exists(&meta_path) && !options.force {
         return Err(format!("runtime \"{name}\" already exists"));
@@ -4353,7 +4371,7 @@ pub(crate) fn install_runtime_from_release_with_context(
     context: InstallContext<'_>,
 ) -> Result<RuntimeMeta, String> {
     let InstallContext { env, cwd, .. } = context;
-    validate_registration_name(&options.name, "Runtime name")?;
+    validate_runtime_registration_name(&options.name, options.force, env, cwd)?;
     let manifest = load_release_manifest(&options.manifest_url)?;
     let release = select_release(
         &manifest,
@@ -4464,7 +4482,7 @@ pub(crate) fn install_runtime_from_official_openclaw_release_with_context(
     context: InstallContext<'_>,
 ) -> Result<RuntimeMeta, String> {
     let env = context.env;
-    let name = validate_registration_name(&options.name, "Runtime name")?;
+    let name = validate_runtime_registration_name(&options.name, options.force, env, context.cwd)?;
     let channel = options
         .channel
         .as_deref()
