@@ -92,6 +92,56 @@ fn env_doctor_json_reports_runtime_health_issues() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn env_doctor_reports_a_runtime_binary_the_current_user_cannot_execute() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = TestDir::new("env-doctor-runtime-not-executable");
+    let cwd = root.child("workspace");
+    let bin_dir = cwd.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let runtime_path = bin_dir.join("stable");
+    write_executable_script(&runtime_path, "#!/bin/sh\nexit 0\n");
+    let env = ocm_env(&root);
+
+    let add = run_ocm(
+        &cwd,
+        &env,
+        &["runtime", "add", "stable", "--path", "./bin/stable"],
+    );
+    assert!(add.status.success(), "{}", stderr(&add));
+    let create = run_ocm(
+        &cwd,
+        &env,
+        &["env", "create", "demo", "--runtime", "stable"],
+    );
+    assert!(create.status.success(), "{}", stderr(&create));
+    fs::set_permissions(&runtime_path, fs::Permissions::from_mode(0o644)).unwrap();
+
+    let doctor = run_ocm(&cwd, &env, &["env", "doctor", "demo", "--json"]);
+    assert!(doctor.status.success(), "{}", stderr(&doctor));
+    let value: Value = serde_json::from_str(&stdout(&doctor)).unwrap();
+    assert_eq!(value["healthy"], false);
+    assert_eq!(value["runtimeStatus"], "broken");
+    let issues = value["issues"].as_array().unwrap();
+    assert_eq!(issues.len(), 1, "{value}");
+    assert!(
+        issues[0]
+            .as_str()
+            .unwrap()
+            .contains("runtime \"stable\" binary path is not executable by the current user:"),
+        "{value}"
+    );
+
+    fs::set_permissions(&runtime_path, fs::Permissions::from_mode(0o755)).unwrap();
+    let doctor = run_ocm(&cwd, &env, &["env", "doctor", "demo", "--json"]);
+    assert!(doctor.status.success(), "{}", stderr(&doctor));
+    let value: Value = serde_json::from_str(&stdout(&doctor)).unwrap();
+    assert_eq!(value["healthy"], true, "{value}");
+    assert_eq!(value["runtimeStatus"], "ok");
+}
+
 #[test]
 fn env_doctor_keeps_official_runtime_healthy_when_managed_fallback_is_available() {
     let root = TestDir::new("env-doctor-official-runtime-host-issue");

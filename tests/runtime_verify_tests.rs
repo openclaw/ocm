@@ -65,6 +65,60 @@ fn runtime_verify_uses_exit_code_one_for_broken_runtimes() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn runtime_verify_reports_a_binary_the_current_user_cannot_execute() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = TestDir::new("runtime-verify-not-executable");
+    let cwd = root.child("workspace");
+    let bin_dir = cwd.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let runtime_path = bin_dir.join("stable");
+    write_executable_script(&runtime_path, "#!/bin/sh\nexit 0\n");
+    let source_path = bin_dir.join("plain");
+    write_executable_script(&source_path, "#!/bin/sh\nexit 0\n");
+    fs::set_permissions(&source_path, fs::Permissions::from_mode(0o644)).unwrap();
+    let env = ocm_env(&root);
+
+    let add = run_ocm(
+        &cwd,
+        &env,
+        &["runtime", "add", "stable", "--path", "./bin/stable"],
+    );
+    assert!(add.status.success(), "{}", stderr(&add));
+    let install = run_ocm(
+        &cwd,
+        &env,
+        &["runtime", "install", "copied", "--path", "./bin/plain"],
+    );
+    assert!(install.status.success(), "{}", stderr(&install));
+    fs::set_permissions(&runtime_path, fs::Permissions::from_mode(0o644)).unwrap();
+
+    for name in ["stable", "copied"] {
+        let verify = run_ocm(&cwd, &env, &["runtime", "verify", name, "--json"]);
+        assert_eq!(verify.status.code(), Some(1), "{}", stdout(&verify));
+        let value: Value = serde_json::from_str(&stdout(&verify)).unwrap();
+        assert_eq!(value["healthy"], false);
+        assert!(
+            value["issue"]
+                .as_str()
+                .unwrap()
+                .contains("binary path is not executable by the current user:"),
+            "{value}"
+        );
+
+        // Inspection is unchanged; only health reports the permission problem.
+        let show = run_ocm(&cwd, &env, &["runtime", "show", name]);
+        assert!(show.status.success(), "{}", stderr(&show));
+    }
+
+    fs::set_permissions(&runtime_path, fs::Permissions::from_mode(0o755)).unwrap();
+    let verify = run_ocm(&cwd, &env, &["runtime", "verify", "stable"]);
+    assert!(verify.status.success(), "{}", stderr(&verify));
+    assert!(stdout(&verify).contains("healthy: true"));
+}
+
 #[test]
 fn runtime_verify_all_reports_mixed_runtime_health() {
     let root = TestDir::new("runtime-verify-all");

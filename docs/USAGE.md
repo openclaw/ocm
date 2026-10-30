@@ -1799,6 +1799,11 @@ Without a registered owner, it maps only paths inside another `.openclaw` direct
 Paths in your own `~/.openclaw` are references to your existing OpenClaw home, so doctor does not report them as copied paths and config repair leaves them unchanged.
 The default workspace setting is checked separately: when `agents.defaults.workspace` points at a `.openclaw/workspace` directory outside the environment, including `~/.openclaw/workspace`, doctor reports it and cleanup resets it to the environment's own workspace.
 
+`env status`, `env doctor` and `runtime verify` report a runtime as broken when
+its binary is missing, is not a regular file, or cannot be executed by the
+current user. On macOS and Linux, restore the execute permission on the reported
+path, for example with `chmod +x`, then rerun the check.
+
 Runtime-state cleanup preserves configured agent directories inside the environment, including their authentication and state files beneath generated plugin dependencies.
 It also retains shared managed skills under `.openclaw/skills` and their global ClawHub tracking metadata under `.openclaw/.clawhub`.
 A runtime-state reset is planned only when a session transcript under `.openclaw/agents/<id>/sessions` records, in its header, a working directory under another environment's root or another `.openclaw` directory, as state copied from elsewhere does.
