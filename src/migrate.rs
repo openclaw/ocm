@@ -889,12 +889,17 @@ fn preflight_migrated_launcher(
     let Some(command_path) = resolve_executable_on_path("openclaw", env) else {
         return Ok(None);
     };
-    let command = migrated_launcher_command(command_path);
+    let command = migrated_launcher_command(&command_path);
 
     let launcher_name = format!("{env_name}.migrated");
     match LauncherService::new(env, cwd).show(&launcher_name) {
         Ok(existing) => {
-            if existing.command != command || existing.cwd.is_some() {
+            // Earlier OCM stored every discovered path unquoted; that launcher
+            // still runs the same program when the shell reads it as one word.
+            let same_command = existing.command == command
+                || (existing.command == command_path
+                    && is_literal_shell_word(&command_path, LiteralWord::Stored));
+            if !same_command || existing.cwd.is_some() {
                 Err(format!(
                     "launcher \"{launcher_name}\" already exists with different settings; choose another env name or remove the conflicting launcher"
                 ))
@@ -919,18 +924,44 @@ fn preflight_migrated_launcher(
 /// shell would not read as one literal word. Other paths stay unquoted, which
 /// keeps matching launchers that earlier migrations stored for them. Windows
 /// recipes run through `cmd`, whose quoting differs, so they keep the path as found.
-fn migrated_launcher_command(command_path: String) -> String {
+fn migrated_launcher_command(command_path: &str) -> String {
+    if cfg!(windows) || is_literal_shell_word(command_path, LiteralWord::New) {
+        command_path.to_string()
+    } else {
+        crate::infra::shell::quote_posix(command_path)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LiteralWord {
+    /// Spellings new launchers store unquoted.
+    New,
+    /// Spellings also accepted from launchers that earlier OCM stored unquoted.
+    Stored,
+}
+
+/// Whether the shell reads `path`, unquoted, as one literal word.
+fn is_literal_shell_word(path: &str, accept: LiteralWord) -> bool {
     // These are literal inside a word that starts with `/`, but not at its start.
-    let absolute = command_path.starts_with('/');
-    let plain = command_path.chars().all(|ch| {
+    let absolute = path.starts_with('/');
+    // So are braces that enclose no comma or `..`, which Bash would expand, and
+    // `]` without an opening `[`.
+    let stored = accept == LiteralWord::Stored && absolute && !may_brace_expand(path);
+    path.chars().all(|ch| {
         ch.is_alphanumeric()
             || matches!(ch, '/' | '.' | '_' | '-' | '+' | ',' | ':' | '@')
             || (absolute && matches!(ch, '#' | '~' | '=' | '%' | '^' | '!'))
-    });
-    if cfg!(windows) || plain {
-        command_path
-    } else {
-        crate::infra::shell::quote_posix(&command_path)
+            || (stored && matches!(ch, '{' | '}' | ']'))
+    })
+}
+
+fn may_brace_expand(path: &str) -> bool {
+    match (path.find('{'), path.rfind('}')) {
+        (Some(open), Some(close)) if open < close => {
+            let inner = &path[open + 1..close];
+            inner.contains(',') || inner.contains("..")
+        }
+        _ => false,
     }
 }
 
@@ -1434,14 +1465,36 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn migrate_plain_openclaw_home_reuses_an_identical_migrated_launcher() {
+    fn migrate_plain_openclaw_home_reuses_only_a_migrated_launcher_for_the_same_program() {
         use std::os::unix::fs::PermissionsExt;
 
-        // Paths the shell reads as one word keep the unquoted command earlier
-        // migrations stored; other paths are matched in their quoted form.
-        for (index, (dir_name, quoted)) in [("bin", false), ("a#b~c", false), ("my bin", true)]
-            .into_iter()
-            .enumerate()
+        enum Leftover {
+            Unquoted,
+            Quoted,
+            Command(&'static str),
+        }
+
+        // Earlier migrations stored every path unquoted. That launcher is reused
+        // when the shell reads it as the same single word; new launchers for
+        // other paths are matched in their quoted form.
+        for (index, (dir_name, leftover, reused)) in [
+            ("bin", Leftover::Unquoted, true),
+            ("a#b~c", Leftover::Unquoted, true),
+            ("a{b}", Leftover::Unquoted, true),
+            ("a]b", Leftover::Unquoted, true),
+            ("a}b{c", Leftover::Unquoted, true),
+            ("my bin", Leftover::Quoted, true),
+            ("a{b}", Leftover::Quoted, true),
+            ("my bin", Leftover::Unquoted, false),
+            ("a{b,c}", Leftover::Unquoted, false),
+            ("a{1..2}", Leftover::Unquoted, false),
+            // Bash pairs the `{` with the `}` after the comma and expands it.
+            ("a{b}/x,y}", Leftover::Unquoted, false),
+            ("a[b]", Leftover::Unquoted, false),
+            ("a{b}", Leftover::Command("pnpm openclaw"), false),
+        ]
+        .into_iter()
+        .enumerate()
         {
             let root = std::env::temp_dir().join(format!(
                 "ocm-migrate-tests-launcher-reuse-{}-{index}",
@@ -1468,10 +1521,10 @@ mod tests {
             env.insert("PATH".to_string(), bin_dir.display().to_string());
 
             let openclaw_path = openclaw.display().to_string();
-            let command = if quoted {
-                crate::infra::shell::quote_posix(&openclaw_path)
-            } else {
-                openclaw_path
+            let command = match leftover {
+                Leftover::Unquoted => openclaw_path,
+                Leftover::Quoted => crate::infra::shell::quote_posix(&openclaw_path),
+                Leftover::Command(command) => command.to_string(),
             };
             LauncherService::new(&env, &cwd)
                 .add(AddLauncherOptions {
@@ -1490,19 +1543,31 @@ mod tests {
                 },
                 &env,
                 &cwd,
-            )
-            .unwrap();
-
-            assert_eq!(
-                result.default_launcher.as_deref(),
-                Some("mira.migrated"),
-                "{dir_name}"
             );
+
+            let case = format!("{dir_name} with {command}");
+            if reused {
+                let summary = result.unwrap_or_else(|error| panic!("{case}: {error}"));
+                assert_eq!(
+                    summary.default_launcher.as_deref(),
+                    Some("mira.migrated"),
+                    "{case}"
+                );
+            } else {
+                let error = result.expect_err(&case);
+                assert!(
+                    error.contains(
+                        "launcher \"mira.migrated\" already exists with different settings"
+                    ),
+                    "{case}: {error}"
+                );
+                assert!(!root.join("ocm-home/envs/mira.json").exists(), "{case}");
+            }
             let launcher = LauncherService::new(&env, &cwd)
                 .show("mira.migrated")
                 .unwrap();
-            assert_eq!(launcher.command, command, "{dir_name}");
-            assert_eq!(launcher.description.as_deref(), Some("kept"), "{dir_name}");
+            assert_eq!(launcher.command, command, "{case}");
+            assert_eq!(launcher.description.as_deref(), Some("kept"), "{case}");
 
             let _ = fs::remove_dir_all(&root);
         }
