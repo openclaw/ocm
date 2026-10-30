@@ -915,13 +915,17 @@ fn preflight_migrated_launcher(
     }
 }
 
-/// Launcher commands are shell recipes, so quote a discovered path that holds
-/// anything but plain path characters. Plain paths stay unquoted, which keeps
-/// matching launchers that earlier migrations stored for them. Windows recipes
-/// run through `cmd`, whose quoting differs, so they keep the path as found.
+/// Launcher commands are shell recipes, so quote a discovered path that the
+/// shell would not read as one literal word. Other paths stay unquoted, which
+/// keeps matching launchers that earlier migrations stored for them. Windows
+/// recipes run through `cmd`, whose quoting differs, so they keep the path as found.
 fn migrated_launcher_command(command_path: String) -> String {
+    // These are literal inside a word that starts with `/`, but not at its start.
+    let absolute = command_path.starts_with('/');
     let plain = command_path.chars().all(|ch| {
-        ch.is_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | '+' | ',' | ':' | '@')
+        ch.is_alphanumeric()
+            || matches!(ch, '/' | '.' | '_' | '-' | '+' | ',' | ':' | '@')
+            || (absolute && matches!(ch, '#' | '~' | '=' | '%' | '^' | '!'))
     });
     if cfg!(windows) || plain {
         command_path
@@ -1445,12 +1449,15 @@ mod tests {
     fn migrate_plain_openclaw_home_reuses_an_identical_migrated_launcher() {
         use std::os::unix::fs::PermissionsExt;
 
-        // Plain paths keep the unquoted command earlier migrations stored; other
-        // paths are matched in their quoted form.
-        for (dir_name, quoted) in [("bin", false), ("my bin", true)] {
+        // Paths the shell reads as one word keep the unquoted command earlier
+        // migrations stored; other paths are matched in their quoted form.
+        for (index, (dir_name, quoted)) in [("bin", false), ("a#b~c", false), ("my bin", true)]
+            .into_iter()
+            .enumerate()
+        {
             let root = std::env::temp_dir().join(format!(
-                "ocm-migrate-tests-launcher-reuse-{}",
-                dir_name.replace(' ', "-")
+                "ocm-migrate-tests-launcher-reuse-{}-{index}",
+                std::process::id()
             ));
             let cwd = root.join("cwd");
             let source_home = root.join("legacy-home");

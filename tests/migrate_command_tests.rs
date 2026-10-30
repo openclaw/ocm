@@ -2071,9 +2071,10 @@ fn adopt_import_preserves_history_and_logs_from_plain_openclaw_home() {
 #[cfg(unix)]
 #[test]
 fn migrated_launchers_run_openclaw_from_paths_that_need_shell_quoting() {
-    // The plain directory is the control: its launcher command stays unquoted.
+    // The first two are controls: their launcher commands stay unquoted.
     for (dir_name, import) in [
         ("bin", "migrate"),
+        ("a#b~c=d%e^f!g", "adopt"),
         ("my bin", "migrate"),
         ("my bin", "adopt"),
         ("o'brien", "migrate"),
@@ -2123,7 +2124,7 @@ fn migrated_launchers_run_openclaw_from_paths_that_need_shell_quoting() {
             stdout(&imported).contains("\"defaultLauncher\": \"mira.migrated\""),
             "{case}"
         );
-        if dir_name == "bin" {
+        if matches!(dir_name, "bin" | "a#b~c=d%e^f!g") {
             let shown = run_ocm(&cwd, &env, &["launcher", "show", "mira.migrated", "--json"]);
             assert!(shown.status.success(), "{case}: {}", stderr(&shown));
             let launcher: serde_json::Value = serde_json::from_str(&stdout(&shown)).unwrap();
