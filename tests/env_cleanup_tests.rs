@@ -205,6 +205,114 @@ fn env_cleanup_yes_repairs_inferred_env_scoped_config_drift() {
     assert!(repaired.contains("\"port\": 19790"));
 }
 
+fn env_root_of(cwd: &Path, env: &BTreeMap<String, String>, name: &str) -> PathBuf {
+    let show = run_ocm(cwd, env, &["env", "show", name, "--json"]);
+    assert!(show.status.success(), "{}", stderr(&show));
+    let value: Value = serde_json::from_str(&stdout(&show)).unwrap();
+    PathBuf::from(value["root"].as_str().unwrap())
+}
+
+fn assert_cleanup_keeps_user_home_config_paths(root: &TestDir, env: &BTreeMap<String, String>) {
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let home = PathBuf::from(&env["HOME"]);
+    for dir in [".openclaw/skills", "projects/app/plugin", "projects/other"] {
+        fs::create_dir_all(home.join(dir)).unwrap();
+    }
+
+    let create = run_ocm(&cwd, env, &["env", "create", "target", "--port", "19790"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let env_root = env_root_of(&cwd, env, "target");
+
+    let config_path = env_root.join(".openclaw/openclaw.json");
+    let config = serde_json::to_string_pretty(&serde_json::json!({
+        "gateway": {"mode": "local", "port": 19790},
+        "agents": {"defaults": {"workspace": path_string(&env_root.join(".openclaw/workspace"))}},
+        "skills": {"load": {"extraDirs": [path_string(&home.join(".openclaw/skills"))]}},
+        "plugins": {"load": {"paths": [
+            path_string(&home.join("projects/app/plugin")),
+            path_string(&home.join("projects/other")),
+        ]}}
+    }))
+    .unwrap();
+    fs::write(&config_path, &config).unwrap();
+
+    let doctor = run_ocm(&cwd, env, &["env", "doctor", "target", "--json"]);
+    assert!(doctor.status.success(), "{}", stderr(&doctor));
+    let doctor: Value = serde_json::from_str(&stdout(&doctor)).unwrap();
+    assert_eq!(doctor["configStatus"], "ok", "{doctor}");
+
+    let cleanup = run_ocm(&cwd, env, &["env", "cleanup", "target", "--yes"]);
+    assert!(cleanup.status.success(), "{}", stderr(&cleanup));
+    assert!(
+        !stdout(&cleanup).contains("repair-openclaw-config"),
+        "{}",
+        stdout(&cleanup)
+    );
+    assert_eq!(fs::read_to_string(&config_path).unwrap(), config);
+}
+
+#[test]
+fn env_cleanup_keeps_user_home_config_paths_with_default_ocm_home() {
+    let root = TestDir::new("env-cleanup-home-paths-default-ocm-home");
+    let mut env = ocm_env(&root);
+    let ocm_home = root.child("home/.ocm");
+    fs::create_dir_all(&ocm_home).unwrap();
+    env.insert("OCM_HOME".to_string(), path_string(&ocm_home));
+    assert_cleanup_keeps_user_home_config_paths(&root, &env);
+}
+
+#[test]
+fn env_cleanup_keeps_user_home_config_paths_with_separate_ocm_home() {
+    let root = TestDir::new("env-cleanup-home-paths-separate-ocm-home");
+    let env = ocm_env(&root);
+    assert_cleanup_keeps_user_home_config_paths(&root, &env);
+}
+
+#[test]
+fn env_cleanup_rewrites_only_the_inferred_openclaw_directory() {
+    let root = TestDir::new("env-cleanup-inferred-openclaw-directory");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+
+    let target = run_ocm(&cwd, &env, &["env", "create", "target", "--port", "19790"]);
+    assert!(target.status.success(), "{}", stderr(&target));
+
+    // The copied source home contains the environment root, so a whole-prefix
+    // rewrite would nest the environment's own paths inside itself.
+    let source_home = root.path().to_path_buf();
+    let env_root = env_root_of(&cwd, &env, "target");
+    let own_path = path_string(&env_root.join(".openclaw/extensions/own"));
+    let project_path = path_string(&source_home.join("projects/app"));
+    let target_config = env_root.join(".openclaw/openclaw.json");
+    fs::write(
+        &target_config,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "gateway": {"port": 19790},
+            "memory": {"logPath": path_string(&source_home.join(".openclaw/logs/gateway.log"))},
+            "plugins": {"load": {"paths": [project_path, own_path]}}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let cleanup = run_ocm(&cwd, &env, &["env", "cleanup", "target", "--yes"]);
+    assert!(cleanup.status.success(), "{}", stderr(&cleanup));
+    assert!(stdout(&cleanup).contains("repair-openclaw-config"));
+
+    let repaired: Value =
+        serde_json::from_str(&fs::read_to_string(&target_config).unwrap()).unwrap();
+    assert_eq!(
+        repaired["memory"]["logPath"],
+        path_string(&env_root.join(".openclaw/logs/gateway.log"))
+    );
+    assert_eq!(
+        repaired["plugins"]["load"]["paths"],
+        serde_json::json!([project_path, own_path])
+    );
+}
+
 #[test]
 fn env_cleanup_yes_clears_copied_openclaw_runtime_state() {
     let root = TestDir::new("env-cleanup-runtime-state-repair");

@@ -1784,6 +1784,10 @@ underlying error; preview and apply preserve that binding. Restore access or rep
 the metadata, then rerun doctor. Restoring valid metadata allows execution to
 recover without rebinding. `--all` applies the same rule.
 
+Config repair moves paths under another registered environment's root into this environment's root.
+Without a registered owner, it maps only paths inside another `.openclaw` directory onto this environment's `.openclaw` directory and leaves other paths unchanged.
+Paths in your own `~/.openclaw` are references to your existing OpenClaw home, so doctor does not report them and cleanup does not rewrite them.
+
 Runtime-state cleanup preserves configured agent directories inside the environment, including their authentication and state files beneath generated plugin dependencies.
 It also retains shared managed skills under `.openclaw/skills` and their global ClawHub tracking metadata under `.openclaw/.clawhub`.
 A runtime-state reset is planned only when a session transcript under `.openclaw/agents/<id>/sessions` records, in its header, a working directory under another environment's root or another `.openclaw` directory, as state copied from elsewhere does.
