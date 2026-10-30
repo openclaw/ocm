@@ -244,12 +244,14 @@ impl Cli {
         };
 
         if let Some(target) = runtime_switch {
-            // The transition takes the environment's operation lock itself.
+            // The transition takes the environment's operation lock itself and
+            // refuses a same-name env created after start read this one.
             self.replace_env_binding_with_runtime(
                 &request.name,
                 request.version.clone(),
                 request.channel.clone(),
                 request.runtime_name.is_some().then_some(target),
+                existing.as_ref(),
             )?;
             // Finalization can rewrite the configuration read above, so minimum
             // setup is prepared again from the switched env.

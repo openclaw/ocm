@@ -805,6 +805,101 @@ fn start_refuses_an_env_recreated_while_it_waits_for_the_operation_lock() {
 }
 
 #[test]
+fn start_runtime_switch_refuses_an_env_recreated_before_the_transition() {
+    let root = TestDir::new("start-switch-recreated-env");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    let commands = root.child("runtime-commands.log");
+    let runtime = root.child("new-openclaw");
+    write_executable_script(
+        &runtime,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\necho 2026.6.33\n",
+            path_string(&commands)
+        ),
+    );
+
+    for args in [
+        vec!["launcher", "add", "stable", "--command", "openclaw"],
+        vec!["runtime", "add", "new", "--path", &path_string(&runtime)],
+        vec!["env", "create", "demo", "--launcher", "stable"],
+    ] {
+        let output = run_ocm(&cwd, &env, &args);
+        assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+    }
+    let first = ocm::store::get_environment("demo", &env, &cwd).unwrap();
+    let registry = ocm::store::env_registry_path(&env, &cwd).unwrap();
+
+    let operation = hold_environment_operation(&root, "demo");
+    let mut start = Command::new(ocm_test_binary_path())
+        .current_dir(&cwd)
+        .args(["start", "demo", "--runtime", "new", "--no-service"])
+        .env_clear()
+        .envs(&env)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        assert!(
+            start.try_wait().unwrap().is_none(),
+            "start finished while the environment operation lock was held"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // Replace the env as `env remove` and `env create` do while start waits.
+    let mut registry_value: Value =
+        serde_json::from_str(&fs::read_to_string(&registry).unwrap()).unwrap();
+    registry_value["envs"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|meta| meta["name"] != "demo");
+    fs::write(
+        &registry,
+        serde_json::to_vec_pretty(&registry_value).unwrap(),
+    )
+    .unwrap();
+    fs::remove_dir_all(&first.root).unwrap();
+    let recreate = run_ocm(
+        &cwd,
+        &env,
+        &["env", "create", "demo", "--launcher", "stable"],
+    );
+    assert!(recreate.status.success(), "{}", stderr(&recreate));
+    let second = ocm::store::get_environment("demo", &env, &cwd).unwrap();
+    assert_ne!(second.created_at, first.created_at);
+    drop(operation);
+
+    let output = start.wait_with_output().unwrap();
+    assert!(
+        !output.status.success(),
+        "start switched a replaced env: {}",
+        stdout(&output)
+    );
+    let replacement = ocm::store::get_environment("demo", &env, &cwd).unwrap();
+    assert_eq!(replacement.created_at, second.created_at);
+    assert_eq!(replacement.default_launcher.as_deref(), Some("stable"));
+    assert_eq!(replacement.default_runtime, None);
+    let snapshots = run_ocm(&cwd, &env, &["env", "snapshot", "list", "demo", "--json"]);
+    assert!(snapshots.status.success(), "{}", stderr(&snapshots));
+    let snapshots: Value = serde_json::from_str(&stdout(&snapshots)).unwrap();
+    assert!(snapshots.as_array().unwrap().is_empty(), "{snapshots}");
+    assert!(
+        !commands.exists(),
+        "the transition ran the target runtime for a replaced env: {}",
+        fs::read_to_string(&commands).unwrap_or_default()
+    );
+    assert!(
+        stderr(&output).contains("changed before its runtime transition started"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
 fn start_preserves_included_settings_and_exported_workspace() {
     for shape in ["root-include", "inline", "root-siblings"] {
         let root = TestDir::new(shape);

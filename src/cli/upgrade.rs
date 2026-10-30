@@ -23,7 +23,7 @@ use diagnostics::{CandidateFailure, CandidateFailureKind};
 
 use super::{Cli, render};
 use crate::env::{
-    CloneEnvironmentOptions, CreateEnvSnapshotOptions, EnvSnapshotSummary,
+    CloneEnvironmentOptions, CreateEnvSnapshotOptions, EnvMeta, EnvSnapshotSummary,
     RestoreEnvSnapshotOptions, resolve_runtime_run_dir,
 };
 use crate::infra::shell::{
@@ -649,12 +649,15 @@ fn managed_codex_candidate_args() -> [String; 5] {
 }
 
 impl Cli {
+    /// With `expected`, the transition refuses an env that is no longer the
+    /// generation the caller read, before it changes anything.
     pub(super) fn upgrade_env_to_runtime_target(
         &self,
         name: &str,
         version: Option<String>,
         channel: Option<String>,
         runtime: Option<String>,
+        expected: Option<&EnvMeta>,
     ) -> Result<UpgradeEnvSummary, String> {
         let explicit_count = usize::from(version.is_some())
             + usize::from(channel.is_some())
@@ -664,7 +667,8 @@ impl Cli {
                 "runtime transition requires exactly one version, channel, or runtime".to_string(),
             );
         }
-        self.upgrade_env(
+        let _batch_lock = lock_upgrade_participant(&self.env, &self.cwd)?;
+        self.upgrade_env_in_batch(
             name,
             &UpgradeTarget {
                 version,
@@ -675,6 +679,7 @@ impl Cli {
                 dry_run: false,
                 rollback_enabled: true,
             },
+            expected,
         )
     }
 
@@ -687,8 +692,10 @@ impl Cli {
         version: Option<String>,
         channel: Option<String>,
         runtime: Option<String>,
+        expected: Option<&EnvMeta>,
     ) -> Result<(), String> {
-        let summary = self.upgrade_env_to_runtime_target(name, version, channel, runtime)?;
+        let summary =
+            self.upgrade_env_to_runtime_target(name, version, channel, runtime, expected)?;
         if matches!(
             summary.outcome.as_str(),
             "failed" | "rolled-back" | "rollback-failed"
@@ -2760,7 +2767,7 @@ impl Cli {
         options: UpgradeOptions,
     ) -> Result<UpgradeEnvSummary, String> {
         let _batch_lock = lock_upgrade_participant(&self.env, &self.cwd)?;
-        self.upgrade_env_in_batch(name, target, options)
+        self.upgrade_env_in_batch(name, target, options, None)
     }
 
     fn upgrade_env_in_batch(
@@ -2768,10 +2775,19 @@ impl Cli {
         name: &str,
         target: &UpgradeTarget,
         options: UpgradeOptions,
+        expected: Option<&EnvMeta>,
     ) -> Result<UpgradeEnvSummary, String> {
         let _transaction_lock = lock_upgrade_transaction(name, &self.env, &self.cwd)?;
         let operation_lock = self.environment_service().lock_operation(name)?;
         self.validate_upgrade_job_environment(name)?;
+        if let Some(expected) = expected {
+            let current = self.environment_service().get(name)?;
+            if current.root != expected.root || current.created_at != expected.created_at {
+                return Err(format!(
+                    "environment \"{name}\" changed before its runtime transition started; retry"
+                ));
+            }
+        }
         self.upgrade_env_locked(name, target, options, &operation_lock)
     }
 

@@ -1617,7 +1617,7 @@ impl Cli {
             let runtime = runtime_name
                 .map(|runtime| validate_name(&runtime, "Runtime name"))
                 .transpose()?;
-            self.replace_env_binding_with_runtime(name, version, channel, runtime)?;
+            self.replace_env_binding_with_runtime(name, version, channel, runtime, None)?;
             let meta = self.environment_service().get(name)?;
             if json_flag {
                 self.print_json(&meta)?;
