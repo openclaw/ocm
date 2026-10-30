@@ -1255,8 +1255,9 @@ fn owned_archive_link_target(
 }
 
 // Returns the root-relative path a link target names, without resolving the
-// links along it, when every step of that path stays inside the root and is
-// archived. `parent` is the link's root-relative parent, a real directory.
+// links along it, when that path passes through a link and every step stays
+// inside the root and is archived. `parent` is the link's root-relative
+// parent, a real directory.
 fn named_owned_link_target(
     parent: &Path,
     root: &Path,
@@ -1308,19 +1309,22 @@ fn named_owned_link_target(
     let common = shared_ancestors(parent, &named);
     // The shared ancestors are the link's own real directories. Each later
     // step may be a link and must resolve inside the root and be archived.
+    // A path through no link keeps its resolved, on-disk spelling.
     let mut step = named.components().take(common).collect::<PathBuf>();
+    let mut through_link = false;
     for component in named.components().skip(common) {
         step.push(component);
         let metadata = fs::symlink_metadata(root.join(&step)).ok()?;
         if options.should_skip(&step, env_archive_entry_kind(&metadata)) {
             return None;
         }
+        through_link |= metadata.file_type().is_symlink();
         fs::canonicalize(root.join(&step))
             .ok()?
             .strip_prefix(root)
             .ok()?;
     }
-    Some(named)
+    through_link.then_some(named)
 }
 
 fn shared_ancestors(parent: &Path, named: &Path) -> usize {
