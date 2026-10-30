@@ -803,7 +803,7 @@ fn load_effective_openclaw_config_with_source_roots(
     load_effective_openclaw_config_with_config_roots(config_path, &config_roots)
 }
 
-fn load_effective_openclaw_config_with_config_roots(
+pub(super) fn load_effective_openclaw_config_with_config_roots(
     config_path: &Path,
     source_config_roots: &[PathBuf],
 ) -> Result<Option<EffectiveOpenClawConfig>, String> {

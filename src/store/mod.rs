@@ -63,8 +63,8 @@ pub(crate) use envs::{
     with_locked_environments,
 };
 pub(crate) use gateway_ports::{
-    openclaw_port_family_available, openclaw_port_family_range, resolve_config_gateway_port,
-    resolve_effective_gateway_ports,
+    openclaw_port_family_available, openclaw_port_family_range, read_plain_home_gateway_port,
+    resolve_config_gateway_port, resolve_effective_gateway_ports,
 };
 pub(crate) use launchers::find_launcher;
 pub use launchers::{add_launcher, get_launcher, list_launchers, remove_launcher};

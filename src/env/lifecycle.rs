@@ -401,15 +401,15 @@ impl<'a> EnvironmentService<'a> {
         Ok(meta)
     }
 
-    /// Creates an environment for a copy of the plain OpenClaw home configured
-    /// at `plain_home_config`; an automatic port avoids that home's ports.
+    /// Creates an environment for a copy of a plain OpenClaw home configured
+    /// for `plain_home_port`; an automatic port avoids that port's family.
     pub(crate) fn create_beside_plain_home(
         &self,
         options: CreateEnvironmentOptions,
-        plain_home_config: &Path,
+        plain_home_port: Option<u32>,
     ) -> Result<EnvMeta, String> {
         let meta =
-            create_environment_beside_plain_home(options, plain_home_config, self.env, self.cwd)?;
+            create_environment_beside_plain_home(options, plain_home_port, self.env, self.cwd)?;
         sync_supervisor_env_if_present(self.env, self.cwd, &meta.name)?;
         Ok(meta)
     }

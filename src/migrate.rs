@@ -11,10 +11,10 @@ use crate::store::{
     MigrationWorkspaceCopy, OpenClawDirectoryCopy, OpenClawWorkspaceRuntime, clean_path,
     default_env_root, derive_env_paths, display_path, list_environments,
     normalize_new_environment_sandbox_origin, prepare_migrated_runtime_state,
-    reject_include_owned_agent_workspaces, reject_include_owned_sandbox_origin,
-    resolve_plain_openclaw_workspaces, resolve_user_home, rewrite_copied_config_include_directives,
-    rewrite_external_workspace_paths_for_migration, rewrite_openclaw_config_for_migration,
-    validate_name,
+    read_plain_home_gateway_port, reject_include_owned_agent_workspaces,
+    reject_include_owned_sandbox_origin, resolve_plain_openclaw_workspaces, resolve_user_home,
+    rewrite_copied_config_include_directives, rewrite_external_workspace_paths_for_migration,
+    rewrite_openclaw_config_for_migration, validate_name,
 };
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -69,6 +69,7 @@ struct ExternalWorkspaceCopy {
 #[derive(Clone, Debug, Default)]
 struct MigrationCopyPlan {
     source_config_roots: Vec<PathBuf>,
+    source_gateway_port: Option<u32>,
     config_include_paths: Vec<PathBuf>,
     default_workspace: Option<ExternalWorkspaceCopy>,
     agent_workspaces: BTreeMap<String, ExternalWorkspaceCopy>,
@@ -115,8 +116,11 @@ impl MigrationCopyPlan {
         // Admission needs the supplied root spelling as well as its filesystem identity.
         let sources = inventory.workspace_sources_for_migration(source_home)?;
         let canonical_target_root = canonicalize_path_allow_missing(&target_paths.root)?;
+        let source_gateway_port =
+            read_plain_home_gateway_port(&canonical_source_home, &source_config_roots)?;
         let mut plan = Self {
             source_config_roots,
+            source_gateway_port,
             config_include_paths: inventory.config_include_paths().cloned().collect(),
             resolved_agent_ids: inventory.resolved_agent_ids().clone(),
             ..Self::default()
@@ -472,7 +476,7 @@ fn migrate_plain_openclaw_home_inner(
             dev: None,
             protected: false,
         },
-        &source_home.join("openclaw.json"),
+        external_workspace_plan.source_gateway_port,
     )?;
     let created_name = created.name.clone();
     let target_paths = derive_env_paths(Path::new(&created.root));

@@ -633,21 +633,21 @@ pub(crate) fn create_environment_with_validated_runtime(
     create_environment_with_runtime_validation(options, true, None, env, cwd)
 }
 
-/// Creates an environment copied from the plain OpenClaw home configured at
-/// `plain_home_config`, keeping an automatic port clear of that home's ports.
+/// Creates an environment copied from a plain OpenClaw home configured for
+/// `plain_home_port`, keeping an automatic port clear of that port's family.
 pub(crate) fn create_environment_beside_plain_home(
     options: CreateEnvironmentOptions,
-    plain_home_config: &Path,
+    plain_home_port: Option<u32>,
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<EnvMeta, String> {
-    create_environment_with_runtime_validation(options, true, Some(plain_home_config), env, cwd)
+    create_environment_with_runtime_validation(options, true, plain_home_port, env, cwd)
 }
 
 fn create_environment_with_runtime_validation(
     options: CreateEnvironmentOptions,
     validate_runtime: bool,
-    plain_home_config: Option<&Path>,
+    plain_home_port: Option<u32>,
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<EnvMeta, String> {
@@ -726,11 +726,11 @@ fn create_environment_with_runtime_validation(
     let gateway_port_auto_assigned = options.gateway_port.is_none();
     let gateway_port = Some(match options.gateway_port {
         Some(port) => port,
-        None => match plain_home_config {
-            Some(config_path) => choose_available_gateway_port_beside_plain_home(
+        None => match plain_home_port {
+            Some(plain_home_port) => choose_available_gateway_port_beside_plain_home(
                 DEFAULT_GATEWAY_PORT,
                 &registry.envs,
-                config_path,
+                plain_home_port,
                 env,
             )?,
             None => choose_available_gateway_port(DEFAULT_GATEWAY_PORT, &registry.envs, env)?,

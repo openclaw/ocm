@@ -964,6 +964,35 @@ fn migrate_and_adopt_keep_an_explicit_source_homes_gateway_ports_free() {
         fs::read_to_string(source_home.join("openclaw.json")).unwrap(),
         source_config
     );
+
+    // A relative source whose port comes from an absolute include authored
+    // under the process cwd's physical spelling of the home.
+    let included_home = root.child("workspace/included/.openclaw");
+    fs::create_dir_all(&included_home).unwrap();
+    let authored = fs::canonicalize(&cwd).unwrap().join("included/.openclaw");
+    fs::write(
+        included_home.join("openclaw.json"),
+        serde_json::json!({"gateway": {"$include": authored.join("gw.json")}}).to_string(),
+    )
+    .unwrap();
+    fs::write(included_home.join("gw.json"), "{ \"port\": 18850 }\n").unwrap();
+    let output = run_ocm(&cwd, &env, &["migrate", "included", "included/.openclaw"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    // The copied include keeps its own port, so read the allocated one.
+    let registry: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.child("ocm-home/envs.json")).unwrap()).unwrap();
+    let port = registry["envs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|meta| meta["name"] == "included")
+        .unwrap()["gatewayPort"]
+        .as_u64()
+        .unwrap();
+    assert!(
+        port + 110 < 18_850 || port > 18_960,
+        "included got {port}, inside the source home's port family"
+    );
 }
 
 #[test]
