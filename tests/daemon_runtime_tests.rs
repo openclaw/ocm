@@ -6642,7 +6642,8 @@ fn daemon_restarts_quick_clean_exit_with_openclaw_handoff() {
     assert!(wait_for_file_value(&starts, "2", Duration::from_secs(6)));
     let runtime = wait_for_runtime_children(&runtime_path, 1, Some("demo"), Duration::from_secs(5))
         .expect("daemon runtime state did not report the restarted child");
-    assert!(runtime["children"][0]["restartCount"].as_u64().unwrap() >= 1);
+    // An accepted handoff is a requested restart, not a failure.
+    assert_eq!(runtime["children"][0]["restartCount"], 0);
     assert_eq!(
         fs::read_to_string(&child_env).unwrap().trim(),
         "external|openclaw|gateway|unset|unset|unset"
@@ -6806,7 +6807,7 @@ fn daemon_stops_repeated_quick_clean_exit_after_restart_handoff() {
     let service_state =
         wait_for_runtime_service_state(&runtime_path, "demo", "stopped", Duration::from_secs(5))
             .expect("daemon runtime state did not stop after the repeated quick clean exit");
-    assert_eq!(service_state["restartCount"], 1);
+    assert_eq!(service_state["restartCount"], 0);
     assert!(
         service_state["lastError"]
             .as_str()

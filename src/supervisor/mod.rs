@@ -2684,7 +2684,12 @@ fn reconcile_restart_requests(
                 existing.spec.env_name,
                 child_binding_label(&next_spec)
             );
-            let restart_count = existing.restart_count + 1;
+            // An explicit restart is not a failure: it does not add to the
+            // backoff a later exit of the replacement would wait.
+            let restart_count = restart_count_since_stable_run(
+                existing.restart_count,
+                existing.started_at.elapsed(),
+            );
             runtime_dirty = true;
             if stop_supervisor_child(existing).is_err() {
                 continue;
@@ -2887,7 +2892,7 @@ fn process_exited_children(
             && let Some(next_spec) = next_spec
         {
             let next_restart_count = if next_spec == previous_child.spec {
-                exited_child.restart_count + 1
+                restart_count_after_exit(&exited_child)
             } else {
                 0
             };
@@ -3570,6 +3575,30 @@ fn restart_delay_ms(restart_count: usize) -> u64 {
     SUPERVISOR_RESTART_DELAY_MS
         .saturating_mul(2u64.saturating_pow(exponent))
         .min(SUPERVISOR_MAX_RESTART_DELAY_MS)
+}
+
+/// The backoff count for restarting an exited child with an unchanged spec.
+/// An accepted OpenClaw restart handoff is a requested restart, such as an
+/// ordinary `ocm service restart`, so it does not add to the backoff.
+fn restart_count_after_exit(exited_child: &ExitedSupervisorChild) -> usize {
+    let restart_count =
+        restart_count_since_stable_run(exited_child.restart_count, exited_child.ran_for);
+    if exited_child.restart_handoff == RestartHandoffConsumeResult::Accepted {
+        restart_count
+    } else {
+        restart_count + 1
+    }
+}
+
+/// Restarts that count toward a child's backoff after it ran for `ran_for`.
+/// A run that was not quick by the clean-exit guard's measure proves the child
+/// healthy again, so its next restart waits like a first restart.
+fn restart_count_since_stable_run(restart_count: usize, ran_for: Duration) -> usize {
+    if ran_for < Duration::from_millis(SUPERVISOR_STABLE_RUN_MS) {
+        restart_count
+    } else {
+        0
+    }
 }
 
 fn preflight_supervisor_child_ports(pending_child: &PendingSupervisorChild) -> Result<(), String> {
@@ -5031,6 +5060,101 @@ mod tests {
     }
 
     #[test]
+    fn restart_after_stable_run_waits_like_first_restart() {
+        for ran_for in [
+            Duration::from_millis(SUPERVISOR_STABLE_RUN_MS),
+            Duration::from_secs(3600),
+        ] {
+            let restart_count = restart_count_after_exit(&exited_child(Some(1), 6, ran_for));
+
+            assert_eq!(restart_count, 1);
+            assert_eq!(restart_delay_ms(restart_count), SUPERVISOR_RESTART_DELAY_MS);
+        }
+    }
+
+    #[test]
+    fn quick_exits_keep_backing_off_to_the_cap() {
+        let quick = Duration::from_millis(SUPERVISOR_STABLE_RUN_MS - 1);
+        let mut restart_count = 0;
+        let mut delays = Vec::new();
+        for _ in 0..7 {
+            restart_count = restart_count_after_exit(&exited_child(Some(1), restart_count, quick));
+            delays.push(restart_delay_ms(restart_count));
+        }
+
+        assert_eq!(delays, [1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000]);
+    }
+
+    #[test]
+    fn accepted_restart_handoff_does_not_add_to_backoff() {
+        let quick = Duration::from_millis(SUPERVISOR_STABLE_RUN_MS - 1);
+        let stable = Duration::from_millis(SUPERVISOR_STABLE_RUN_MS);
+        for (restart_count, ran_for, expected_restart_count) in
+            [(0, quick, 0), (3, quick, 3), (3, stable, 0)]
+        {
+            let exited = exited_child_with_handoff_result(
+                Some(0),
+                restart_count,
+                0,
+                RestartHandoffConsumeResult::Accepted,
+                ran_for,
+            );
+
+            assert_eq!(restart_count_after_exit(&exited), expected_restart_count);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_request_does_not_add_to_backoff() {
+        let stable_run = Duration::from_millis(SUPERVISOR_STABLE_RUN_MS);
+        for (ran_for, expected_restart_count) in [(Duration::ZERO, 4), (stable_run, 0)] {
+            let state = supervisor_state(Vec::new());
+            let child = Command::new("/bin/sleep")
+                .arg("30")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let mut running = BTreeMap::from([(
+                "demo".to_string(),
+                RunningSupervisorChild {
+                    launch_spec_sha256: state.children[0].launch_spec_sha256(),
+                    spec: state.children[0].clone(),
+                    child,
+                    restart_count: 4,
+                    quick_clean_restart_count: 0,
+                    restart_handoff_support: RestartHandoffSupport::Unsupported(
+                        "fixture".to_string(),
+                    ),
+                    started_at: Instant::now().checked_sub(ran_for).unwrap(),
+                    cleanup_error: None,
+                    reaped_status: None,
+                },
+            )]);
+            let mut pending = BTreeMap::new();
+            let mut inactive = BTreeMap::new();
+
+            assert!(reconcile_restart_requests(
+                &[SupervisorRestartRequest {
+                    env_name: "demo".to_string(),
+                    request_id: "restart-1".to_string(),
+                }],
+                &mut running,
+                &mut pending,
+                &mut inactive,
+                &state,
+            ));
+
+            assert!(running.is_empty());
+            assert_eq!(pending["demo"].restart_count, expected_restart_count);
+            assert!(pending["demo"].retry_at <= Instant::now());
+        }
+    }
+
+    #[test]
     fn desired_quick_clean_exit_without_accepted_handoff_stays_stopped() {
         let decision = exited_child_restart_decision(
             &exited_child(Some(0), 0, Duration::from_millis(50)),
@@ -5688,7 +5812,7 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(25));
                 }
                 assert!(running.0.is_empty());
-                assert_eq!(pending["demo"].restart_count, 1);
+                assert_eq!(pending["demo"].restart_count, 0);
                 let saved: SupervisorState = read_json(&state_path).unwrap();
                 assert!(saved.restart_requests.is_empty());
                 assert!(!refresh_active_state(
@@ -5700,7 +5824,7 @@ mod tests {
                     &mut pending,
                     &mut inactive
                 ));
-                assert_eq!(pending["demo"].restart_count, 1);
+                assert_eq!(pending["demo"].restart_count, 0);
             } else {
                 crate::store::set_environment_service_policy(
                     &meta.name,
