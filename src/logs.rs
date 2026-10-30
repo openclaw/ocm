@@ -10,7 +10,7 @@ use time::OffsetDateTime;
 
 use crate::env::EnvironmentService;
 use crate::infra::file_identity::{FileIdentity, file_identity, file_is_excluded};
-use crate::store::{derive_env_paths, display_path};
+use crate::store::{derive_env_paths, display_path, supervisor_child_log_file};
 
 const FOLLOW_POLL_INTERVAL_MS: u64 = 250;
 const TAIL_READ_CHUNK_SIZE: usize = 8 * 1024;
@@ -68,31 +68,35 @@ impl LogSources {
 
     /// Picks the newer existing file, or the Gateway path when neither exists.
     fn select(&self) -> Result<LogTarget, String> {
+        // A follower selects again until a file exists. By then a case-distinct
+        // name may have created the name-keyed file, which is not this env's.
+        let service_path =
+            supervisor_child_log_file(&self.service_path, &self.env_name, &self.stream);
         let gateway_modified = modified_at(&self.gateway_path);
         let service_modified = if !self.service_available {
             None
         } else if self.excluded_paths.is_empty() {
-            modified_at(&self.service_path)
+            modified_at(&service_path)
         } else if gateway_modified.is_some_and(|gateway_time| {
-            modified_at(&self.service_path).is_some_and(|service_time| gateway_time >= service_time)
+            modified_at(&service_path).is_some_and(|service_time| gateway_time >= service_time)
         }) {
             // Gateway wins ties too. An unused child file need not be opened
             // for diagnostic ownership checks before reading Gateway output.
             None
         } else {
-            open_log_excluding(&self.service_path, &self.excluded_paths)?
+            open_log_excluding(&service_path, &self.excluded_paths)?
                 .and_then(|(_, metadata)| modified_time(&metadata))
         };
         let (source_kind, path) = match (gateway_modified, service_modified) {
             (Some(gateway_time), Some(service_time)) => {
                 if service_time > gateway_time {
-                    ("service", &self.service_path)
+                    ("service", &service_path)
                 } else {
                     ("gateway", &self.gateway_path)
                 }
             }
             (Some(_), None) => ("gateway", &self.gateway_path),
-            (None, Some(_)) => ("service", &self.service_path),
+            (None, Some(_)) => ("service", &service_path),
             (None, None) => ("gateway", &self.gateway_path),
         };
 
@@ -2515,6 +2519,35 @@ mod tests {
         let update = cursor.read_update().unwrap().unwrap();
         assert_eq!(update_bytes(&update), b"second service error\n");
         assert_eq!(cursor.target.path, service_path);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pending_follower_ignores_a_case_distinct_envs_service_log() {
+        let root = test_root("follow-pending-case-distinct");
+        let gateway_path = root.join("gateway.err.log");
+        let service_path = root.join("demo.stderr.log");
+        let mut cursor =
+            FollowCursor::for_sources(stderr_sources(&gateway_path, &service_path)).unwrap();
+        assert!(cursor.snapshot(Some(50), false).unwrap().is_none());
+
+        // On case-insensitive storage, Demo's file is what demo.stderr.log opens.
+        fs::write(root.join("Demo.stderr.log"), b"other env error\n").unwrap();
+        assert!(cursor.snapshot(Some(50), false).unwrap().is_none());
+
+        let separate =
+            crate::store::supervisor_child_case_distinct_log_path(&root, "demo", "stderr");
+        fs::create_dir_all(separate.parent().unwrap()).unwrap();
+        let own = if root.join("DEMO.STDERR.LOG").exists() {
+            separate
+        } else {
+            service_path
+        };
+        fs::write(&own, b"own error\n").unwrap();
+        let snapshot = cursor.snapshot(Some(50), false).unwrap().unwrap();
+        assert_eq!(snapshot.bytes, b"own error\n");
+        assert_eq!(cursor.target.path, own);
 
         let _ = fs::remove_dir_all(root);
     }
