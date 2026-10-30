@@ -5073,6 +5073,7 @@ fn env_remove_refuses_a_clean_replacement_at_a_stale_registered_path() {
     );
 }
 
+#[cfg(unix)]
 fn assert_dev_checkout_health(
     cwd: &Path,
     env: &std::collections::BTreeMap<String, String>,

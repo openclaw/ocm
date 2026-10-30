@@ -870,6 +870,13 @@ fn env_doctor_next_steps(doctor: &EnvDoctorSummary, command_example: &str) -> Ve
         )];
     }
 
+    if doctor.resolution_status == "error" && doctor.resolved_kind.as_deref() == Some("dev") {
+        return vec![KeyValueRow::warning(
+            "Inspect source",
+            format!("{command_example} env show {}", doctor.env_name),
+        )];
+    }
+
     if doctor.runtime_status == "missing" || doctor.runtime_status == "broken" {
         let mut rows = Vec::new();
         if let Some(runtime_name) = doctor.resolved_name.as_deref()
@@ -1853,11 +1860,6 @@ mod tests {
                 .any(|line| line.contains("OpenClaw checkout not found at /tmp/checkout"))
         );
         assert!(lines.iter().any(|line| line.contains("ocm env show demo")));
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("ocm dev rebind demo --repo <checkout>"))
-        );
         assert!(!lines.iter().any(|line| line.contains("ocm @demo")));
     }
 
@@ -1913,6 +1915,39 @@ mod tests {
         assert!(lines.iter().any(|line| line.contains("Summary")));
         assert!(lines.iter().any(|line| line.contains("Checks")));
         assert!(lines.iter().any(|line| line.contains("Issues")));
+    }
+
+    #[test]
+    fn env_doctor_pretty_suggests_inspecting_an_unusable_dev_source() {
+        let lines = env_doctor(
+            &EnvDoctorSummary {
+                env_name: "demo".to_string(),
+                root: "/tmp/demo".to_string(),
+                default_runtime: None,
+                default_launcher: None,
+                healthy: false,
+                root_status: "ok".to_string(),
+                config_status: "ok".to_string(),
+                runtime_status: "unbound".to_string(),
+                launcher_status: "unbound".to_string(),
+                resolution_status: "error".to_string(),
+                resolved_kind: Some("dev".to_string()),
+                resolved_name: Some("dev".to_string()),
+                runtime_source_kind: None,
+                runtime_release_version: None,
+                runtime_release_channel: None,
+                issues: vec!["OpenClaw checkout not found at /tmp/checkout".to_string()],
+            },
+            RenderProfile::pretty(false),
+            "ocm",
+        );
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("OpenClaw checkout not found at /tmp/checkout"))
+        );
+        assert!(lines.iter().any(|line| line.contains("ocm env show demo")));
     }
 
     #[test]
@@ -2548,20 +2583,13 @@ fn env_status_next_steps(status: &EnvStatusSummary, command_example: &str) -> Ve
         ];
     }
 
+    // Older owned worktree bindings cannot use dev rebind, so only point at the
+    // recorded source; the issue says to restore it.
     if status.resolved_kind.as_deref() == Some("dev") && status.issue.is_some() {
-        return vec![
-            KeyValueRow::accent(
-                "Inspect source",
-                format!("{command_example} env show {}", status.env_name),
-            ),
-            KeyValueRow::warning(
-                "Rebind",
-                format!(
-                    "{command_example} dev rebind {} --repo <checkout>",
-                    status.env_name
-                ),
-            ),
-        ];
+        return vec![KeyValueRow::warning(
+            "Inspect source",
+            format!("{command_example} env show {}", status.env_name),
+        )];
     }
 
     match status.managed_service_state.as_deref() {
