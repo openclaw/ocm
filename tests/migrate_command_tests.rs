@@ -4604,3 +4604,52 @@ fn migration_rejects_only_mutating_saved_skill_includes() {
         }
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn migrate_skips_fifos_in_the_home_and_external_workspaces_without_blocking() {
+    use std::os::unix::fs::FileTypeExt;
+    use std::time::Duration;
+
+    let root = TestDir::new("migrate-special-files");
+    let source = root.child("plain-home");
+    let external = root.child("external");
+    fs::create_dir_all(source.join("workspace")).unwrap();
+    fs::create_dir_all(&external).unwrap();
+    fs::write(source.join("workspace/notes.txt"), "home payload\n").unwrap();
+    fs::write(external.join("notes.txt"), "external payload\n").unwrap();
+    support::make_fifo(&source.join("workspace/pipe"));
+    support::make_fifo(&external.join("pipe"));
+    fs::write(
+        source.join("openclaw.json"),
+        serde_json::json!({
+            "agents": {"defaults": {"workspace": external}}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let env = ocm_env(&root);
+
+    let output = support::run_ocm_within(
+        root.path(),
+        &env,
+        &["migrate", "mira", source.to_str().unwrap()],
+        Duration::from_secs(60),
+    );
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let state = root.child("ocm-home/envs/mira/.openclaw");
+    assert_eq!(
+        fs::read_to_string(state.join("workspace/notes.txt")).unwrap(),
+        "home payload\n"
+    );
+    assert_eq!(
+        fs::read_to_string(state.join("workspaces/default/notes.txt")).unwrap(),
+        "external payload\n"
+    );
+    assert!(fs::symlink_metadata(state.join("workspace/pipe")).is_err());
+    assert!(fs::symlink_metadata(state.join("workspaces/default/pipe")).is_err());
+    for pipe in [source.join("workspace/pipe"), external.join("pipe")] {
+        assert!(fs::symlink_metadata(pipe).unwrap().file_type().is_fifo());
+    }
+}

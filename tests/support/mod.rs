@@ -1032,6 +1032,59 @@ pub fn run_ocm_binary(
     command.output().unwrap()
 }
 
+/// Run ocm, failing instead of hanging when it does not exit within `limit`.
+pub fn run_ocm_within(
+    cwd: &Path,
+    env: &BTreeMap<String, String>,
+    args: &[&str],
+    limit: Duration,
+) -> Output {
+    let mut child = Command::new(ocm_test_binary_path())
+        .current_dir(cwd)
+        .args(args)
+        .env_clear()
+        .envs(env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Drain both pipes so a verbose child cannot block on a full pipe.
+    fn drain(mut pipe: impl Read + Send + 'static) -> JoinHandle<Vec<u8>> {
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            pipe.read_to_end(&mut bytes).unwrap();
+            bytes
+        })
+    }
+    let stdout = drain(child.stdout.take().unwrap());
+    let stderr = drain(child.stderr.take().unwrap());
+    let deadline = std::time::Instant::now() + limit;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("ocm {args:?} did not exit within {limit:?}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    Output {
+        status,
+        stdout: stdout.join().unwrap(),
+        stderr: stderr.join().unwrap(),
+    }
+}
+
+#[cfg(unix)]
+pub fn make_fifo(path: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    let raw = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(raw.as_ptr(), 0o600) }, 0);
+}
+
 pub fn run_ocm_with_stdin(
     cwd: &Path,
     env: &BTreeMap<String, String>,
