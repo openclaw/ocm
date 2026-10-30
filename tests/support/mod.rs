@@ -1049,16 +1049,33 @@ pub fn run_ocm_within(
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
+    // Drain both pipes so a verbose child cannot block on a full pipe.
+    fn drain(mut pipe: impl Read + Send + 'static) -> JoinHandle<Vec<u8>> {
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            pipe.read_to_end(&mut bytes).unwrap();
+            bytes
+        })
+    }
+    let stdout = drain(child.stdout.take().unwrap());
+    let stderr = drain(child.stderr.take().unwrap());
     let deadline = std::time::Instant::now() + limit;
-    while child.try_wait().unwrap().is_none() {
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
         if std::time::Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
             panic!("ocm {args:?} did not exit within {limit:?}");
         }
         thread::sleep(Duration::from_millis(50));
+    };
+    Output {
+        status,
+        stdout: stdout.join().unwrap(),
+        stderr: stderr.join().unwrap(),
     }
-    child.wait_with_output().unwrap()
 }
 
 #[cfg(unix)]

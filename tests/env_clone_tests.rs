@@ -4644,7 +4644,10 @@ fn env_clone_skips_fifos_and_sockets_without_blocking() {
     fs::write(workspace.join("notes.txt"), "kept\n").unwrap();
     std::os::unix::fs::symlink("notes.txt", workspace.join("notes-link")).unwrap();
     support::make_fifo(&workspace.join("pipe"));
-    let _listener = UnixListener::bind(workspace.join("endpoint.sock")).unwrap();
+    // Bind at a short path for macOS, then move the live socket into the workspace.
+    let short_root = tempfile::tempdir().unwrap();
+    let _listener = UnixListener::bind(short_root.path().join("s")).unwrap();
+    fs::rename(short_root.path().join("s"), workspace.join("endpoint.sock")).unwrap();
 
     let cloned = support::run_ocm_within(
         root.path(),
