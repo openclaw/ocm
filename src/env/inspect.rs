@@ -3,7 +3,7 @@ use serde::Serialize;
 use super::{
     EnvironmentService, ExecutionBinding, resolve_execution_binding, resolve_runtime_run_dir,
 };
-use crate::launcher::resolve_launcher_run_dir;
+use crate::launcher::{launcher_working_directory_issue, resolve_launcher_run_dir};
 use crate::service::ServiceService;
 use crate::store::{get_launcher, runtime_operational_issue};
 
@@ -152,6 +152,8 @@ impl<'a> EnvironmentService<'a> {
                                 .display()
                                 .to_string(),
                         );
+                        summary.issue = launcher_working_directory_issue(&launcher)
+                            .map(|issue| format!("launcher \"{}\" {issue}", launcher.name));
                     }
                     Err(error) => summary.issue = Some(error),
                 }
