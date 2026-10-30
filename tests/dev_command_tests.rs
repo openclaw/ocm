@@ -9880,6 +9880,18 @@ fn alias_source_watch_file(root: &TestDir, from: &str, to: &str) {
 }
 
 #[cfg(unix)]
+fn case_distinct_source_watch_path(root: &TestDir, name: &str, extension: &str) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let key = Sha256::digest(name.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    root.child(format!(
+        "ocm-home/source-watch/case-distinct/{key}.{extension}"
+    ))
+}
+
+#[cfg(unix)]
 fn source_watch_session_owner(path: &Path) -> (String, bool) {
     let session: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
     (
@@ -9909,7 +9921,7 @@ fn case_distinct_environments_keep_separate_source_watch_state_on_shared_files()
     ok(&["env", "create", "Alpha", "--root", &alpha_root]);
     ok(&["dev", "alpha", "--repo", &repo, "--no-watch", "--no-ui"]);
     let shared = root.child("ocm-home/source-watch/alpha.session");
-    let separate = root.child("ocm-home/source-watch/case-distinct/+alpha.session");
+    let separate = case_distinct_source_watch_path(&root, "Alpha", "session");
     assert_eq!(source_watch_session_owner(&shared), ("alpha".into(), true));
     alias_source_watch_file(&root, "alpha.session", "Alpha.session");
     alias_source_watch_file(&root, "alpha.lock", "Alpha.lock");
@@ -9943,11 +9955,7 @@ fn case_distinct_environments_keep_separate_source_watch_state_on_shared_files()
     );
     assert_eq!(source_watch_session_owner(&shared), ("alpha".into(), true));
     // Gateway admission stays one lock per name, shared like operation locks.
-    assert!(
-        !root
-            .child("ocm-home/source-watch/case-distinct/+alpha.admission")
-            .exists()
-    );
+    assert!(!case_distinct_source_watch_path(&root, "Alpha", "admission").exists());
     assert!(root.child("ocm-home/source-watch/Alpha.admission").exists());
     ok(&["dev", "alpha", "--no-watch", "--no-ui"]);
     ok(&["dev", "Alpha", "--no-watch", "--no-ui"]);
@@ -9958,6 +9966,12 @@ fn case_distinct_environments_keep_separate_source_watch_state_on_shared_files()
     assert_eq!(source_watch_session_owner(&shared), ("alpha".into(), true));
     ok(&["env", "status", "alpha"]);
     ok(&["env", "status", "Alpha"]);
+    // The separate location stays short for the longest accepted names.
+    let long = "A".repeat(128);
+    let long_root = path_string(&root.child("long-root"));
+    ok(&["env", "create", &long, "--root", &long_root]);
+    ok(&["env", "status", &long]);
+    ok(&["env", "remove", &long]);
 
     // Removing the environment that holds the shared files leaves the peer's
     // state where it is, and each removal deletes only its own session.
@@ -10072,7 +10086,7 @@ fn case_distinct_environments_run_independent_active_dev_sessions() {
     };
     ok(&["env", "create", "beta"]);
     let shared = root.child("ocm-home/source-watch/alpha.session");
-    let separate = root.child("ocm-home/source-watch/case-distinct/+alpha.session");
+    let separate = case_distinct_source_watch_path(&root, "Alpha", "session");
 
     let alpha = DevWatchFixture::spawn(
         &root,

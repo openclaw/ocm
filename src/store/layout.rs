@@ -365,28 +365,24 @@ pub fn source_watch_override_path(
 
 /// Separate source-watch state for a name whose `source-watch/<name>.*` files
 /// already belong to a case-distinct environment on case-insensitive storage.
-/// Writing each uppercase ASCII letter as `+` and its lowercase form keeps
-/// every accepted name distinct under case folding.
+/// The SHA-256 of the exact name keeps every accepted name distinct under case
+/// folding and keeps the file name short for any accepted name length.
 pub fn source_watch_case_distinct_override_path(
     name: &str,
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<PathBuf, String> {
+    use sha2::{Digest, Sha256};
     let stores = resolve_store_paths(env, cwd)?;
-    let mut stem = String::with_capacity(name.len() * 2);
-    for character in name.chars() {
-        if character.is_ascii_uppercase() {
-            stem.push('+');
-            stem.push(character.to_ascii_lowercase());
-        } else {
-            stem.push(character);
-        }
-    }
+    let key = Sha256::digest(name.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
     Ok(stores
         .home
         .join("source-watch")
         .join("case-distinct")
-        .join(format!("{stem}.json")))
+        .join(format!("{key}.json")))
 }
 
 pub fn snapshot_archive_path(
