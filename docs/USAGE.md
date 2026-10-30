@@ -639,11 +639,13 @@ Use `service` when an environment should run in the background.
 
 ```bash
 ocm service install mira
-ocm service list
+ocm service status
 ocm service status mira
 ```
 
 Use `service install` when you want a background service for an environment that was created with `--no-service`, or when you want to bring an older env under background management later.
+
+`service status` without a name lists every supervised environment.
 
 On Linux, OCM writes its user-service unit under `$XDG_CONFIG_HOME/systemd/user`
 when `XDG_CONFIG_HOME` is an absolute path. An unset, empty, or relative value
@@ -1785,7 +1787,6 @@ launch plan, and admission rejects a saved plan that still names the old source.
 ocm env status mira
 ocm env doctor mira
 ocm env cleanup mira --yes
-ocm env repair-marker mira
 ```
 
 Cleanup clears runtime and launcher bindings only when their metadata is confirmed absent.
@@ -2068,7 +2069,7 @@ Use:
 Examples:
 
 ```bash
-ocm service list --json
+ocm service status --json
 ocm env status mira --raw
 ocm --color always runtime list
 ```
@@ -2078,26 +2079,43 @@ ocm --color always runtime list
 ### Top-level commands
 
 - `ocm setup`
+- `ocm dev`
 - `ocm start`
+- `ocm upgrade`
+- `ocm doctor`
 - `ocm self`
 - `ocm env`
+- `ocm migrate`
+- `ocm adopt`
 - `ocm release`
 - `ocm runtime`
 - `ocm launcher`
+- `ocm logs`
 - `ocm service`
 - `ocm init`
 - `ocm help`
 - `ocm --version`
 
+### `doctor`
+
+- host
+
 ### `env`
 
 - create, clone, list, show
 - use, exec, run, resolve, status
-- set-runtime, set-launcher
-- doctor, cleanup, repair-marker, protect
+- set-runtime, set-launcher, set-independent-paths
+- doctor, cleanup, protect
 - snapshot create, list, show, restore, remove, prune
 - export, import
+- artifact export
 - remove, destroy, prune
+
+### `adopt`
+
+- import
+- inspect
+- plan
 
 ### `release`
 
@@ -2127,17 +2145,14 @@ ocm --color always runtime list
 
 ### `service`
 
-- list
 - status
-- discover
-- logs
 - install
 - start
 - stop
+- recover
 - restart
+- refresh-daemon
 - uninstall
-- adopt-global
-- restore-global
 
 ### `self`
 
@@ -2176,9 +2191,8 @@ and SecretRefs, follow the existing command's update rules.
 Examples:
 
 - protected environments are not removed unless forced
-- environment roots are marker-checked before destructive cleanup
+- removal refuses a root that contains another registered environment or its required links, even with `--force`
 - preview-first behavior is used where it matters
-- service install picks the next free port instead of colliding with an existing one
 
 ## Where to look next
 
