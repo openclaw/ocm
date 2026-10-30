@@ -120,7 +120,7 @@ fi
 
 if [[ -z "$bin_dir" ]]; then
   if [[ "$prefix_given" != "true" ]]; then
-    if [[ -z "${HOME+x}" ]]; then
+    if [[ -z "${HOME:-}" ]]; then
       echo "error: HOME is not set; pass --prefix or --bin-dir to choose where to install ocm" >&2
       exit 1
     fi

@@ -436,48 +436,63 @@ fn installer_prints_usage_without_home() {
     }
 }
 
+/// The installer sees no usable home when `HOME` is unset or set to nothing.
+const UNUSABLE_HOMES: [Option<&str>; 2] = [None, Some("")];
+
 #[test]
 fn installer_installs_to_an_explicit_directory_without_home() {
-    for (option, relative) in [("--bin-dir", "dest/ocm"), ("--prefix", "dest/bin/ocm")] {
-        let root = TestDir::new("install-explicit-dir-without-home");
-        let (fake_bin, archive) = standalone_release(&root);
-        let directory = root.child("dest");
-        let output = installer_command(&root, &fake_bin, &archive)
-            .args([option, &path_string(&directory)])
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{option}: {}", stderr(&output));
-        assert_eq!(
-            fs::read(root.child(relative)).unwrap(),
-            STANDALONE_BINARY,
-            "{option}"
-        );
-        assert_eq!(
-            fs::metadata(root.child(relative))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o755,
-            "{option}"
-        );
+    for home in UNUSABLE_HOMES {
+        for (option, relative) in [("--bin-dir", "dest/ocm"), ("--prefix", "dest/bin/ocm")] {
+            let label = format!("{option} with HOME {home:?}");
+            let root = TestDir::new("install-explicit-dir-without-home");
+            let (fake_bin, archive) = standalone_release(&root);
+            let directory = root.child("dest");
+            let mut command = installer_command(&root, &fake_bin, &archive);
+            if let Some(home) = home {
+                command.env("HOME", home);
+            }
+            let output = command
+                .args([option, &path_string(&directory)])
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{label}: {}", stderr(&output));
+            assert_eq!(
+                fs::read(root.child(relative)).unwrap(),
+                STANDALONE_BINARY,
+                "{label}"
+            );
+            assert_eq!(
+                fs::metadata(root.child(relative))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o755,
+                "{label}"
+            );
+        }
     }
 }
 
 #[test]
 fn installer_without_home_or_a_destination_asks_for_one_before_downloading() {
-    let root = TestDir::new("install-no-home-no-destination");
-    let (fake_bin, archive) = standalone_release(&root);
-    let output = installer_command(&root, &fake_bin, &archive)
-        .output()
-        .unwrap();
+    for home in UNUSABLE_HOMES {
+        let root = TestDir::new("install-no-home-no-destination");
+        let (fake_bin, archive) = standalone_release(&root);
+        let mut command = installer_command(&root, &fake_bin, &archive);
+        if let Some(home) = home {
+            command.env("HOME", home);
+        }
+        let output = command.output().unwrap();
 
-    assert!(!output.status.success());
-    assert_eq!(
-        stderr(&output),
-        "error: HOME is not set; pass --prefix or --bin-dir to choose where to install ocm\n"
-    );
-    assert!(!stdout(&output).contains("Downloading"));
+        assert!(!output.status.success(), "HOME {home:?}");
+        assert_eq!(
+            stderr(&output),
+            "error: HOME is not set; pass --prefix or --bin-dir to choose where to install ocm\n",
+            "HOME {home:?}"
+        );
+        assert!(!stdout(&output).contains("Downloading"), "HOME {home:?}");
+    }
 }
 
 #[test]
