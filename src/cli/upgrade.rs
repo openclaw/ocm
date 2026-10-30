@@ -4347,8 +4347,10 @@ impl Cli {
                     "runtime \"{runtime_name}\" is not healthy: {issue}",
                 ));
             }
+            // Case-insensitive storage accepts any spelling of a registered
+            // name; bindings, history and rollback use the registered one.
             return Ok(ResolvedUpgradeTarget {
-                name: runtime_name,
+                name: meta.name.clone(),
                 release_version: meta.release_version.clone(),
                 release_channel: meta.release_channel.clone(),
                 kind: ResolvedUpgradeTargetKind::Named(Box::new(meta)),

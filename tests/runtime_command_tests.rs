@@ -6374,6 +6374,84 @@ fn runtime_update_reinstalls_a_manifest_backed_runtime_with_a_new_version() {
 }
 
 #[test]
+fn runtime_update_uses_the_registered_name_for_a_case_variant() {
+    let root = TestDir::new("runtime-update-case-variant");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+
+    let digest_root = root.child("sha256");
+    fs::create_dir_all(&digest_root).unwrap();
+    let mut servers = Vec::new();
+    let mut releases = Vec::new();
+    for version in ["0.2.0", "0.3.0"] {
+        let body = format!("runtime-v{version}");
+        let digest_path = digest_root.join(version);
+        fs::write(&digest_path, &body).unwrap();
+        let server = TestHttpServer::serve_bytes(
+            &format!("/artifacts/openclaw-{version}"),
+            "application/octet-stream",
+            body.as_bytes(),
+        );
+        releases.push(format!(
+            "{{\"version\":\"{version}\",\"channel\":\"stable\",\"url\":\"{}\",\"sha256\":\"{}\"}}",
+            server.url(),
+            file_sha256(&digest_path).unwrap()
+        ));
+        servers.push(server);
+    }
+    let manifest_body = format!("{{\"releases\":[{}]}}", releases.join(","));
+    let manifest_server = TestHttpServer::serve_bytes_times(
+        "/manifests/releases.json",
+        "application/json",
+        manifest_body.as_bytes(),
+        2,
+    );
+    let env = ocm_env(&root);
+
+    let install = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "runtime",
+            "install",
+            "stable",
+            "--manifest-url",
+            &manifest_server.url(),
+            "--version",
+            "0.2.0",
+        ],
+    );
+    assert!(install.status.success(), "{}", stderr(&install));
+
+    let update = run_ocm(
+        &cwd,
+        &env,
+        &["runtime", "update", "STABLE", "--version", "0.3.0"],
+    );
+    let show = run_ocm(&cwd, &env, &["runtime", "show", "stable", "--json"]);
+    assert!(show.status.success(), "{}", stderr(&show));
+    let show: Value = serde_json::from_str(&stdout(&show)).unwrap();
+    if !update.status.success() {
+        // Case-sensitive storage does not resolve a case variant at all.
+        assert!(
+            stderr(&update).contains("runtime \"STABLE\" does not exist"),
+            "{}",
+            stderr(&update)
+        );
+        assert_eq!(show["releaseVersion"], "0.2.0");
+        return;
+    }
+    assert!(stdout(&update).contains("Updated runtime stable"));
+    assert_eq!(show["name"], "stable");
+    assert_eq!(show["releaseVersion"], "0.3.0");
+    let install_root = runtime_install_root("stable", &env, &cwd).unwrap();
+    assert_eq!(
+        fs::read(install_root.join("files/openclaw-0.3.0")).unwrap(),
+        b"runtime-v0.3.0"
+    );
+}
+
+#[test]
 fn runtime_update_rejects_oversized_metadata_without_changing_the_installed_runtime() {
     let root = TestDir::new("runtime-update-oversized-metadata");
     let cwd = root.child("workspace");
