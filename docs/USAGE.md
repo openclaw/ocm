@@ -400,6 +400,7 @@ Use `upgrade simulate` when you want to test what would happen against a publish
 - pinned runtimes stay pinned unless you pass `--version`, `--channel`, or `--runtime`
 - local-command environments are reported clearly instead of being changed behind your back
 - dev environments registered with `ocm dev` are reported as `dev-checkout` and left on their checkout; update that checkout outside OCM
+- under `upgrade --all`, environments without a runtime or launcher binding are reported as `unbound` and skipped; `ocm upgrade <env>` still refuses them until you bind one
 
 ### 8. Run OpenClaw without activating the shell first
 
@@ -1071,7 +1072,7 @@ ocm upgrade --all
 ```
 
 This updates channel-tracked environments and restarts their running services when needed.
-Pinned, manual-runtime, local-command and `ocm dev` environments are reported as skipped and left unchanged.
+Pinned, manual-runtime, local-command, `ocm dev` and unbound environments are reported as skipped and left unchanged.
 
 ### Move a pinned or local env to a different published release
 

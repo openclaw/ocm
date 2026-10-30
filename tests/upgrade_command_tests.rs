@@ -10731,6 +10731,133 @@ fn upgrade_all_json_exits_failed_when_any_env_fails() {
     );
 }
 
+const UNBOUND_NOTE: &str = "this env has no runtime or launcher binding; use start or env set-runtime/set-launcher to include it";
+const UNBOUND_REFUSAL: &str = "does not have a runtime or launcher binding";
+
+fn assert_unbound_skip(result: &Value, name: &str) {
+    assert_eq!(result["envName"], name, "{result}");
+    assert_eq!(result["outcome"], "unbound", "{result}");
+    assert_eq!(result["previousBindingKind"], "none", "{result}");
+    assert_eq!(result["previousBindingName"], "none", "{result}");
+    assert_eq!(result["bindingKind"], "none", "{result}");
+    assert_eq!(result["bindingName"], "none", "{result}");
+    assert_eq!(result["note"], UNBOUND_NOTE, "{result}");
+    assert!(result["snapshotId"].is_null(), "{result}");
+}
+
+#[test]
+fn upgrade_all_reports_unbound_envs_as_skipped_and_still_fails_real_failures() {
+    let root = TestDir::new("upgrade-all-unbound-envs");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    let manual = root.child("manual-openclaw");
+    write_executable_script(&manual, &recording_openclaw_script("2026.3.24"));
+    let launcher = root.child("launcher-openclaw");
+    write_executable_script(&launcher, "#!/bin/sh\necho fake-openclaw\n");
+    for args in [
+        vec!["runtime", "add", "manual", "--path", &path_string(&manual)],
+        vec![
+            "launcher",
+            "add",
+            "lc",
+            "--command",
+            &path_string(&launcher),
+        ],
+        vec!["env", "create", "manual-env", "--runtime", "manual"],
+        vec!["env", "create", "lc-env", "--launcher", "lc"],
+        vec!["env", "create", "bare"],
+        vec!["env", "create", "cleared", "--launcher", "lc"],
+        vec!["env", "set-launcher", "cleared", "none"],
+    ] {
+        let output = run_ocm(&cwd, &env, &args);
+        assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+    }
+    let registry = env_registry_path(&env, &cwd).unwrap();
+    let registry_before = fs::read(&registry).unwrap();
+
+    for args in [
+        vec!["upgrade", "--all", "--dry-run", "--json"],
+        vec!["upgrade", "--all", "--json"],
+    ] {
+        let output = run_ocm(&cwd, &env, &args);
+        assert!(
+            output.status.success(),
+            "{args:?}: stderr:\n{}\nstdout:\n{}",
+            stderr(&output),
+            stdout(&output)
+        );
+        let json: Value = serde_json::from_str(&stdout(&output)).unwrap();
+        assert_eq!(json["count"], 4, "{args:?}: {json}");
+        assert_eq!(json["changed"], 0, "{args:?}: {json}");
+        assert_eq!(json["skipped"], 4, "{args:?}: {json}");
+        assert_eq!(json["failed"], 0, "{args:?}: {json}");
+        assert_eq!(
+            batch_result(&json, "manual-env")["outcome"],
+            "manual-runtime"
+        );
+        assert_eq!(batch_result(&json, "lc-env")["outcome"], "local-command");
+        assert_unbound_skip(batch_result(&json, "bare"), "bare");
+        assert_unbound_skip(batch_result(&json, "cleared"), "cleared");
+        assert_eq!(fs::read(&registry).unwrap(), registry_before, "{args:?}");
+    }
+
+    let text = run_ocm(&cwd, &env, &["upgrade", "--all", "--dry-run"]);
+    assert!(text.status.success(), "{}", stderr(&text));
+    let text = stdout(&text);
+    assert!(text.contains("unbound"), "{text}");
+    assert!(text.contains("none:none"), "{text}");
+    assert!(!text.contains("unknown"), "{text}");
+    assert!(!text.contains(UNBOUND_REFUSAL), "{text}");
+
+    // Naming an unbound env is still refused, with or without --dry-run.
+    for args in [
+        vec!["upgrade", "bare"],
+        vec!["upgrade", "bare", "--dry-run", "--json"],
+    ] {
+        let single = run_ocm(&cwd, &env, &args);
+        assert!(!single.status.success(), "{args:?}: {}", stdout(&single));
+        assert!(
+            stderr(&single).contains(UNBOUND_REFUSAL),
+            "{args:?}: {}",
+            stderr(&single)
+        );
+    }
+    assert_eq!(fs::read(&registry).unwrap(), registry_before);
+
+    // A real failure in the same run is still reported and fails the run.
+    let broken = root.child("broken-openclaw");
+    write_executable_script(&broken, "#!/bin/sh\necho fake-openclaw\n");
+    for args in [
+        vec![
+            "runtime",
+            "add",
+            "missing-soon",
+            "--path",
+            &path_string(&broken),
+        ],
+        vec!["env", "create", "broken", "--runtime", "missing-soon"],
+    ] {
+        let output = run_ocm(&cwd, &env, &args);
+        assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+    }
+    fs::remove_file(root.child("ocm-home/runtimes/missing-soon.json")).unwrap();
+    for args in [
+        vec!["upgrade", "--all", "--dry-run", "--json"],
+        vec!["upgrade", "--all", "--json"],
+    ] {
+        let output = run_ocm(&cwd, &env, &args);
+        assert!(!output.status.success(), "{args:?}: {}", stdout(&output));
+        let json: Value = serde_json::from_str(&stdout(&output)).unwrap();
+        assert_eq!(json["count"], 5, "{args:?}: {json}");
+        assert_eq!(json["skipped"], 4, "{args:?}: {json}");
+        assert_eq!(json["failed"], 1, "{args:?}: {json}");
+        assert_eq!(batch_result(&json, "broken")["outcome"], "failed");
+        assert_unbound_skip(batch_result(&json, "bare"), "bare");
+        assert_unbound_skip(batch_result(&json, "cleared"), "cleared");
+    }
+}
+
 fn setup_named_runtime_candidate_fixture(
     root: &TestDir,
 ) -> (PathBuf, BTreeMap<String, String>, PathBuf) {

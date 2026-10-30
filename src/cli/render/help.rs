@@ -739,6 +739,7 @@ pub fn upgrade_help(cmd: &str) -> String {
             "Pinned runtimes stay pinned unless you pass --version, --channel, or --runtime explicitly.",
             "Opaque or unsupported local-command environments are reported without attempting an update.",
             "Dev environments run their checkout and are reported as dev-checkout without an update; update that checkout outside ocm.",
+            "With --all, envs without a runtime or launcher binding are reported as unbound and skipped; naming one still requires a binding.",
         ],
     )
 }
