@@ -3672,6 +3672,279 @@ fn env_clone_copied_git_config_native_worktrees_stage_independently_without_a_re
 }
 
 #[test]
+fn env_clone_relocates_native_worktrees_and_shared_checkouts_outside_workspaces() {
+    // Clone retains these directories as environment state, so their native
+    // Git layouts must select the clone's storage just as workspace layouts do.
+    for location in [
+        "projects",
+        ".openclaw/extensions/dev-plugin",
+        ".openclaw/skills/dev-skill",
+        ".openclaw/npm/dev",
+        ".openclaw/git/dev",
+        ".openclaw/plugins/dev",
+    ] {
+        let root = TestDir::new("copy-git-outside-workspace");
+        let (mut env, source, donor) = copied_config_fixture(&root);
+        env.insert("GIT_OPTIONAL_LOCKS".into(), "0".into());
+        let parent = source.join(location);
+        fs::create_dir_all(&parent).unwrap();
+        let repo = parent.join("repo");
+        fs::rename(&donor, &repo).unwrap();
+        let checkout = parent.join("task");
+        managed_git(
+            &repo,
+            &["worktree", "add", "-qb", "task", checkout.to_str().unwrap()],
+        );
+        for (name, flag) in [("shared", "--shared"), ("independent", "--no-hardlinks")] {
+            copied_config_git(
+                &parent,
+                &env,
+                &["clone", "-q", flag, &copied_config_path(&repo), name],
+            );
+        }
+        let source_index = repo.join(".git/worktrees/task/index");
+        let index = fs::read(&source_index).unwrap();
+        let before = file_bytes(&source);
+
+        let output = run_ocm(root.path(), &env, &["env", "clone", "source", "target"]);
+        assert!(output.status.success(), "{location}: {}", stderr(&output));
+        assert_eq!(file_bytes(&source), before, "{location} changed its source");
+
+        let target = source.parent().unwrap().join("target").join(location);
+        let target_checkout = target.join("task");
+        let common = copied_config_git(&target_checkout, &env, &["rev-parse", "--git-common-dir"]);
+        assert_eq!(
+            fs::canonicalize(target_checkout.join(common)).unwrap(),
+            fs::canonicalize(target.join("repo/.git")).unwrap(),
+            "{location}: copied worktree selects source storage"
+        );
+        write_text(&target_checkout.join("target-only"), "target edit\n");
+        copied_config_git(&target_checkout, &env, &["add", "target-only"]);
+        assert_eq!(fs::read(&source_index).unwrap(), index, "{location}");
+        assert_eq!(file_bytes(&source), before, "{location}");
+
+        fs::rename(&source, source.with_extension("offline")).unwrap();
+        assert!(
+            copied_config_git(&target_checkout, &env, &["status", "--porcelain"])
+                .contains("A  target-only"),
+            "{location}"
+        );
+        for name in ["repo", "shared", "independent"] {
+            assert_eq!(
+                copied_config_git(&target.join(name), &env, &["show", "HEAD:file"]),
+                "authored content",
+                "{location}: {name} depends on the original environment"
+            );
+        }
+    }
+}
+
+#[test]
+fn env_clone_relocates_native_checkouts_in_agent_directories_and_the_environment_root() {
+    let root = TestDir::new("copy-git-agent-and-root");
+    let (mut env, source, donor) = copied_config_fixture(&root);
+    env.insert("GIT_OPTIONAL_LOCKS".into(), "0".into());
+    let agent = source.join(".openclaw/private-agent");
+    write_text(
+        &source.join(".openclaw/openclaw.json"),
+        &serde_json::json!({"agents":{"entries":{"main":{"agentDir": agent}}}}).to_string(),
+    );
+    fs::create_dir_all(&agent).unwrap();
+    let repo = agent.join("repo");
+    fs::rename(&donor, &repo).unwrap();
+    managed_git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-qb",
+            "task",
+            agent.join("task").to_str().unwrap(),
+        ],
+    );
+    copied_config_git(
+        &agent,
+        &env,
+        &[
+            "clone",
+            "-q",
+            "--shared",
+            &copied_config_path(&repo),
+            "shared",
+        ],
+    );
+    // The environment root is itself a repository borrowing objects from the
+    // agent repository.
+    copied_config_git(&source, &env, &["init", "-q"]);
+    write_text(
+        &source.join(".git/objects/info/alternates"),
+        &format!("{}\n", copied_config_path(&repo.join(".git/objects"))),
+    );
+    let commit = copied_config_git(&repo, &env, &["rev-parse", "HEAD"]);
+    let before = file_bytes(&source);
+
+    let output = run_ocm(root.path(), &env, &["env", "clone", "source", "target"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(file_bytes(&source), before);
+
+    let target_root = source.parent().unwrap().join("target");
+    let target = target_root.join(".openclaw/private-agent");
+    let common = copied_config_git(
+        &target.join("task"),
+        &env,
+        &["rev-parse", "--git-common-dir"],
+    );
+    assert_eq!(
+        fs::canonicalize(target.join("task").join(common)).unwrap(),
+        fs::canonicalize(target.join("repo/.git")).unwrap()
+    );
+    fs::rename(&source, source.with_extension("offline")).unwrap();
+    assert_eq!(
+        copied_config_git(&target.join("shared"), &env, &["show", "HEAD:file"]),
+        "authored content"
+    );
+    assert_eq!(
+        copied_config_git(&target_root, &env, &["cat-file", "-t", &commit]),
+        "commit"
+    );
+}
+
+#[test]
+fn env_clone_skips_extension_runtime_dependencies_that_cleanup_clears() {
+    // A shared checkout borrowing external objects is refused wherever clone
+    // relocates Git storage, so it must not be inspected inside runtime
+    // dependencies that clone removes.
+    let root = TestDir::new("copy-git-runtime-debris");
+    let (env, source, donor) = copied_config_fixture(&root);
+    let external = root.child("external donor");
+    fs::rename(&donor, &external).unwrap();
+    let plugin = source.join(".openclaw/extensions/dev-plugin");
+    write_text(&plugin.join(".openclaw-runtime-deps.json"), "{}\n");
+    fs::create_dir_all(plugin.join("node_modules")).unwrap();
+    copied_config_git(
+        &plugin.join("node_modules"),
+        &env,
+        &[
+            "clone",
+            "-q",
+            "--shared",
+            &copied_config_path(&external),
+            "dep",
+        ],
+    );
+
+    let output = run_ocm(root.path(), &env, &["env", "clone", "source", "target"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let target_plugin = source
+        .parent()
+        .unwrap()
+        .join("target/.openclaw/extensions/dev-plugin");
+    assert!(!target_plugin.join("node_modules").exists());
+}
+
+#[test]
+fn env_clone_copies_a_separate_git_dir_checkout_outside_workspaces_like_import() {
+    for location in ["projects", ".openclaw/extensions/dev-plugin"] {
+        let root = TestDir::new("copy-separate-git-dir-outside-workspace");
+        let (mut env, source, _) = copied_config_fixture(&root);
+        env.insert("GIT_OPTIONAL_LOCKS".into(), "0".into());
+        let parent = source.join(location);
+        let checkout = parent.join("checkout");
+        fs::create_dir_all(&checkout).unwrap();
+        let git_dir = parent.join("checkout.git");
+        copied_config_git(
+            &checkout,
+            &env,
+            &[
+                "init",
+                "-q",
+                "--separate-git-dir",
+                &copied_config_path(&git_dir),
+            ],
+        );
+        write_text(&checkout.join("file"), "authored content\n");
+        copied_config_git(&checkout, &env, &["add", "file"]);
+        copied_config_git(
+            &checkout,
+            &env,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                // Detached auto-maintenance would change the source snapshot.
+                "-c",
+                "maintenance.auto=false",
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+        );
+        let before = file_bytes(&source);
+
+        let source_index = git_dir.join("index");
+        let index = fs::read(&source_index).unwrap();
+
+        let cloned = run_ocm(root.path(), &env, &["env", "clone", "source", "target"]);
+        assert!(cloned.status.success(), "{location}: {}", stderr(&cloned));
+        assert_eq!(file_bytes(&source), before, "{location} changed its source");
+
+        let archive = root.child("source.tar");
+        let exported = run_ocm(
+            root.path(),
+            &env,
+            &[
+                "env",
+                "export",
+                "source",
+                "--include-state",
+                "--output",
+                archive.to_str().unwrap(),
+            ],
+        );
+        assert!(exported.status.success(), "{}", stderr(&exported));
+        let imported = run_ocm(
+            root.path(),
+            &env,
+            &[
+                "env",
+                "import",
+                archive.to_str().unwrap(),
+                "--name",
+                "imported",
+            ],
+        );
+        assert!(
+            imported.status.success(),
+            "{location}: {}",
+            stderr(&imported)
+        );
+
+        for name in ["target", "imported"] {
+            let copy = source.parent().unwrap().join(name).join(location);
+            let copied_checkout = copy.join("checkout");
+            let git_dir =
+                copied_config_git(&copied_checkout, &env, &["rev-parse", "--absolute-git-dir"]);
+            assert_eq!(
+                fs::canonicalize(git_dir).unwrap(),
+                fs::canonicalize(copy.join("checkout.git")).unwrap(),
+                "{location}: {name} checkout selects source storage"
+            );
+            write_text(&copied_checkout.join(name), "copy edit\n");
+            copied_config_git(&copied_checkout, &env, &["add", name]);
+            assert_eq!(
+                fs::read(&source_index).unwrap(),
+                index,
+                "{location}: {name}"
+            );
+        }
+        assert_eq!(file_bytes(&source), before, "{location}");
+    }
+}
+
+#[test]
 fn env_clone_copied_git_config_native_worktrees_keep_overlapping_migration_copies_independent() {
     for adopt in [false, true] {
         let root = TestDir::new("copy-native-overlapping-workspaces");

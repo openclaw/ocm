@@ -755,6 +755,15 @@ Native bare shared repositories also relocate object alternates to donors alread
 inside the copied footprint during clone, `migrate`, and `adopt import`, keeping
 history readable without the source when all required donor storage is included.
 External or omitted bare donors retain their existing paths.
+Clone looks for these native linked and shared checkouts everywhere the copied
+environment keeps them, not only in workspaces: configured agent directories,
+top-level directories of the environment such as `projects`, and the retained
+`.openclaw` roots (`state`, `extensions`, `plugins`, `npm`, `git`, `skills` and
+`.clawhub`), as `env import` does for an extracted archive. Extension runtime
+dependencies that clone clears are not inspected. A checkout the relocation
+cannot make self-contained, such as one whose Git directory import also refuses,
+fails the clone and removes the provisional target instead of leaving the copy
+attached to the source.
 Clone refuses an active database that resolves to protected history, including through directory aliases, and removes the partial clone before registration.
 
 For clone, migration, and adoption, OCM does not classify a package or project
