@@ -257,18 +257,29 @@ impl AdmissionFixture {
     }
 
     fn freeze_daemon(&mut self, pid: u32) {
-        // The direct Child remains unreaped and owns this PID. SIGSTOP cannot be
-        // caught, so the wait returns once the daemon stops or exits.
+        // The direct Child remains unreaped and owns this PID.
         assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGSTOP) }, 0);
-        let mut status = 0;
-        while unsafe { libc::waitpid(pid as i32, &mut status, libc::WUNTRACED) } != pid as i32 {
-            let error = std::io::Error::last_os_error();
-            assert_eq!(error.kind(), std::io::ErrorKind::Interrupted, "{error}");
+        // This bound is separate from the suspension deadline, so that deadline
+        // still reports a busy publication rather than a slow stop.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let mut status = 0;
+            let waited =
+                unsafe { libc::waitpid(pid as i32, &mut status, libc::WUNTRACED | libc::WNOHANG) };
+            if waited == pid as i32 {
+                if !libc::WIFSTOPPED(status) {
+                    self.daemon.take();
+                    panic!("empty daemon exited before fixture suspension");
+                }
+                return;
+            }
+            if waited < 0 {
+                let error = std::io::Error::last_os_error();
+                assert_eq!(error.kind(), std::io::ErrorKind::Interrupted, "{error}");
+            }
+            thread::sleep(Duration::from_millis(1));
         }
-        if !libc::WIFSTOPPED(status) {
-            self.daemon.take();
-            panic!("empty daemon exited before fixture suspension");
-        }
+        panic!("daemon did not stop within 5 seconds of SIGSTOP");
     }
 
     fn stop_daemon(&mut self) {
