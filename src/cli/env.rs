@@ -2234,17 +2234,28 @@ fn normalize_process_path(value: &str) -> String {
 fn process_cwd_map(
     processes: &[ProcessEntry],
 ) -> Result<std::collections::HashMap<u32, String>, String> {
+    process_cwd_map_with(processes, |pid| fs::read_link(format!("/proc/{pid}/cwd")))
+}
+
+#[cfg(target_os = "linux")]
+fn process_cwd_map_with(
+    processes: &[ProcessEntry],
+    read_cwd: impl Fn(u32) -> std::io::Result<std::path::PathBuf>,
+) -> Result<std::collections::HashMap<u32, String>, String> {
     let mut cwd_map = std::collections::HashMap::new();
     for process in processes {
-        match fs::read_link(format!("/proc/{}/cwd", process.pid)) {
+        match read_cwd(process.pid) {
             Ok(path) => {
                 cwd_map.insert(process.pid, path.to_string_lossy().into_owned());
             }
+            // A listed process can exit before its cwd is read; depending on
+            // the kernel that reads as ENOENT or ESRCH. Skip it like one that
+            // had already exited, and skip processes we may not inspect.
             Err(error)
                 if matches!(
                     error.kind(),
                     std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-                ) => {}
+                ) || error.raw_os_error() == Some(libc::ESRCH) => {}
             Err(error) => {
                 return Err(format!(
                     "failed to inspect process cwd for pid {}: {error}",
@@ -2350,6 +2361,44 @@ mod tests {
         active_invocation_processes, command_contains_process_path, process_path_is_within,
         should_clear_skip_bootstrap_for_openclaw_args,
     };
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_cwd_scan_skips_processes_that_vanish_mid_scan() {
+        use std::io::Error;
+        use std::path::PathBuf;
+
+        use super::{ProcessEntry, process_cwd_map_with};
+
+        let entries = |pids: &[u32]| {
+            pids.iter()
+                .map(|pid| ProcessEntry {
+                    pid: *pid,
+                    ppid: 1,
+                    command: "worker".to_string(),
+                })
+                .collect::<Vec<_>>()
+        };
+        let read_cwd = |pid: u32| match pid {
+            10 => Ok(PathBuf::from("/envs/demo/workspace")),
+            11 => Err(Error::from_raw_os_error(libc::ESRCH)),
+            12 => Err(Error::from_raw_os_error(libc::ENOENT)),
+            13 => Err(Error::from_raw_os_error(libc::EACCES)),
+            _ => Err(Error::from_raw_os_error(libc::EIO)),
+        };
+
+        let cwd_map = process_cwd_map_with(&entries(&[10, 11, 12, 13]), read_cwd).unwrap();
+        assert_eq!(
+            cwd_map,
+            HashMap::from([(10, "/envs/demo/workspace".to_string())])
+        );
+
+        let error = process_cwd_map_with(&entries(&[10, 11, 14]), read_cwd).unwrap_err();
+        assert!(
+            error.starts_with("failed to inspect process cwd for pid 14: "),
+            "{error}"
+        );
+    }
 
     #[test]
     fn skip_bootstrap_clears_only_for_onboarding_runs() {
