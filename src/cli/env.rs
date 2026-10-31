@@ -2357,6 +2357,11 @@ fn process_alive(pid: u32) -> bool {
 mod tests {
     use std::collections::HashMap;
 
+    use super::{
+        active_invocation_processes, command_contains_process_path, process_path_is_within,
+        should_clear_skip_bootstrap_for_openclaw_args,
+    };
+
     #[cfg(target_os = "linux")]
     #[test]
     fn process_cwd_scan_skips_processes_that_vanish_mid_scan() {
@@ -2394,11 +2399,6 @@ mod tests {
             "{error}"
         );
     }
-
-    use super::{
-        active_invocation_processes, command_contains_process_path, process_path_is_within,
-        should_clear_skip_bootstrap_for_openclaw_args,
-    };
 
     #[test]
     fn skip_bootstrap_clears_only_for_onboarding_runs() {
