@@ -58,12 +58,15 @@ fn wait_for_gateway_readiness_with_timeout(
     // A later incomplete observation must never turn a known TLS wait into an
     // unauthenticated HTTP probe, even if the config changes while starting.
     let mut known_tls = false;
-    let mut permitted_retry_count = None;
+    let mut scheduled_retry = ScheduledGatewayRetry::Unclaimed;
     let mut process_observed_after_ms = None;
     loop {
         let (status, child_spec) = service_readiness_observation(name, env, cwd)?;
-        if process_observed_after_ms.is_none() && status.child_pid.is_some() {
-            process_observed_after_ms = Some(duration_ms(started.elapsed()));
+        if status.child_pid.is_some() {
+            if process_observed_after_ms.is_none() {
+                process_observed_after_ms = Some(duration_ms(started.elapsed()));
+            }
+            scheduled_retry.observe_gateway_process();
         }
         let port = status.child_port.unwrap_or(status.gateway_port);
         let probe = if status.running {
@@ -172,7 +175,7 @@ fn wait_for_gateway_readiness_with_timeout(
         ) {
             if status.gateway_state == "backoff"
                 && should_wait_for_scheduled_gateway_retry(
-                    &mut permitted_retry_count,
+                    &mut scheduled_retry,
                     status.child_restart_count,
                     status.next_retry_at.as_deref(),
                     time::OffsetDateTime::now_utc(),
@@ -619,8 +622,28 @@ fn health_response_ok(stream: &mut (impl Read + Write), host: Ipv4Addr, port: u3
     false
 }
 
+/// The one scheduled gateway retry readiness may wait for past its deadline.
+/// The restart count alone cannot tell one retry from the next: a gateway that
+/// ran for the supervisor's stable-run time is restarted with the same count.
+/// So the retry is used once its gateway process is observed, and any later
+/// backoff is a new exit.
+#[cfg_attr(test, derive(Debug, PartialEq))]
+enum ScheduledGatewayRetry {
+    Unclaimed,
+    Waiting { restart_count: usize },
+    Used,
+}
+
+impl ScheduledGatewayRetry {
+    fn observe_gateway_process(&mut self) {
+        if matches!(self, Self::Waiting { .. }) {
+            *self = Self::Used;
+        }
+    }
+}
+
 fn should_wait_for_scheduled_gateway_retry(
-    permitted_retry_count: &mut Option<usize>,
+    scheduled_retry: &mut ScheduledGatewayRetry,
     restart_count: Option<usize>,
     next_retry_at: Option<&str>,
     now: time::OffsetDateTime,
@@ -637,10 +660,15 @@ fn should_wait_for_scheduled_gateway_retry(
     if now > next_retry_at + time::Duration::seconds(3) {
         return false;
     }
-    match permitted_retry_count {
-        Some(permitted) => restart_count == *permitted,
-        None => {
-            *permitted_retry_count = Some(restart_count);
+    match scheduled_retry {
+        // A retry that exited before readiness observed its process ran only
+        // briefly, so its exit added to the restart count.
+        ScheduledGatewayRetry::Waiting {
+            restart_count: permitted,
+        } => restart_count == *permitted,
+        ScheduledGatewayRetry::Used => false,
+        ScheduledGatewayRetry::Unclaimed => {
+            *scheduled_retry = ScheduledGatewayRetry::Waiting { restart_count };
             true
         }
     }
@@ -648,7 +676,7 @@ fn should_wait_for_scheduled_gateway_retry(
 
 #[cfg(test)]
 mod tests {
-    use super::should_wait_for_scheduled_gateway_retry;
+    use super::{ScheduledGatewayRetry, should_wait_for_scheduled_gateway_retry};
 
     #[test]
     fn interface_order_matches_native_numeric_names() {
@@ -694,26 +722,56 @@ mod tests {
         let next_retry_at = (now + time::Duration::seconds(1))
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap();
-        let mut permitted_retry_count = None;
+        let mut scheduled_retry = ScheduledGatewayRetry::Unclaimed;
 
         assert!(should_wait_for_scheduled_gateway_retry(
-            &mut permitted_retry_count,
+            &mut scheduled_retry,
             Some(2),
             Some(&next_retry_at),
             now,
         ));
         assert!(should_wait_for_scheduled_gateway_retry(
-            &mut permitted_retry_count,
+            &mut scheduled_retry,
             Some(2),
             Some(&next_retry_at),
             now,
         ));
         assert!(!should_wait_for_scheduled_gateway_retry(
-            &mut permitted_retry_count,
+            &mut scheduled_retry,
             Some(3),
             Some(&next_retry_at),
             now,
         ));
+    }
+
+    #[test]
+    fn scheduled_retry_is_used_once_its_gateway_process_is_observed() {
+        let now = time::OffsetDateTime::now_utc();
+        let next_retry_at = (now + time::Duration::seconds(1))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let mut scheduled_retry = ScheduledGatewayRetry::Unclaimed;
+
+        // A gateway observed before any backoff claims nothing.
+        scheduled_retry.observe_gateway_process();
+        assert_eq!(scheduled_retry, ScheduledGatewayRetry::Unclaimed);
+        assert!(should_wait_for_scheduled_gateway_retry(
+            &mut scheduled_retry,
+            Some(1),
+            Some(&next_retry_at),
+            now,
+        ));
+
+        // The retry ran past the stable-run threshold and exited again: the
+        // supervisor restarts it with the same restart count.
+        scheduled_retry.observe_gateway_process();
+        assert!(!should_wait_for_scheduled_gateway_retry(
+            &mut scheduled_retry,
+            Some(1),
+            Some(&next_retry_at),
+            now,
+        ));
+        assert_eq!(scheduled_retry, ScheduledGatewayRetry::Used);
     }
 
     #[test]
@@ -724,19 +782,19 @@ mod tests {
             .unwrap();
 
         assert!(!should_wait_for_scheduled_gateway_retry(
-            &mut None,
+            &mut ScheduledGatewayRetry::Unclaimed,
             Some(1),
             None,
             now,
         ));
         assert!(!should_wait_for_scheduled_gateway_retry(
-            &mut None,
+            &mut ScheduledGatewayRetry::Unclaimed,
             Some(1),
             Some(&stale_retry_at),
             now,
         ));
         assert!(!should_wait_for_scheduled_gateway_retry(
-            &mut None,
+            &mut ScheduledGatewayRetry::Unclaimed,
             Some(1),
             Some("not-a-timestamp"),
             now,
