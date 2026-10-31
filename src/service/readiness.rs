@@ -623,11 +623,11 @@ fn health_response_ok(stream: &mut (impl Read + Write), host: Ipv4Addr, port: u3
 }
 
 /// The one scheduled gateway retry readiness may wait for past its deadline.
-/// The restart count alone cannot tell one retry from the next: it stays equal
-/// across exits after stable runs and across accepted restart handoffs. So the
-/// retry is used once its gateway process is observed, and any later backoff
-/// is a new exit.
-#[derive(Debug, PartialEq)]
+/// The restart count alone cannot tell one retry from the next: a gateway that
+/// ran for the supervisor's stable-run time is restarted with the same count.
+/// So the retry is used once its gateway process is observed, and any later
+/// backoff is a new exit.
+#[cfg_attr(test, derive(Debug, PartialEq))]
 enum ScheduledGatewayRetry {
     Unclaimed,
     Waiting { restart_count: usize },
@@ -661,8 +661,8 @@ fn should_wait_for_scheduled_gateway_retry(
         return false;
     }
     match scheduled_retry {
-        // A retry that exited before readiness observed its process has a
-        // larger restart count after a quick run.
+        // A retry that exited before readiness observed its process ran only
+        // briefly, so its exit added to the restart count.
         ScheduledGatewayRetry::Waiting {
             restart_count: permitted,
         } => restart_count == *permitted,

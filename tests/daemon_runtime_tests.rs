@@ -6195,6 +6195,31 @@ fn service_start_reports_failed_backoff_with_the_child_error() {
 }
 
 #[test]
+fn service_start_reports_the_exit_after_one_retry_of_a_gateway_that_crashes_after_stable_runs() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("service-readiness-stable-backoff");
+    // Each run outlasts the supervisor's 10 s stable-run time, so every
+    // restart keeps the same restart count. The timeout leaves room for the
+    // first run and its one retry, but not for a third run to finish.
+    let (cwd, env) = setup_gateway_readiness_fixture(&root, "exit-23", 10_500, 45_000);
+    let mut daemon = spawn_daemon_process(&cwd, &env);
+
+    let started = run_ocm(&cwd, &env, &["service", "start", "demo", "--json"]);
+    assert!(!started.status.success());
+    let body: Value = serde_json::from_slice(&started.stdout).unwrap();
+    assert_eq!(body["gatewayReady"], false);
+    assert!(matches!(
+        body["gatewayState"].as_str(),
+        Some("backoff" | "stopped")
+    ));
+    let issue = body["issue"].as_str().unwrap();
+    assert!(issue.contains("23"), "{issue}");
+    assert!(!issue.contains("did not become ready"), "{issue}");
+
+    stop_process(&mut daemon);
+}
+
+#[test]
 fn service_start_reports_an_explicit_readiness_timeout() {
     let _guard = daemon_runtime_test_lock();
     let root = TestDir::new("service-readiness-timeout");
