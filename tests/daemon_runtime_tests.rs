@@ -2480,23 +2480,40 @@ fn daemon_revalidates_binding_after_capability_probe() {
             // Each setter publishes its own plan update. Stop the idle daemon so
             // one reconciliation queues alpha and beta in the same startup
             // batch. Otherwise alpha can be probed alone and its legitimate
-            // re-plan starts before beta's gate. Runtime publication holds the
-            // lock the setters take, so keep it until the daemon is stopped.
+            // re-plan starts before beta's gate. Runtime publication takes the
+            // lock the setters take. A stopped daemon cannot start waiting for
+            // it, so the setters can run once the lock is free; if the daemon
+            // stopped while holding it, resume it and try again.
             let publication = fs::OpenOptions::new()
                 .read(true)
                 .write(true)
                 .open(root.child("ocm-home/supervisor/state.lock"))
                 .unwrap();
-            FileExt::lock_exclusive(&publication).unwrap();
             let pid = daemon.0.id() as libc::pid_t;
-            assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
-            let mut status = 0;
-            assert_eq!(
-                unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) },
-                pid
-            );
-            assert!(libc::WIFSTOPPED(status));
-            FileExt::unlock(&publication).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+                let mut status = 0;
+                assert_eq!(
+                    unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) },
+                    pid
+                );
+                assert!(libc::WIFSTOPPED(status));
+                match FileExt::try_lock_exclusive(&publication) {
+                    Ok(()) => {
+                        FileExt::unlock(&publication).unwrap();
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(error) => panic!("cannot inspect daemon publication: {error}"),
+                }
+                assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
+                assert!(
+                    Instant::now() < deadline,
+                    "daemon kept its publication lock"
+                );
+                sleep(Duration::from_millis(10));
+            }
             for name in ["alpha", "beta"] {
                 env_service.set_service_running(name, true).unwrap();
             }
