@@ -224,26 +224,26 @@ impl AdmissionFixture {
                 // Runtime publication takes the lock the operations under test
                 // take. Stop the daemon before taking that lock: a stopped daemon
                 // cannot start waiting for it. On macOS a daemon stopped while it
-                // was already waiting behind another holder can still take the
-                // lock after that holder releases it, so give such a waiter time
-                // to do so before checking. If the stopped daemon holds the
-                // lock, resume it and try again.
+                // was already waiting behind another holder can take the lock
+                // some time after that holder releases it, even when the lock
+                // looked free just after the release. So take the lock, release
+                // it, and confirm after a pause that it is still free. If the
+                // stopped daemon holds it, resume the daemon and try again.
                 self.freeze_daemon(pid);
-                thread::sleep(Duration::from_millis(50));
-                match publication.try_lock_exclusive() {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGCONT) }, 0);
-                        thread::sleep(Duration::from_millis(10));
-                        continue;
+                if take_publication(&publication) {
+                    FileExt::unlock(&publication).unwrap();
+                    thread::sleep(Duration::from_millis(50));
+                    if take_publication(&publication) {
+                        publication_acquired(&publication);
+                        // Closing this file alone can leave the lock held by a
+                        // concurrent fork's copy until that child execs.
+                        FileExt::unlock(&publication).unwrap();
+                        return runtime;
                     }
-                    Err(error) => panic!("cannot exclude daemon publication: {error}"),
                 }
-                publication_acquired(&publication);
-                // Closing this file alone can leave the lock held by a
-                // concurrent fork's copy until that child execs.
-                FileExt::unlock(&publication).unwrap();
-                return runtime;
+                assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGCONT) }, 0);
+                thread::sleep(Duration::from_millis(10));
+                continue;
             }
             thread::sleep(Duration::from_millis(20));
         }
@@ -339,6 +339,14 @@ impl AdmissionFixture {
             fs::read_to_string(self.repo.join("SENTINEL")).unwrap(),
             "preserve source\n"
         );
+    }
+}
+
+fn take_publication(publication: &fs::File) -> bool {
+    match publication.try_lock_exclusive() {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
+        Err(error) => panic!("cannot exclude daemon publication: {error}"),
     }
 }
 
