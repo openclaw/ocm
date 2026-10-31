@@ -296,26 +296,33 @@ fn spawn_worker(cli: &Cli, previous: &Path, receipt: &Receipt) -> Result<Child, 
     }
     #[cfg(unix)]
     {
-        let mut command = worker_command(previous, receipt)?;
-        // The caller may reach the store through another spelling. The worker is
-        // the retained previous release, which may compare the receipt's
-        // directories as text, so it gets the spellings the receipt recorded.
-        command
-            .env_clear()
-            .envs(&cli.env)
-            .env_remove("OCM_ACTIVE_ENV")
-            .env_remove("OPENCLAW_SERVICE_KIND")
-            .env("OCM_HOME", &receipt.ocm_home)
-            .env("HOME", &receipt.user_home)
-            .env("OCM_SERVICE_EXECUTABLE", &receipt.binary_path)
-            .current_dir(&cli.cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        command.spawn().map_err(|e| {
-            format!("cannot detach self-update helper; no executable was replaced: {e}")
-        })
+        worker_process(cli, previous, receipt)?
+            .spawn()
+            .map_err(|e| {
+                format!("cannot detach self-update helper; no executable was replaced: {e}")
+            })
     }
+}
+
+#[cfg(unix)]
+fn worker_process(cli: &Cli, previous: &Path, receipt: &Receipt) -> Result<Command, String> {
+    let mut command = worker_command(previous, receipt)?;
+    // The caller may reach the store through another spelling. The worker is
+    // the retained previous release, which may compare the receipt's
+    // directories as text, so it gets the spellings the receipt recorded.
+    command
+        .env_clear()
+        .envs(&cli.env)
+        .env_remove("OCM_ACTIVE_ENV")
+        .env_remove("OPENCLAW_SERVICE_KIND")
+        .env("OCM_HOME", &receipt.ocm_home)
+        .env("HOME", &receipt.user_home)
+        .env("OCM_SERVICE_EXECUTABLE", &receipt.binary_path)
+        .current_dir(&cli.cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    Ok(command)
 }
 
 #[cfg(unix)]
@@ -576,5 +583,55 @@ impl Cli {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::ffi::OsStr;
+    use std::path::{Path, PathBuf};
+
+    use super::{Cli, Phase, Receipt, worker_process};
+
+    #[test]
+    fn worker_runs_with_the_recorded_store_and_home() {
+        let receipt = Receipt {
+            schema: 1,
+            id: "1-1".into(),
+            phase: Phase::RollingBack,
+            binary_path: PathBuf::from("/opt/bin/ocm"),
+            ocm_home: PathBuf::from("/recorded/store"),
+            user_home: PathBuf::from("/recorded/home"),
+            current_version: "1.0.0".into(),
+            target_version: "1.0.1".into(),
+            previous_sha256: String::new(),
+            candidate_sha256: String::new(),
+            daemon_was_running: false,
+            gateways: Vec::new(),
+            error: None,
+            rollback_error: None,
+        };
+        let cli = Cli {
+            env: BTreeMap::from([
+                ("OCM_HOME".into(), "/alias/store".into()),
+                ("HOME".into(), "/alias/home".into()),
+                ("OCM_ACTIVE_ENV".into(), "demo".into()),
+            ]),
+            cwd: PathBuf::from("/caller"),
+        };
+        let command = worker_process(&cli, Path::new("/opt/bin/previous"), &receipt).unwrap();
+        let envs: BTreeMap<&OsStr, Option<&OsStr>> = command.get_envs().collect();
+        // An older retained worker compares these as text, so the caller's
+        // spelling of the same directories must not reach it.
+        assert_eq!(
+            envs[OsStr::new("OCM_HOME")],
+            Some(OsStr::new("/recorded/store"))
+        );
+        assert_eq!(envs[OsStr::new("HOME")], Some(OsStr::new("/recorded/home")));
+        assert!(!matches!(
+            envs.get(OsStr::new("OCM_ACTIVE_ENV")),
+            Some(Some(_))
+        ));
     }
 }
