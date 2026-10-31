@@ -232,6 +232,9 @@ impl UpgradeInterruptFence {
     }
 
     fn requested(&self) -> bool {
+        // A signal that reached OCM, such as Ctrl-C that also ended the
+        // running check, is recorded before the run decides to continue.
+        crate::infra::interrupt::settle();
         UPGRADE_INTERRUPT_STATE.load(Ordering::SeqCst) & UPGRADE_INTERRUPT_REQUESTED != 0
     }
 
