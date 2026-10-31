@@ -753,6 +753,15 @@ fn local_transaction_survives_gateway_teardown_and_recovers_failures() {
         &alias_env,
         &["self", "update", "--recover"],
     );
+    // The rollback worker is the retained previous release, which may compare
+    // the receipt's directories as text, so it must run with the recorded
+    // spellings. Its service definition path is derived from HOME.
+    let recovery_log = fs::read_to_string(crash.root.child("manager.log")).unwrap();
+    let recovery_log = &recovery_log[before_recovery.len()..];
+    assert!(
+        recovery_log.contains("bootstrap") && !recovery_log.contains("home-link"),
+        "rollback worker did not use the recorded HOME: {recovery_log}"
+    );
     assert_eq!(
         crash.receipt()["phase"],
         "rolledBack",

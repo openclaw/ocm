@@ -297,11 +297,16 @@ fn spawn_worker(cli: &Cli, previous: &Path, receipt: &Receipt) -> Result<Child, 
     #[cfg(unix)]
     {
         let mut command = worker_command(previous, receipt)?;
+        // The caller may reach the store through another spelling. The worker is
+        // the retained previous release, which may compare the receipt's
+        // directories as text, so it gets the spellings the receipt recorded.
         command
             .env_clear()
             .envs(&cli.env)
             .env_remove("OCM_ACTIVE_ENV")
             .env_remove("OPENCLAW_SERVICE_KIND")
+            .env("OCM_HOME", &receipt.ocm_home)
+            .env("HOME", &receipt.user_home)
             .env("OCM_SERVICE_EXECUTABLE", &receipt.binary_path)
             .current_dir(&cli.cwd)
             .stdin(Stdio::null())
