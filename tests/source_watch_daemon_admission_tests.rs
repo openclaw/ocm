@@ -221,46 +221,59 @@ impl AdmissionFixture {
                         .as_str()
                         .is_some_and(|value| !value.is_empty())
                 );
-                // The runtime rename precedes publication-lock release. Keep
-                // that lock until the empty daemon is confirmed stopped, so it
-                // cannot freeze a lock needed by the operations under test.
-                match publication.try_lock_exclusive() {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(10));
-                        continue;
-                    }
-                    Err(error) => panic!("cannot exclude daemon publication: {error}"),
-                }
-                publication_acquired(&publication);
-                // The direct Child remains unreaped and owns this PID.
-                assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGSTOP) }, 0);
-                while Instant::now() < deadline {
-                    let mut status = 0;
-                    let waited = unsafe {
-                        libc::waitpid(pid as i32, &mut status, libc::WUNTRACED | libc::WNOHANG)
-                    };
-                    if waited == pid as i32 {
-                        if !libc::WIFSTOPPED(status) {
-                            self.daemon.take();
-                            panic!("empty daemon exited before fixture suspension");
-                        }
+                // Runtime publication takes the lock the operations under test
+                // take. Stop the daemon before taking that lock: a stopped daemon
+                // cannot start waiting for it. On macOS a daemon stopped while it
+                // was already waiting behind another holder can take the lock
+                // some time after that holder releases it, even when the lock
+                // looked free just after the release. So take the lock, release
+                // it, and confirm after a pause that it is still free. If the
+                // stopped daemon holds it, resume the daemon and try again.
+                self.freeze_daemon(pid);
+                if take_publication(&publication) {
+                    FileExt::unlock(&publication).unwrap();
+                    thread::sleep(Duration::from_millis(50));
+                    if take_publication(&publication) {
+                        publication_acquired(&publication);
                         // Closing this file alone can leave the lock held by a
                         // concurrent fork's copy until that child execs.
                         FileExt::unlock(&publication).unwrap();
                         return runtime;
                     }
-                    if waited < 0 {
-                        let error = std::io::Error::last_os_error();
-                        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted, "{error}");
-                    }
-                    thread::sleep(Duration::from_millis(10));
                 }
-                panic!("daemon did not stop before the suspension deadline");
+                assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGCONT) }, 0);
+                thread::sleep(Duration::from_millis(10));
+                continue;
             }
             thread::sleep(Duration::from_millis(20));
         }
         panic!("daemon did not reach a safe publication boundary before the suspension deadline");
+    }
+
+    fn freeze_daemon(&mut self, pid: u32) {
+        // The direct Child remains unreaped and owns this PID.
+        assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGSTOP) }, 0);
+        // This bound is separate from the suspension deadline, so that deadline
+        // still reports a busy publication rather than a slow stop.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let mut status = 0;
+            let waited =
+                unsafe { libc::waitpid(pid as i32, &mut status, libc::WUNTRACED | libc::WNOHANG) };
+            if waited == pid as i32 {
+                if !libc::WIFSTOPPED(status) {
+                    self.daemon.take();
+                    panic!("empty daemon exited before fixture suspension");
+                }
+                return;
+            }
+            if waited < 0 {
+                let error = std::io::Error::last_os_error();
+                assert_eq!(error.kind(), std::io::ErrorKind::Interrupted, "{error}");
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        panic!("daemon did not stop within 5 seconds of SIGSTOP");
     }
 
     fn stop_daemon(&mut self) {
@@ -326,6 +339,14 @@ impl AdmissionFixture {
             fs::read_to_string(self.repo.join("SENTINEL")).unwrap(),
             "preserve source\n"
         );
+    }
+}
+
+fn take_publication(publication: &fs::File) -> bool {
+    match publication.try_lock_exclusive() {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
+        Err(error) => panic!("cannot exclude daemon publication: {error}"),
     }
 }
 
