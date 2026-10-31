@@ -144,7 +144,8 @@ pub fn resolve_ocm_home(env: &BTreeMap<String, String>, cwd: &Path) -> Result<Pa
 /// absolute spellings resolve to the same existing directory, such as a
 /// symlinked store or HOME. A relative, missing or unresolvable recorded store
 /// never matches another spelling, so the caller's working directory is never
-/// part of the decision.
+/// part of the decision. The self-update receipt applies the same rule to its
+/// recorded HOME.
 pub(crate) fn same_ocm_home(recorded: &str, current: &str) -> bool {
     recorded == current
         || (Path::new(recorded).is_absolute()

@@ -678,27 +678,90 @@ fn local_transaction_survives_gateway_teardown_and_recovers_failures() {
         stderr(&retry)
     );
     let before_recovery = fs::read(crash.root.child("manager.log")).unwrap();
-    for key in ["HOME", "OCM_HOME"] {
-        let mut foreign = crash.env.clone();
-        foreign.insert(
-            key.into(),
-            crash.root.child("foreign").to_string_lossy().into(),
-        );
-        let rejected = run_ocm_binary(
+    // A missing directory and a different existing one are other stores.
+    fs::create_dir_all(crash.root.child("foreign-existing")).unwrap();
+    for foreign_dir in ["foreign", "foreign-existing"] {
+        for key in ["HOME", "OCM_HOME"] {
+            let mut foreign = crash.env.clone();
+            foreign.insert(
+                key.into(),
+                crash.root.child(foreign_dir).to_string_lossy().into(),
+            );
+            let rejected = run_ocm_binary(
+                &crash.binary,
+                crash.root.path(),
+                &foreign,
+                &["self", "update", "--recover"],
+            );
+            assert!(!rejected.status.success());
+            assert!(stderr(&rejected).contains("different HOME or OCM_HOME"));
+            assert_eq!(crash.receipt()["phase"], "applying");
+            assert_eq!(
+                fs::read(crash.root.child("manager.log")).unwrap(),
+                before_recovery
+            );
+        }
+    }
+    // Other spellings of the recorded store and HOME name the same update:
+    // a symlinked store or HOME, and the absolute path of the relative
+    // OCM_HOME the update started with.
+    let home = PathBuf::from(&crash.env["HOME"]);
+    fs::create_dir_all(&home).unwrap();
+    std::os::unix::fs::symlink(crash.root.child("ocm-home"), crash.root.child("store-link"))
+        .unwrap();
+    std::os::unix::fs::symlink(&home, crash.root.child("home-link")).unwrap();
+    let aliases = [
+        ("OCM_HOME", crash.root.child("store-link")),
+        ("OCM_HOME", crash.root.child("ocm-home")),
+        ("HOME", crash.root.child("home-link")),
+    ];
+    for (key, alias) in &aliases {
+        let mut env = crash.env.clone();
+        env.insert((*key).into(), alias.to_string_lossy().into());
+        let status = run_ocm_binary(
             &crash.binary,
             crash.root.path(),
-            &foreign,
-            &["self", "update", "--recover"],
+            &env,
+            &["self", "update", "--status"],
         );
-        assert!(!rejected.status.success());
-        assert!(stderr(&rejected).contains("different HOME or OCM_HOME"));
-        assert_eq!(crash.receipt()["phase"], "applying");
-        assert_eq!(
-            fs::read(crash.root.child("manager.log")).unwrap(),
-            before_recovery
+        assert!(
+            status.status.success(),
+            "--status through {key}={}: {}",
+            alias.display(),
+            stderr(&status)
         );
+        let shown: Value = serde_json::from_slice(&status.stdout).unwrap();
+        assert_eq!(shown["phase"], "applying");
+        assert_eq!(shown["id"], id);
     }
-    let recovered = crash.run(&["self", "update", "--recover"]);
+    assert_eq!(
+        fs::read(crash.root.child("manager.log")).unwrap(),
+        before_recovery
+    );
+    let mut alias_env = crash.env.clone();
+    alias_env.insert(
+        "OCM_HOME".into(),
+        crash.root.child("store-link").to_string_lossy().into(),
+    );
+    alias_env.insert(
+        "HOME".into(),
+        crash.root.child("home-link").to_string_lossy().into(),
+    );
+    let recovered = run_ocm_binary(
+        &crash.binary,
+        crash.root.path(),
+        &alias_env,
+        &["self", "update", "--recover"],
+    );
+    // The rollback worker is the retained previous release, which may compare
+    // the receipt's directories as text, so it must run with the recorded
+    // spellings. Its service definition path is derived from HOME.
+    let recovery_log = fs::read_to_string(crash.root.child("manager.log")).unwrap();
+    let recovery_log = &recovery_log[before_recovery.len()..];
+    assert!(
+        recovery_log.contains("bootstrap") && !recovery_log.contains("home-link"),
+        "rollback worker did not use the recorded HOME: {recovery_log}"
+    );
     assert_eq!(
         crash.receipt()["phase"],
         "rolledBack",
@@ -712,6 +775,7 @@ fn local_transaction_survives_gateway_teardown_and_recovers_failures() {
     );
     assert_eq!(file_sha256(&crash.binary).unwrap(), original);
     assert!(!crash.root.child("ocm-home/ocm-home").exists());
+    assert!(!crash.root.child("ocm-home/store-link").exists());
     let before_retry = fs::read(crash.root.child("manager.log")).unwrap();
     let _ = crash.run(&["self", "update", "--recover"]);
     assert_eq!(
