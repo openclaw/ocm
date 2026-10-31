@@ -14,7 +14,7 @@ use super::Cli;
 use super::self_cmd::{StagedBinary, validate_staged_binary};
 use crate::infra::download::file_sha256;
 use crate::service::wait_for_gateway_readiness;
-use crate::store::{resolve_ocm_home, resolve_user_home};
+use crate::store::{resolve_ocm_home, resolve_user_home, same_ocm_home};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -355,9 +355,18 @@ impl Cli {
         transaction.start_and_wait(self, receipt)
     }
 
+    /// Another spelling of the recorded store or HOME, such as a symlink or
+    /// `/tmp` for `/private/tmp`, is the same store; see `same_ocm_home`.
     fn validate_receipt_home(&self, receipt: &Receipt) -> Result<(), String> {
-        if resolve_ocm_home(&self.env, &self.cwd)? != receipt.ocm_home
-            || resolve_user_home(&self.env) != receipt.user_home
+        let same = |recorded: &Path, current: &Path| {
+            recorded == current
+                || matches!(
+                    (recorded.to_str(), current.to_str()),
+                    (Some(recorded), Some(current)) if same_ocm_home(recorded, current)
+                )
+        };
+        if !same(&receipt.ocm_home, &resolve_ocm_home(&self.env, &self.cwd)?)
+            || !same(&receipt.user_home, &resolve_user_home(&self.env))
         {
             return Err(
                 "self-update belongs to a different HOME or OCM_HOME; use the original store"
