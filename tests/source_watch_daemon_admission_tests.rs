@@ -221,46 +221,54 @@ impl AdmissionFixture {
                         .as_str()
                         .is_some_and(|value| !value.is_empty())
                 );
-                // The runtime rename precedes publication-lock release. Keep
-                // that lock until the empty daemon is confirmed stopped, so it
-                // cannot freeze a lock needed by the operations under test.
+                // Runtime publication takes the lock the operations under test
+                // take. On macOS a daemon stopped while waiting for it can still
+                // take it after a later release and keep it while frozen. So
+                // stop the daemon only while the lock is free, when it cannot
+                // be waiting, and take the lock only after the stop. If the
+                // daemon stopped holding it, resume it and try again.
+                match publication.try_lock_exclusive() {
+                    Ok(()) => FileExt::unlock(&publication).unwrap(),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(error) => panic!("cannot inspect daemon publication: {error}"),
+                }
+                self.freeze_daemon(pid);
                 match publication.try_lock_exclusive() {
                     Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGCONT) }, 0);
                         thread::sleep(Duration::from_millis(10));
                         continue;
                     }
                     Err(error) => panic!("cannot exclude daemon publication: {error}"),
                 }
                 publication_acquired(&publication);
-                // The direct Child remains unreaped and owns this PID.
-                assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGSTOP) }, 0);
-                while Instant::now() < deadline {
-                    let mut status = 0;
-                    let waited = unsafe {
-                        libc::waitpid(pid as i32, &mut status, libc::WUNTRACED | libc::WNOHANG)
-                    };
-                    if waited == pid as i32 {
-                        if !libc::WIFSTOPPED(status) {
-                            self.daemon.take();
-                            panic!("empty daemon exited before fixture suspension");
-                        }
-                        // Closing this file alone can leave the lock held by a
-                        // concurrent fork's copy until that child execs.
-                        FileExt::unlock(&publication).unwrap();
-                        return runtime;
-                    }
-                    if waited < 0 {
-                        let error = std::io::Error::last_os_error();
-                        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted, "{error}");
-                    }
-                    thread::sleep(Duration::from_millis(10));
-                }
-                panic!("daemon did not stop before the suspension deadline");
+                // Closing this file alone can leave the lock held by a
+                // concurrent fork's copy until that child execs.
+                FileExt::unlock(&publication).unwrap();
+                return runtime;
             }
             thread::sleep(Duration::from_millis(20));
         }
         panic!("daemon did not reach a safe publication boundary before the suspension deadline");
+    }
+
+    fn freeze_daemon(&mut self, pid: u32) {
+        // The direct Child remains unreaped and owns this PID. SIGSTOP cannot be
+        // caught, so the wait returns once the daemon stops or exits.
+        assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGSTOP) }, 0);
+        let mut status = 0;
+        while unsafe { libc::waitpid(pid as i32, &mut status, libc::WUNTRACED) } != pid as i32 {
+            let error = std::io::Error::last_os_error();
+            assert_eq!(error.kind(), std::io::ErrorKind::Interrupted, "{error}");
+        }
+        if !libc::WIFSTOPPED(status) {
+            self.daemon.take();
+            panic!("empty daemon exited before fixture suspension");
+        }
     }
 
     fn stop_daemon(&mut self) {
