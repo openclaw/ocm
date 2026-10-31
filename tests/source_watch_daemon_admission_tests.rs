@@ -222,20 +222,14 @@ impl AdmissionFixture {
                         .is_some_and(|value| !value.is_empty())
                 );
                 // Runtime publication takes the lock the operations under test
-                // take. On macOS a daemon stopped while waiting for it can still
-                // take it after a later release and keep it while frozen. So
-                // stop the daemon only while the lock is free, when it cannot
-                // be waiting, and take the lock only after the stop. If the
-                // daemon stopped holding it, resume it and try again.
-                match publication.try_lock_exclusive() {
-                    Ok(()) => FileExt::unlock(&publication).unwrap(),
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(10));
-                        continue;
-                    }
-                    Err(error) => panic!("cannot inspect daemon publication: {error}"),
-                }
+                // take. Stop the daemon before taking that lock: a stopped daemon
+                // cannot start waiting for it. On macOS a daemon stopped while it
+                // was already waiting behind another holder can still take the
+                // lock after that holder releases it, so give such a waiter time
+                // to do so before checking. If the stopped daemon holds the
+                // lock, resume it and try again.
                 self.freeze_daemon(pid);
+                thread::sleep(Duration::from_millis(50));
                 match publication.try_lock_exclusive() {
                     Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
