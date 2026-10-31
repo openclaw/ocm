@@ -2477,9 +2477,22 @@ fn daemon_revalidates_binding_after_capability_probe() {
         if reconciled {
             wait_for_runtime_children(&runtime_path, 0, None, Duration::from_secs(5))
                 .expect("idle daemon did not publish runtime state");
+            // Each setter publishes its own plan update. Stop the idle daemon,
+            // which holds no OCM lock, so one reconciliation queues alpha and
+            // beta in the same startup batch. Otherwise alpha can be probed
+            // alone and its legitimate re-plan starts before beta's gate.
+            let pid = daemon.0.id() as libc::pid_t;
+            assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+            let mut status = 0;
+            assert_eq!(
+                unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) },
+                pid
+            );
+            assert!(libc::WIFSTOPPED(status));
             for name in ["alpha", "beta"] {
                 env_service.set_service_running(name, true).unwrap();
             }
+            assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
         }
         assert!(wait_for_file(
             &root.child("alpha.probe"),
