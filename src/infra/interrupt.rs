@@ -29,10 +29,13 @@ static STATE: Mutex<State> = Mutex::new(State {
 // OS handler counts each signal here first, so an observer can tell that a
 // signal reached OCM before its dispatch has started.
 static ARRIVED: AtomicUsize = AtomicUsize::new(0);
+// Each signal ctrlc dispatches, with the ctrlc OS handler its wrapper forwards to.
 #[cfg(unix)]
-const DISPATCHED_SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
-#[cfg(unix)]
-static FORWARD_HANDLERS: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
+static FORWARD_HANDLERS: [(libc::c_int, AtomicUsize); 3] = [
+    (libc::SIGINT, AtomicUsize::new(0)),
+    (libc::SIGTERM, AtomicUsize::new(0)),
+    (libc::SIGHUP, AtomicUsize::new(0)),
+];
 static DISPATCHED: Condvar = Condvar::new();
 static INSTALLED: OnceLock<Result<Installation, String>> = OnceLock::new();
 
@@ -50,7 +53,7 @@ fn ensure_installed(application_owner: bool) -> Result<(), String> {
     #[cfg(unix)]
     if application_owner {
         if let Some(action) = &installation.private_hup_handler {
-            set_hup_action(action)?;
+            set_signal_action(libc::SIGHUP, action)?;
         }
     }
     #[cfg(not(unix))]
@@ -63,7 +66,7 @@ fn install_dispatcher(application_owner: bool) -> Result<Installation, String> {
     let ignored_hup = if application_owner {
         None
     } else {
-        let action = hup_action()?;
+        let action = signal_action(libc::SIGHUP)?;
         (action.sa_sigaction == libc::SIG_IGN).then_some(action)
     };
     #[cfg(not(unix))]
@@ -77,8 +80,8 @@ fn install_dispatcher(application_owner: bool) -> Result<Installation, String> {
         // Detached workers deliberately ignore HUP across exec. A private
         // lookup must preserve that policy; a later application owner retains
         // the ordinary ctrlc termination semantics it had before this helper.
-        let dispatcher = hup_action();
-        let restore = set_hup_action(&inherited);
+        let dispatcher = signal_action(libc::SIGHUP);
+        let restore = set_signal_action(libc::SIGHUP, &inherited);
         match (dispatcher, restore) {
             (Ok(action), Ok(())) => Some(action),
             (Err(error), Ok(())) | (Ok(_), Err(error)) => return Err(error),
@@ -91,16 +94,6 @@ fn install_dispatcher(application_owner: bool) -> Result<Installation, String> {
         #[cfg(unix)]
         private_hup_handler,
     })
-}
-
-#[cfg(unix)]
-fn hup_action() -> Result<libc::sigaction, String> {
-    signal_action(libc::SIGHUP)
-}
-
-#[cfg(unix)]
-fn set_hup_action(action: &libc::sigaction) -> Result<(), String> {
-    set_signal_action(libc::SIGHUP, action)
 }
 
 #[cfg(unix)]
@@ -135,7 +128,8 @@ fn set_signal_action(signal: libc::c_int, action: &libc::sigaction) -> Result<()
 // mask, so every arrival is counted before ctrlc wakes its thread.
 #[cfg(unix)]
 fn count_arrivals() -> Result<(), String> {
-    for (forward, signal) in FORWARD_HANDLERS.iter().zip(DISPATCHED_SIGNALS) {
+    for (signal, forward) in &FORWARD_HANDLERS {
+        let signal = *signal;
         let mut action = signal_action(signal)?;
         if matches!(action.sa_sigaction, libc::SIG_DFL | libc::SIG_IGN)
             || action.sa_flags & libc::SA_SIGINFO != 0
@@ -155,10 +149,10 @@ fn count_arrivals() -> Result<(), String> {
 extern "C" fn count_arrival(signal: libc::c_int) {
     // Only async-signal-safe work: atomics and the forwarded handler.
     ARRIVED.fetch_add(1, Ordering::SeqCst);
-    let forward = DISPATCHED_SIGNALS
+    let forward = FORWARD_HANDLERS
         .iter()
-        .position(|dispatched| *dispatched == signal)
-        .map_or(0, |index| FORWARD_HANDLERS[index].load(Ordering::SeqCst));
+        .find(|(dispatched, _)| *dispatched == signal)
+        .map_or(0, |(_, forward)| forward.load(Ordering::SeqCst));
     if forward != 0 {
         // SAFETY: count_arrivals stored this signal's plain (non-SA_SIGINFO)
         // handler before installing this wrapper in its place.
@@ -224,6 +218,8 @@ fn settled_dispatch() -> MutexGuard<'static, State> {
 
 /// Wait until every signal that has reached OCM has been handed to the
 /// application owner, so a check run after this sees its recorded effect.
+/// Arrivals are counted on Unix only; elsewhere this waits out a dispatch
+/// already in progress, as `settled_dispatch` does.
 pub(crate) fn settle() {
     let mut state = STATE.lock().unwrap();
     while state.dispatching || state.arrivals_dispatched != ARRIVED.load(Ordering::SeqCst) {
@@ -302,7 +298,10 @@ mod tests {
             libc::signal(libc::SIGHUP, libc::SIG_IGN);
         }
         let first = CaptureInterrupt::enter(generation()).unwrap();
-        assert_eq!(hup_action().unwrap().sa_sigaction, libc::SIG_IGN);
+        assert_eq!(
+            signal_action(libc::SIGHUP).unwrap().sa_sigaction,
+            libc::SIG_IGN
+        );
         drop(first);
 
         let signals = Arc::new(AtomicUsize::new(0));
@@ -312,7 +311,10 @@ mod tests {
             true
         })
         .unwrap();
-        assert_ne!(hup_action().unwrap().sa_sigaction, libc::SIG_IGN);
+        assert_ne!(
+            signal_action(libc::SIGHUP).unwrap().sa_sigaction,
+            libc::SIG_IGN
+        );
         assert!(
             set_handler(|| true).is_err(),
             "application ownership must remain exclusive"
@@ -330,7 +332,13 @@ mod tests {
             // raise returns only after the OS handler ran, so the signal has
             // reached the process; settle must then wait out ctrlc's thread.
             assert_eq!(unsafe { libc::raise(signal) }, 0);
-            settle();
+            let (settled, done) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                settle();
+                let _ = settled.send(());
+            });
+            done.recv_timeout(std::time::Duration::from_secs(10))
+                .expect("settle did not return after the signal arrived");
             assert_eq!(
                 signals.load(Ordering::SeqCst),
                 index + 1,
