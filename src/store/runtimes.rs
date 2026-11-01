@@ -23,12 +23,12 @@ use crate::runtime::releases::{
     select_release,
 };
 use crate::runtime::{
-    AddRuntimeOptions, INTERNAL_NPM_PROXY_REAL_BIN_ENV, INTERNAL_NPM_PROXY_WORKSPACE_DIRS_ENV,
-    INTERNAL_NPM_PROXY_WORKSPACE_VERSIONS_ENV, InstallRuntimeFromOfficialReleaseOptions,
-    InstallRuntimeFromReleaseOptions, InstallRuntimeFromUrlOptions, InstallRuntimeOptions,
-    RuntimeCompanionMeta, RuntimeMeta, RuntimeReleaseSelectorKind, RuntimeSourceKind,
-    is_official_openclaw_package_runtime, is_openclaw_package_runtime,
-    patch_workspace_package_archive,
+    AddRuntimeOptions, BuildLocalRuntimeOptions, INTERNAL_NPM_PROXY_REAL_BIN_ENV,
+    INTERNAL_NPM_PROXY_WORKSPACE_DIRS_ENV, INTERNAL_NPM_PROXY_WORKSPACE_VERSIONS_ENV,
+    InstallRuntimeFromOfficialReleaseOptions, InstallRuntimeFromReleaseOptions,
+    InstallRuntimeFromUrlOptions, InstallRuntimeOptions, RuntimeCompanionMeta, RuntimeMeta,
+    RuntimeReleaseSelectorKind, RuntimeSourceKind, is_official_openclaw_package_runtime,
+    is_openclaw_package_runtime, patch_workspace_package_archive,
 };
 
 use super::common::{
@@ -373,16 +373,11 @@ impl RuntimeInstallTarget {
 pub(crate) struct PreparedRuntimeInstall {
     target: Option<RuntimeInstallTarget>,
     meta: RuntimeMeta,
-    reused: bool,
 }
 
 impl PreparedRuntimeInstall {
     pub(crate) fn reuse(meta: RuntimeMeta) -> Self {
-        Self {
-            target: None,
-            meta,
-            reused: true,
-        }
+        Self { target: None, meta }
     }
 
     pub(crate) fn meta(&self) -> &RuntimeMeta {
@@ -390,7 +385,7 @@ impl PreparedRuntimeInstall {
     }
 
     pub(crate) fn reused(&self) -> bool {
-        self.reused
+        self.target.is_none()
     }
 
     pub(crate) fn prepared_binary_path(&self) -> PathBuf {
@@ -400,17 +395,12 @@ impl PreparedRuntimeInstall {
             .unwrap_or_else(|| PathBuf::from(&self.meta.binary_path))
     }
 
-    pub(crate) fn commit(mut self) -> Result<RuntimeMeta, String> {
-        let meta = self.meta.clone();
-        match self.target.take() {
-            Some(target) => publish_runtime(target, meta),
-            None => Ok(meta),
+    pub(crate) fn commit(self) -> Result<RuntimeMeta, String> {
+        match self.target {
+            Some(target) => publish_runtime(target, self.meta),
+            None => Ok(self.meta),
         }
     }
-}
-
-pub(crate) struct OfficialRuntimeInstallResult {
-    pub meta: RuntimeMeta,
 }
 
 enum OfficialRuntimeInstallTarget {
@@ -453,18 +443,6 @@ impl InstallContext<'_> {
             None => lock_runtime_mutation(name, self.env, self.cwd).map(Arc::new),
         }
     }
-}
-
-#[derive(Clone, Debug)]
-pub struct BuildLocalRuntimeOptions {
-    pub name: String,
-    pub repo: String,
-    pub companions: Vec<String>,
-    pub description: Option<String>,
-    pub force: bool,
-    pub include_source_extensions: bool,
-    /// Existing environment whose configured source-plugin closure must be packaged.
-    pub target_env: Option<String>,
 }
 
 fn summarize_command_output(stdout: &[u8], stderr: &[u8]) -> Option<String> {
@@ -1370,18 +1348,7 @@ fn local_workspace_dependency_plan(
     extensions: &[LocalSourceExtensionArchive],
 ) -> Result<Option<LocalWorkspaceDependencyPlan>, String> {
     let package_json_path = repo_path.join("package.json");
-    let raw = fs::read_to_string(&package_json_path).map_err(|error| {
-        format!(
-            "failed to read OpenClaw package.json at {}: {error}",
-            display_path(&package_json_path)
-        )
-    })?;
-    let root_package: serde_json::Value = serde_json::from_str(&raw).map_err(|error| {
-        format!(
-            "failed to parse OpenClaw package.json at {}: {error}",
-            display_path(&package_json_path)
-        )
-    })?;
+    let root_package = load_json_value(&package_json_path, "OpenClaw package.json")?;
 
     let mut pending = workspace_dependency_names(&root_package, true);
     let extension_packages = extensions
@@ -1607,15 +1574,12 @@ fn runtime_npm_install_command(
     env: &BTreeMap<String, String>,
     local_adapter: Option<&LocalBuildNpmAdapter>,
 ) -> Result<CommandSpec, String> {
-    let requirement = if local_adapter.is_some() {
-        NodeRequirement::default()
-    } else {
-        NodeRequirement::from_archive(archive_path)?
-    };
+    if let Some(local_adapter) = local_adapter {
+        return Ok(local_adapter.command.clone());
+    }
+    let requirement = NodeRequirement::from_archive(archive_path)?;
     let host_ready = verify_package_runtime_host(env, &requirement).is_ok();
-    Ok(if let Some(local_adapter) = local_adapter {
-        local_adapter.command.clone()
-    } else if host_ready {
+    Ok(if host_ready {
         CommandSpec {
             program: npm_program(env),
             args: Vec::new(),
@@ -1691,18 +1655,7 @@ fn install_openclaw_package_with_npm(
 
 fn load_openclaw_repo_version(repo_path: &Path) -> Result<String, String> {
     let package_json_path = repo_path.join("package.json");
-    let raw = fs::read_to_string(&package_json_path).map_err(|error| {
-        format!(
-            "failed to read OpenClaw package.json at {}: {error}",
-            display_path(&package_json_path)
-        )
-    })?;
-    let value: serde_json::Value = serde_json::from_str(&raw).map_err(|error| {
-        format!(
-            "failed to parse OpenClaw package.json at {}: {error}",
-            display_path(&package_json_path)
-        )
-    })?;
+    let value = load_json_value(&package_json_path, "OpenClaw package.json")?;
 
     let package_name = value
         .get("name")
@@ -3243,43 +3196,34 @@ fn prepare_runtime_at_path(
         ));
     }
 
-    (|| {
-        ensure_dir(&target.install_files)?;
-        let binary_path = target.install_files.join(file_name);
-        match (source.path.as_deref(), source.url.as_deref()) {
-            (Some(source_path), _) => copy_installed_runtime_binary(source_path, &binary_path)?,
-            (None, Some(source_url)) => {
-                download_to_file(source_url, &binary_path)?;
-                if let Some(source_sha256) = source.sha256.as_deref() {
-                    verify_file_sha256(&binary_path, source_sha256)?;
-                }
-                #[cfg(unix)]
-                {
-                    let mut permissions = fs::metadata(&binary_path)
-                        .map_err(|error| error.to_string())?
-                        .permissions();
-                    permissions.set_mode(0o755);
-                    fs::set_permissions(&binary_path, permissions)
-                        .map_err(|error| error.to_string())?;
-                }
+    ensure_dir(&target.install_files)?;
+    let binary_path = target.install_files.join(file_name);
+    match (source.path.as_deref(), source.url.as_deref()) {
+        (Some(source_path), _) => copy_installed_runtime_binary(source_path, &binary_path)?,
+        (None, Some(source_url)) => {
+            download_to_file(source_url, &binary_path)?;
+            if let Some(source_sha256) = source.sha256.as_deref() {
+                verify_file_sha256(&binary_path, source_sha256)?;
             }
-            (None, None) => return Err("runtime install requires a source path or URL".to_string()),
+            #[cfg(unix)]
+            {
+                let mut permissions = fs::metadata(&binary_path)
+                    .map_err(|error| error.to_string())?
+                    .permissions();
+                permissions.set_mode(0o755);
+                fs::set_permissions(&binary_path, permissions)
+                    .map_err(|error| error.to_string())?;
+            }
         }
+        (None, None) => return Err("runtime install requires a source path or URL".to_string()),
+    }
 
-        let meta = build_installed_runtime_meta(
-            &target,
-            &binary_path,
-            &source,
-            None,
-            &release,
-            description,
-        );
-        Ok(PreparedRuntimeInstall {
-            target: Some(target),
-            meta,
-            reused: false,
-        })
-    })()
+    let meta =
+        build_installed_runtime_meta(&target, &binary_path, &source, None, &release, description);
+    Ok(PreparedRuntimeInstall {
+        target: Some(target),
+        meta,
+    })
 }
 
 fn prepare_runtime_install_target(
@@ -3726,38 +3670,37 @@ fn prepare_runtime_from_openclaw_package(
             display_path(&target.install_root)
         ));
     }
-    (|| {
-        ensure_dir(&target.install_files)?;
-        let tarball_url = source.url.as_deref().ok_or_else(|| {
-            "official OpenClaw runtime install requires a tarball URL".to_string()
-        })?;
-        let source_integrity = source.integrity.as_deref().ok_or_else(|| {
-            "official OpenClaw runtime install requires source integrity".to_string()
-        })?;
-        let archive_name = artifact_file_name_from_url(tarball_url)?;
-        let archive_path = target.install_files.join(&archive_name);
-        download_to_file(tarball_url, &archive_path)?;
-        verify_file_integrity(&archive_path, source_integrity)?;
+    ensure_dir(&target.install_files)?;
+    let tarball_url = source
+        .url
+        .as_deref()
+        .ok_or_else(|| "official OpenClaw runtime install requires a tarball URL".to_string())?;
+    let source_integrity = source
+        .integrity
+        .as_deref()
+        .ok_or_else(|| "official OpenClaw runtime install requires source integrity".to_string())?;
+    let archive_name = artifact_file_name_from_url(tarball_url)?;
+    let archive_path = target.install_files.join(&archive_name);
+    download_to_file(tarball_url, &archive_path)?;
+    verify_file_integrity(&archive_path, source_integrity)?;
 
-        let meta = stage_runtime_from_openclaw_package_archive(
-            &target,
-            &archive_path,
-            source,
-            release,
-            description,
-            context,
-            None,
-            &[],
-        );
-        if target.finish_children().is_ok() {
-            let _ = fs::remove_file(&archive_path);
-        }
-        Ok(PreparedRuntimeInstall {
-            target: Some(target),
-            meta: meta?,
-            reused: false,
-        })
-    })()
+    let meta = stage_runtime_from_openclaw_package_archive(
+        &target,
+        &archive_path,
+        source,
+        release,
+        description,
+        context,
+        None,
+        &[],
+    );
+    if target.finish_children().is_ok() {
+        let _ = fs::remove_file(&archive_path);
+    }
+    Ok(PreparedRuntimeInstall {
+        target: Some(target),
+        meta: meta?,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4651,7 +4594,7 @@ pub(crate) fn install_runtime_from_official_openclaw_release_with_context(
     let description = trim_description(options.description)
         .or_else(|| Some(official_openclaw_release_description(&release.version)));
 
-    install_runtime_from_selected_official_openclaw_release(
+    prepare_runtime_from_selected_official_openclaw_release(
         name,
         options.force,
         releases_url,
@@ -4663,31 +4606,8 @@ pub(crate) fn install_runtime_from_official_openclaw_release_with_context(
         },
         description,
         context,
-    )
-    .map(|result| result.meta)
-}
-
-pub(crate) fn install_runtime_from_selected_official_openclaw_release(
-    name: String,
-    force: bool,
-    releases_url: String,
-    release: OpenClawRelease,
-    release_details: RuntimeReleaseDetails,
-    description: Option<String>,
-    context: InstallContext<'_>,
-) -> Result<OfficialRuntimeInstallResult, String> {
-    let prepared = prepare_runtime_from_selected_official_openclaw_release(
-        name,
-        force,
-        releases_url,
-        release,
-        release_details,
-        description,
-        context,
-    )?;
-    prepared
-        .commit()
-        .map(|meta| OfficialRuntimeInstallResult { meta })
+    )?
+    .commit()
 }
 
 pub(crate) fn prepare_runtime_from_selected_official_openclaw_release(
@@ -4724,11 +4644,7 @@ pub(crate) fn prepare_runtime_from_selected_official_openclaw_release(
         selector_value: release_details.selector_value,
     };
     match prepare_official_runtime_install_target(name, force, &source, &release, context)? {
-        OfficialRuntimeInstallTarget::Reuse(meta) => Ok(PreparedRuntimeInstall {
-            target: None,
-            meta: *meta,
-            reused: true,
-        }),
+        OfficialRuntimeInstallTarget::Reuse(meta) => Ok(PreparedRuntimeInstall::reuse(*meta)),
         OfficialRuntimeInstallTarget::Install(target) => {
             prepare_runtime_from_openclaw_package(target, source, release, description, context)
         }
@@ -5233,7 +5149,6 @@ mod tests {
         super::PreparedRuntimeInstall {
             target: Some(target),
             meta,
-            reused: false,
         }
     }
 

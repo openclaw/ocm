@@ -7,9 +7,8 @@ use crate::runtime::releases::{
     select_official_openclaw_release_by_channel, select_official_openclaw_release_by_version,
 };
 use crate::store::{
-    BuildLocalRuntimeOptions as StoreBuildLocalRuntimeOptions, InstallContext,
-    PreparedRuntimeInstall, RuntimeMutationGuard, RuntimeReleaseDetails, find_runtime, get_runtime,
-    install_runtime_from_local_openclaw_build,
+    InstallContext, PreparedRuntimeInstall, RuntimeMutationGuard, RuntimeReleaseDetails,
+    find_runtime, get_runtime, install_runtime_from_local_openclaw_build,
     install_runtime_from_official_openclaw_release_with_context,
     install_runtime_from_release_with_context, install_runtime_from_url_with_context,
     install_runtime_with_context, is_official_openclaw_release_description, list_runtimes,
@@ -534,15 +533,7 @@ impl<'a> RuntimeService<'a> {
         let name = options.name.clone();
         let meta = self.with_unbound_runtime(&name, |guard| {
             install_runtime_from_local_openclaw_build(
-                StoreBuildLocalRuntimeOptions {
-                    name: options.name,
-                    repo: options.repo,
-                    companions: options.companions,
-                    description: options.description,
-                    force: options.force,
-                    include_source_extensions: options.include_source_extensions,
-                    target_env: options.target_env,
-                },
+                options,
                 InstallContext {
                     env: self.env,
                     cwd: self.cwd,
