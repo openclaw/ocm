@@ -6,19 +6,17 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use base64::Engine;
 use flate2::{Compression, write::GzEncoder};
 use ocm::infra::download::file_sha256;
 use ocm::store::{runtime_install_root, runtime_meta_path};
 use serde_json::Value;
-use sha2::{Digest, Sha512};
 use tar::{Builder, Header};
 
 use crate::support::{
     TestDir, TestHttpServer, install_fake_managed_node_archive, install_fake_node_and_npm,
     install_fake_service_manager, ocm_env,
     openclaw_package_tarball as openclaw_package_tarball_with_version, path_string, run_ocm,
-    stderr, stdout, write_executable_script,
+    sha512_integrity, stderr, stdout, write_executable_script,
 };
 
 fn append_tar_file(
@@ -229,14 +227,6 @@ fn companion_package_tarball(id: &str, package_name: &str, version: &str) -> Vec
         builder.finish().unwrap();
     }
     encoder.finish().unwrap()
-}
-
-fn sha512_integrity(body: &[u8]) -> String {
-    let digest = Sha512::digest(body);
-    format!(
-        "sha512-{}",
-        base64::engine::general_purpose::STANDARD.encode(digest)
-    )
 }
 
 fn installed_openclaw_runtime_entrypoint(install_root: &std::path::Path) -> std::path::PathBuf {

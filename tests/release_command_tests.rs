@@ -2,58 +2,12 @@ mod support;
 
 use std::fs;
 
-use base64::Engine;
-use flate2::{Compression, write::GzEncoder};
 use serde_json::json;
-use sha2::{Digest, Sha512};
-use tar::{Builder, Header};
 
 use crate::support::{
     TestDir, TestHttpServer, install_fake_managed_node_archive, install_fake_node_and_npm, ocm_env,
-    path_string, run_ocm, stderr, stdout,
+    openclaw_package_tarball, path_string, run_ocm, sha512_integrity, stderr, stdout,
 };
-
-fn append_tar_file(
-    builder: &mut Builder<&mut GzEncoder<Vec<u8>>>,
-    path: &str,
-    body: &[u8],
-    mode: u32,
-) {
-    let mut header = Header::new_gnu();
-    header.set_size(body.len() as u64);
-    header.set_mode(mode);
-    header.set_cksum();
-    builder.append_data(&mut header, path, body).unwrap();
-}
-
-fn openclaw_package_tarball(script_body: &str) -> Vec<u8> {
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    {
-        let mut builder = Builder::new(&mut encoder);
-        append_tar_file(
-            &mut builder,
-            "package/openclaw.mjs",
-            script_body.as_bytes(),
-            0o755,
-        );
-        append_tar_file(
-            &mut builder,
-            "package/package.json",
-            br#"{"name":"openclaw","version":"2026.3.24","bin":{"openclaw":"openclaw.mjs"}}"#,
-            0o644,
-        );
-        builder.finish().unwrap();
-    }
-    encoder.finish().unwrap()
-}
-
-fn sha512_integrity(body: &[u8]) -> String {
-    let digest = Sha512::digest(body);
-    format!(
-        "sha512-{}",
-        base64::engine::general_purpose::STANDARD.encode(digest)
-    )
-}
 
 fn requests_install_metadata(server: &TestHttpServer) -> bool {
     server.requests().iter().any(|request| {
@@ -301,7 +255,8 @@ fn release_install_uses_the_published_openclaw_source() {
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
 
-    let tarball = openclaw_package_tarball("#!/usr/bin/env node\nconsole.log('stable');\n");
+    let tarball =
+        openclaw_package_tarball("#!/usr/bin/env node\nconsole.log('stable');\n", "2026.3.24");
     let integrity = sha512_integrity(&tarball);
     let tarball_server = TestHttpServer::serve_bytes(
         "/openclaw-2026.3.24.tgz",
@@ -361,7 +316,8 @@ fn release_install_stays_quiet_when_managed_node_fallback_is_available() {
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
 
-    let tarball = openclaw_package_tarball("#!/usr/bin/env node\nconsole.log('stable');\n");
+    let tarball =
+        openclaw_package_tarball("#!/usr/bin/env node\nconsole.log('stable');\n", "2026.3.24");
     let integrity = sha512_integrity(&tarball);
     let tarball_server = TestHttpServer::serve_bytes(
         "/openclaw-2026.3.24.tgz",
@@ -400,7 +356,8 @@ fn release_install_reuses_a_matching_installed_runtime() {
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
 
-    let tarball = openclaw_package_tarball("#!/usr/bin/env node\nconsole.log('stable');\n");
+    let tarball =
+        openclaw_package_tarball("#!/usr/bin/env node\nconsole.log('stable');\n", "2026.3.24");
     let integrity = sha512_integrity(&tarball);
     let tarball_server = TestHttpServer::serve_bytes_times(
         "/openclaw-2026.3.24.tgz",
@@ -444,7 +401,8 @@ fn release_list_and_show_surface_installed_runtime_names() {
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
 
-    let tarball = openclaw_package_tarball("#!/usr/bin/env node\nconsole.log('stable');\n");
+    let tarball =
+        openclaw_package_tarball("#!/usr/bin/env node\nconsole.log('stable');\n", "2026.3.24");
     let integrity = sha512_integrity(&tarball);
     let tarball_server = TestHttpServer::serve_bytes(
         "/openclaw-2026.3.24.tgz",
