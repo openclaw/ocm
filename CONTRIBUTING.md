@@ -194,6 +194,29 @@ case uses privilege, to launch a reader as the existing `nobody` user against a
 temporary fixture. The CI command in `.github/workflows/ci.yml` selects the exact
 test; it does not run the rest of the suite or any environment service as root.
 
+### Opt-in native Gateway lifecycle check
+
+On a fresh disposable Linux worker with a usable `systemctl --user` session,
+run the published OpenClaw lifecycle check against the tested OCM binary:
+
+```sh
+python3 -B scripts/validate-native-gateway.py \
+  --ocm "$PWD/target/release/ocm" \
+  --openclaw-version 2026.10.9 \
+  --disposable-host
+```
+
+Choose an exact published OpenClaw version. This downloads the real package,
+checks plugin discovery and runtime integrity, and exercises native service
+install, start, authenticated health, restart, stop, and uninstall. It does not
+make model or channel calls. Run it exclusively on that disposable user; OCM's
+native service label is shared across stores. An existing unit or definition
+causes refusal. The check isolates `OCM_HOME`, keeps the real user bus and home,
+and uses no service-manager or readiness overrides. Successful runs remove their
+state; failures retain the printed state directory for private diagnostics.
+This is an additional opt-in check, not a replacement for the baseline or
+platform matrix.
+
 ## Issues and pull requests
 
 Check existing issues and pull requests before starting overlapping work. Bug
