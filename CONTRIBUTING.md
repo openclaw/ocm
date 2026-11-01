@@ -223,6 +223,24 @@ state; failures retain the printed state directory for private diagnostics.
 This is an additional opt-in check, not a replacement for the baseline or
 platform matrix.
 
+The macOS Test job runs the corresponding native launchd check after its Cargo
+install smoke test. To run it manually on a fresh disposable macOS user:
+
+```sh
+python3 -B scripts/validate-native-gateway-macos.py --preflight-only
+python3 -B scripts/validate-native-gateway-macos.py \
+  --ocm "$PWD/target/release/ocm" \
+  --openclaw-version 2026.10.9 \
+  --disposable-host
+```
+
+The preflight is read-only and requires an existing `gui/<uid>` launchd domain,
+with no OCM job, plist, or enablement override. The lifecycle refuses existing
+state and rechecks immediately before service installation. It preserves the
+real user home and session, isolates OCM state, checks native executable and
+parent identities, and verifies uninstall. Launchd's task-created enabled
+override remains on the disposable user; the check never resets other overrides.
+
 ## Issues and pull requests
 
 Check existing issues and pull requests before starting overlapping work. Bug

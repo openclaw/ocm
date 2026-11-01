@@ -189,6 +189,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Qualify native macOS launchd session
+        if: runner.os == 'macOS'
+        run: python3 -B scripts/validate-native-gateway-macos.py --preflight-only
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           toolchain: stable
@@ -243,6 +246,14 @@ jobs:
         run: |
           cargo install --locked --path . --root "$RUNNER_TEMP/ocm-install"
           "$RUNNER_TEMP/ocm-install/bin/ocm" --version
+      - name: Prove native macOS Gateway lifecycle
+        if: runner.os == 'macOS'
+        timeout-minutes: 25
+        run: |
+          python3 -B scripts/validate-native-gateway-macos.py \
+            --ocm "$RUNNER_TEMP/ocm-install/bin/ocm" \
+            --openclaw-version 2026.10.9 \
+            --disposable-host
 
 
   npm:
