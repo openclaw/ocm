@@ -56,9 +56,6 @@ def main():
     if definition.exists() or definition.is_symlink() or unit_property("LoadState") != "not-found":
         raise RuntimeError("existing native OCM service; use a fresh disposable user")
 
-    with socket.socket() as listener:
-        listener.bind(("127.0.0.1", 0))
-        port = listener.getsockname()[1]
     root = Path(tempfile.mkdtemp(prefix="ocm-native-gateway-"))
     print("isolated test state:", root, flush=True)
     # Cargo artifacts may intentionally select an installed OCM for the daemon.
@@ -121,11 +118,12 @@ def main():
     try:
         installed = oc_json(
             "published install", "start", ENV_NAME,
-            "--version", args.openclaw_version, "--port", port, "--no-service",
+            "--version", args.openclaw_version, "--no-service",
             timeout=1200,
         )
         created = installed["created"]
         assert created and not installed["serviceRequested"]
+        port = installed["gatewayPort"]
         runtime = installed["defaultRuntime"]
         oc_json("runtime integrity", "runtime", "verify", runtime)
         version = run("published version", "@" + ENV_NAME, "--", "--version")

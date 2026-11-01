@@ -160,18 +160,16 @@ def main():
         )
         return status
 
-    with socket.socket() as listener:
-        listener.bind(("127.0.0.1", 0))
-        port = listener.getsockname()[1]
     provider = ProviderFixture()
     install_attempted = False
     failure = None
     try:
         installed = oc_json(
             "published install", "start", ENV_NAME, "--version", args.openclaw_version,
-            "--port", port, "--no-service", timeout=1200,
+            "--no-service", timeout=1200,
         )
         assert installed["created"] and not installed["serviceRequested"]
+        port = installed["gatewayPort"]
         oc_json("runtime integrity", "runtime", "verify", installed["defaultRuntime"])
         inventory = oc_json("plugin inventory", "@" + ENV_NAME, "--", "plugins", "list")
         assert inventory["plugins"]
