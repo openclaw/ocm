@@ -1,11 +1,9 @@
 use std::collections::BTreeMap;
 
-use crate::infra::terminal::{
-    Cell, KeyValueRow, Tone, paint, render_key_value_card, render_table, terminal_width,
-};
+use crate::infra::terminal::{Cell, KeyValueRow, Tone, paint, render_table, terminal_width};
 use crate::launcher::LauncherMeta;
 
-use super::{RenderProfile, format_key_value_lines, format_rfc3339};
+use super::{RenderProfile, format_key_value_lines, format_rfc3339, push_card};
 
 pub fn launcher_added(
     meta: &LauncherMeta,
@@ -205,16 +203,6 @@ pub fn launcher_removed(name: &str, profile: RenderProfile, command_example: &st
         profile.color,
     );
     lines
-}
-
-fn push_card(lines: &mut Vec<String>, title: &str, rows: Vec<KeyValueRow>, color: bool) {
-    if rows.is_empty() {
-        return;
-    }
-    if !lines.is_empty() {
-        lines.push(String::new());
-    }
-    lines.extend(render_key_value_card(title, &rows, color));
 }
 
 #[cfg(test)]

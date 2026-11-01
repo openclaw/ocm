@@ -14,6 +14,8 @@ use std::collections::BTreeMap;
 
 use time::OffsetDateTime;
 
+use crate::infra::terminal::{KeyValueRow, render_key_value_card};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RenderProfile {
     pub pretty: bool,
@@ -47,4 +49,21 @@ pub(crate) fn format_rfc3339(value: OffsetDateTime) -> Result<String, String> {
     value
         .format(&time::format_description::well_known::Rfc3339)
         .map_err(|error| error.to_string())
+}
+
+pub(super) fn push_card(lines: &mut Vec<String>, title: &str, rows: Vec<KeyValueRow>, color: bool) {
+    if rows.is_empty() {
+        return;
+    }
+    if !lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines.extend(render_key_value_card(title, &rows, color));
+}
+
+pub(super) fn optional_value_row(label: &str, value: Option<String>) -> KeyValueRow {
+    match value {
+        Some(value) => KeyValueRow::plain(label, value),
+        None => KeyValueRow::muted(label, "—"),
+    }
 }

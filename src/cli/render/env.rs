@@ -11,7 +11,7 @@ use crate::infra::terminal::{
     render_tags, terminal_width,
 };
 
-use super::{RenderProfile, format_key_value_lines, format_rfc3339};
+use super::{RenderProfile, format_key_value_lines, format_rfc3339, optional_value_row, push_card};
 
 pub fn env_protected(name: &str, protected: bool, profile: RenderProfile) -> Vec<String> {
     if !profile.pretty {
@@ -1310,23 +1310,6 @@ fn env_action_next_steps(
         ));
     }
     rows
-}
-
-fn push_card(lines: &mut Vec<String>, title: &str, rows: Vec<KeyValueRow>, color: bool) {
-    if rows.is_empty() {
-        return;
-    }
-    if !lines.is_empty() {
-        lines.push(String::new());
-    }
-    lines.extend(render_key_value_card(title, &rows, color));
-}
-
-fn optional_value_row(label: &str, value: Option<String>) -> KeyValueRow {
-    match value {
-        Some(value) => KeyValueRow::plain(label, value),
-        None => KeyValueRow::muted(label, "—"),
-    }
 }
 
 fn bool_row(label: &str, value: bool) -> KeyValueRow {

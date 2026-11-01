@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 
 use crate::cli::self_cmd::{SelfUpdateMode, SelfUpdateStatus, SelfUpdateSummary};
-use crate::infra::terminal::{KeyValueRow, render_key_value_card};
+use crate::infra::terminal::KeyValueRow;
 
-use super::{RenderProfile, format_key_value_lines};
+use super::{RenderProfile, format_key_value_lines, push_card};
 
 pub fn self_update(summary: &SelfUpdateSummary, profile: RenderProfile, cmd: &str) -> Vec<String> {
     if !profile.pretty {
@@ -98,14 +98,4 @@ fn self_update_raw(summary: &SelfUpdateSummary) -> Vec<String> {
         lines.insert("receiptPath".to_string(), path.clone());
     }
     format_key_value_lines(lines)
-}
-
-fn push_card(lines: &mut Vec<String>, title: &str, rows: Vec<KeyValueRow>, color: bool) {
-    if rows.is_empty() {
-        return;
-    }
-    if !lines.is_empty() {
-        lines.push(String::new());
-    }
-    lines.extend(render_key_value_card(title, &rows, color));
 }
