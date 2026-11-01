@@ -6,12 +6,18 @@ use std::path::PathBuf;
 
 use crate::support::{TestDir, ocm_env, run_ocm, stdout};
 
-const DOCS: [&str; 5] = [
+const DOCS: [&str; 11] = [
     "README.md",
     "npm/README.md",
     "docs/USAGE.md",
     "docs/SELF_UPDATE.md",
     "docs/OPENCLAW_RELEASE_SCENARIO_MATRIX.md",
+    "skills/ocm-operator/SKILL.md",
+    "skills/ocm-operator/references/command-cookbook.md",
+    "skills/ocm-operator/references/local-paths.md",
+    "skills/ocm-operator/references/safety-and-state.md",
+    "skills/openclaw-release-validation/SKILL.md",
+    "skills/openclaw-release-validation/references/release-validation-paths.md",
 ];
 
 /// Resolves command paths through the shipped binary's own `ocm help`.
