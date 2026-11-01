@@ -90,14 +90,6 @@ impl Drop for ExclusiveFileLock {
 }
 
 impl ExclusiveFileLock {
-    pub(crate) fn output(
-        &self,
-        mut command: std::process::Command,
-    ) -> std::io::Result<std::process::Output> {
-        self.retain_for_child(&mut command);
-        command.output()
-    }
-
     pub(crate) fn retain_for_child(&self, command: &mut std::process::Command) {
         retain_lock_for_child(&self.file, &self.child_custody, command);
     }

@@ -17,8 +17,8 @@ use serde_json::Value;
 
 use crate::support::{
     TestDir, TestHttpServer, install_fake_launchctl, install_fake_node_and_npm, ocm_env,
-    openclaw_package_tarball, path_string, run_ocm, sha512_integrity, stderr,
-    write_empty_supervisor_runtime,
+    openclaw_package_tarball, openclaw_package_tarball_with_manifest, path_string, run_ocm,
+    sha512_integrity, stderr, write_empty_supervisor_runtime,
 };
 
 const PREPARE_DELAY: Duration = Duration::from_millis(1_500);
@@ -190,6 +190,7 @@ fn health_observation(port: u32) -> Option<bool> {
 fn write_running_supervisor_runtime(
     runtime_path: &Path,
     ocm_home: &str,
+    binding_kind: &str,
     binding_name: &str,
     pid: u32,
     child_port: u32,
@@ -203,7 +204,7 @@ fn write_running_supervisor_runtime(
         SupervisorRuntimeChild {
             launch_spec_sha256: None,
             env_name: "demo".to_string(),
-            binding_kind: "runtime".to_string(),
+            binding_kind: binding_kind.to_string(),
             binding_name: binding_name.to_string(),
             pid,
             restart_count: 0,
@@ -232,6 +233,19 @@ case "$1" in
     exit 1
     ;;
   update)
+    if [ "$2" = "preflight" ]; then
+      if [ "$#" != "7" ] || [ "$3" != "--json" ] || [ "$4" != "--source-root" ] || [ "$6" != "--timeout" ] || [ "$7" != "300" ]; then
+        printf 'invalid preflight arguments\n' >&2
+        exit 41
+      fi
+      if env | grep -Ei '^(OPENCLAW_UPDATE_|OPENCLAW_(SUPERVISOR_MODE|LAUNCHD_LABEL|SYSTEMD_UNIT|WINDOWS_TASK_NAME|SERVICE_MARKER|SERVICE_KIND|CONTROL_PLANE_UPDATE_SENTINEL_META|GATEWAY_SERVICE_PID|COMPATIBILITY_HOST_VERSION|NO_RESPAWN)=|LAUNCH_JOB_LABEL=|LAUNCH_JOB_NAME=|XPC_SERVICE_NAME=|INVOCATION_ID=|SYSTEMD_EXEC_PID=|JOURNAL_STREAM=)' >/dev/null; then
+        printf 'preflight inherited update authority\n' >&2
+        exit 42
+      fi
+      printf '%s\n' "$5" "$OPENCLAW_STATE_DIR" "$OPENCLAW_CONFIG_PATH" > "$OCM_TEST_PREFLIGHT_OBSERVATION"
+      cat "$OCM_TEST_PREFLIGHT_RECEIPT"
+      exit "${{OCM_TEST_PREFLIGHT_EXIT:-0}}"
+    fi
     if [ "$2" = "finalize" ]; then
       if [ "$OPENCLAW_UPDATE_POST_CORE" != "1" ]; then
         printf 'missing post-core capability handshake\n' >&2
@@ -282,6 +296,396 @@ fn env_desired_running(registry_path: &Path, fallback: bool) -> bool {
         .unwrap_or(fallback)
 }
 
+fn preflight_package(version: &str, protocol: Value) -> Vec<u8> {
+    openclaw_package_tarball_with_manifest(
+        &fixture_openclaw_script(version),
+        &serde_json::json!({
+            "name": "openclaw",
+            "version": version,
+            "bin": {"openclaw": "openclaw.mjs"},
+            "openclaw": {"updatePreflightProtocol": protocol}
+        })
+        .to_string(),
+    )
+}
+
+fn preflight_receipt_json(status: &str, version: &str) -> Value {
+    serde_json::json!({
+        "protocol": 1,
+        "mode": "preflight",
+        "status": status,
+        "candidateVersion": version,
+        "coverage": "isolated-core-startup",
+        "phase": "readiness",
+        "reason": "synthetic readiness result"
+    })
+}
+
+fn assert_preflight_observation(observation: &str, source_root: &Path, environment: &Value) {
+    let lines = observation.lines().collect::<Vec<_>>();
+    let paths = ocm::store::derive_env_paths(environment["root"].as_str().unwrap());
+    assert_eq!(
+        lines,
+        [
+            path_string(source_root),
+            path_string(&paths.state_dir),
+            path_string(&paths.config_path),
+        ],
+        "preflight did not receive the actual source package and profile paths"
+    );
+}
+
+#[test]
+fn upgrade_preflight_refusal_keeps_tracked_source_running() {
+    assert_refused_preflights(false, false);
+}
+
+#[test]
+fn upgrade_preflight_refuses_invalid_receipts_before_explicit_cutover() {
+    assert_refused_preflights(false, true);
+}
+
+#[test]
+fn upgrade_preflight_refusal_keeps_launcher_source_running() {
+    assert_refused_preflights(true, true);
+}
+
+fn assert_refused_preflights(launcher: bool, explicit: bool) {
+    let root = TestDir::new("upgrade-preflight-refusal");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let available = Arc::new(AtomicBool::new(true));
+    let health_server = ControlledHealthServer::start(Arc::clone(&available));
+    let source_version = "2026.8.13";
+    let source_tarball =
+        openclaw_package_tarball(&fixture_openclaw_script(source_version), source_version);
+    let source_server = TestHttpServer::serve_bytes_times(
+        "/source.tgz",
+        "application/octet-stream",
+        &source_tarball,
+        8,
+    );
+    let source_release = serde_json::json!({
+        "version": source_version,
+        "dist": {"tarball": source_server.url(), "integrity": sha512_integrity(&source_tarball)}
+    });
+    let cases = if explicit && !launcher {
+        vec![
+            ("blocked", 3),
+            ("unverified", 2),
+            ("unverified-execution", 2),
+            ("ready-nonzero", 3),
+            ("version-mismatch", 0),
+            ("coverage-mismatch", 0),
+            ("protocol-mismatch", 0),
+            ("invalid", 0),
+            ("unsupported", 0),
+            ("package-version-mismatch", 0),
+        ]
+    } else {
+        vec![("blocked", 3)]
+    };
+    let mut versions = serde_json::Map::new();
+    versions.insert(source_version.into(), source_release.clone());
+    let mut candidates = Vec::new();
+    let mut target_servers = Vec::new();
+    for (index, (case, code)) in cases.iter().enumerate() {
+        let version = format!("2026.8.{}", 14 + index);
+        let protocol = if *case == "unsupported" { 2 } else { 1 };
+        let package_version = if *case == "package-version-mismatch" {
+            "2026.8.12"
+        } else {
+            &version
+        };
+        let bytes = preflight_package(package_version, serde_json::json!(protocol));
+        let server = TestHttpServer::serve_bytes_times(
+            &format!("/target-{index}.tgz"),
+            "application/octet-stream",
+            &bytes,
+            8,
+        );
+        versions.insert(
+            version.clone(),
+            serde_json::json!({
+                "version": version,
+                "dist": {"tarball": server.url(), "integrity": sha512_integrity(&bytes)}
+            }),
+        );
+        candidates.push((*case, *code, version));
+        target_servers.push(server);
+    }
+    let initial = serde_json::json!({
+        "dist-tags": {"latest": source_version},
+        "versions": {source_version: source_release}
+    });
+    let updated = serde_json::json!({
+        "dist-tags": {"latest": "2026.8.14"},
+        "versions": versions
+    });
+    let mut responses = vec![initial.to_string().into_bytes()];
+    responses.extend((0..64).map(|_| updated.to_string().into_bytes()));
+    let packument_server =
+        TestHttpServer::serve_bytes_sequence("/openclaw", "application/json", responses);
+    let mut env = ocm_env(&root);
+    install_fake_node_and_npm(&root, &mut env, "22.22.3");
+    env.insert(
+        "OCM_INTERNAL_OPENCLAW_RELEASES_URL".into(),
+        packument_server.url(),
+    );
+    env.insert("OCM_INTERNAL_SERVICE_MANAGER".into(), "launchd".into());
+    install_fake_launchctl(&root, &mut env);
+    env.insert(
+        "OCM_TEST_NATIVE_DAEMON_PID".into(),
+        std::process::id().to_string(),
+    );
+    let installed = run_ocm(
+        &cwd,
+        &env,
+        &["runtime", "install", "stable", "--channel", "stable"],
+    );
+    assert!(installed.status.success(), "{}", stderr(&installed));
+    let source = ocm::store::get_runtime("stable", &env, &cwd).unwrap();
+    let source_binary = fs::canonicalize(&source.binary_path).unwrap();
+    let source_root = source_binary.parent().unwrap();
+    let (binding_kind, binding_name, selector) = if launcher {
+        // A literal installed-package launcher has no development runner.
+        support::write_executable_script(
+            &root.child("fake-node-bin/node"),
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo v22.22.3; exit 0; fi\nscript=\"$1\"\nshift\nexec /bin/sh \"$script\" \"$@\"\n",
+        );
+        let added = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "launcher",
+                "add",
+                "source",
+                "--command",
+                &format!("node '{}'", path_string(&source_binary)),
+                "--cwd",
+                &path_string(&cwd),
+            ],
+        );
+        assert!(added.status.success(), "{}", stderr(&added));
+        ("launcher", "source", "--launcher")
+    } else {
+        ("runtime", "stable", "--runtime")
+    };
+    let created = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "env",
+            "create",
+            "demo",
+            selector,
+            binding_name,
+            "--port",
+            &health_server.port.to_string(),
+        ],
+    );
+    assert!(created.status.success(), "{}", stderr(&created));
+    let created_env = ocm::store::get_environment("demo", &env, &cwd).unwrap();
+    let created_paths = ocm::store::derive_env_paths(&created_env.root);
+    fs::write(
+        &created_paths.config_path,
+        br#"{"gateway":{"mode":"local","auth":{"mode":"token","token":"synthetic-token"}}}"#,
+    )
+    .unwrap();
+    let started = run_ocm(&cwd, &env, &["service", "start", "demo"]);
+    assert!(started.status.success(), "{}", stderr(&started));
+    let env_show = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
+    assert!(env_show.status.success(), "{}", stderr(&env_show));
+    let environment: Value = serde_json::from_slice(&env_show.stdout).unwrap();
+    let paths = ocm::store::derive_env_paths(environment["root"].as_str().unwrap());
+    let config_before = fs::read(&paths.config_path).unwrap();
+    fs::write(paths.workspace_dir.join("sentinel"), "source data").unwrap();
+    let registry_path = env_registry_path(&env, &cwd).unwrap();
+    let registry_before = fs::read(&registry_path).unwrap();
+    let runtime_path = supervisor_runtime_path(&env, &cwd).unwrap();
+    fs::create_dir_all(runtime_path.parent().unwrap()).unwrap();
+    let ocm_home = env["OCM_HOME"].clone();
+    write_running_supervisor_runtime(
+        &runtime_path,
+        &ocm_home,
+        binding_kind,
+        binding_name,
+        4242,
+        health_server.port,
+    );
+    let observation = root.child("preflight-observation");
+    let receipt_path = root.child("preflight-receipt.json");
+    let finalizer_started = root.child("finalizer-started");
+    let finalizer_release = root.child("finalizer-release");
+    let completion_started = root.child("completion-started");
+    let completion_input = root.child("completion-input");
+    fs::write(&finalizer_release, "release").unwrap();
+    for (key, path) in [
+        ("OCM_TEST_PREFLIGHT_OBSERVATION", &observation),
+        ("OCM_TEST_PREFLIGHT_RECEIPT", &receipt_path),
+        ("OCM_TEST_UPDATE_FINALIZE_STARTED", &finalizer_started),
+        ("OCM_TEST_UPDATE_FINALIZE_RELEASE", &finalizer_release),
+        ("OCM_TEST_COMPLETION_STARTED", &completion_started),
+        ("OCM_TEST_COMPLETION_INPUT", &completion_input),
+    ] {
+        env.insert(key.into(), path_string(path));
+    }
+    env.insert("OPENCLAW_UPDATE_POST_CORE".into(), "1".into());
+    for key in [
+        "OPENCLAW_UPDATE_UNKNOWN_AUTHORITY",
+        "openclaw_update_lowercase_authority",
+        "OPENCLAW_COMPATIBILITY_HOST_VERSION",
+        "openclaw_gateway_service_pid",
+        "LAUNCH_JOB_LABEL",
+        "LAUNCH_JOB_NAME",
+        "XPC_SERVICE_NAME",
+        "INVOCATION_ID",
+        "SYSTEMD_EXEC_PID",
+        "JOURNAL_STREAM",
+        "openclaw_supervisor_mode",
+        "openclaw_service_marker",
+        "openclaw_service_kind",
+        "openclaw_launchd_label",
+        "openclaw_systemd_unit",
+        "openclaw_windows_task_name",
+        "OPENCLAW_CONTROL_PLANE_UPDATE_SENTINEL_META",
+    ] {
+        env.insert(key.into(), "synthetic-authority".into());
+    }
+    let done = Arc::new(AtomicBool::new(false));
+    let stopped = Arc::new(AtomicBool::new(false));
+    let observer_done = Arc::clone(&done);
+    let observer_stopped = Arc::clone(&stopped);
+    let observer_available = Arc::clone(&available);
+    let observer_runtime = runtime_path.clone();
+    let observer_registry = registry_path.clone();
+    let health_port = health_server.port;
+    let observer = thread::spawn(move || {
+        let mut was_running = true;
+        while !observer_done.load(Ordering::Relaxed) {
+            let running = env_desired_running(&observer_registry, was_running);
+            if running != was_running {
+                if running {
+                    write_running_supervisor_runtime(
+                        &observer_runtime,
+                        &ocm_home,
+                        binding_kind,
+                        binding_name,
+                        4242,
+                        health_port,
+                    );
+                } else {
+                    observer_stopped.store(true, Ordering::SeqCst);
+                    write_empty_supervisor_runtime(&observer_runtime, &ocm_home);
+                }
+                observer_available.store(running, Ordering::SeqCst);
+                was_running = running;
+            }
+            sleep(Duration::from_millis(1));
+        }
+    });
+    let results = candidates
+        .into_iter()
+        .map(|(case, code, version)| {
+            let mut receipt = preflight_receipt_json(
+                if case.starts_with("unverified") {
+                    "unverified"
+                } else if case == "blocked" {
+                    "blocked"
+                } else {
+                    "ready"
+                },
+                &version,
+            );
+            match case {
+                "version-mismatch" => receipt["candidateVersion"] = serde_json::json!("2026.1.1"),
+                "coverage-mismatch" => receipt["coverage"] = serde_json::json!("complete-startup"),
+                "protocol-mismatch" => receipt["protocol"] = serde_json::json!(2),
+                "unverified-execution" => {
+                    receipt["candidateVersion"] = Value::Null;
+                    receipt.as_object_mut().unwrap().remove("phase");
+                }
+                _ => {}
+            }
+            fs::write(
+                &receipt_path,
+                if case == "invalid" {
+                    "not-json".into()
+                } else {
+                    receipt.to_string()
+                },
+            )
+            .unwrap();
+            env.insert("OCM_TEST_PREFLIGHT_EXIT".into(), code.to_string());
+            let output = if explicit {
+                run_ocm(
+                    &cwd,
+                    &env,
+                    &["upgrade", "demo", "--version", &version, "--json"],
+                )
+            } else {
+                run_ocm(&cwd, &env, &["upgrade", "demo", "--json"])
+            };
+            let invoked = observation.exists();
+            let observed = fs::read_to_string(&observation).ok();
+            if invoked {
+                fs::remove_file(&observation).unwrap();
+            }
+            (case, output, invoked, observed)
+        })
+        .collect::<Vec<_>>();
+    done.store(true, Ordering::Relaxed);
+    observer.join().unwrap();
+    let health_after = health_observation(health_server.port);
+    health_server.stop();
+    assert!(
+        !stopped.load(Ordering::SeqCst),
+        "source stopped before readiness was accepted"
+    );
+    assert_eq!(health_after, Some(true));
+    assert_eq!(fs::read(&registry_path).unwrap(), registry_before);
+    assert_eq!(fs::read(&paths.config_path).unwrap(), config_before);
+    assert_eq!(
+        fs::read_to_string(paths.workspace_dir.join("sentinel")).unwrap(),
+        "source data"
+    );
+    assert!(
+        !finalizer_started.exists(),
+        "cold finalization ran after preflight refusal"
+    );
+    for (case, output, invoked, observed) in results {
+        assert!(
+            !output.status.success(),
+            "{case}: unexpectedly accepted candidate"
+        );
+        let summary: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
+            panic!(
+                "{case}: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                stderr(&output)
+            )
+        });
+        assert_eq!(summary["outcome"], "failed", "{case}: {summary}");
+        assert!(summary["snapshotId"].is_null(), "{case}: {summary}");
+        assert_eq!(
+            invoked,
+            !matches!(case, "unsupported" | "package-version-mismatch"),
+            "{case}: {summary}",
+        );
+        if case == "unverified-execution" {
+            assert!(
+                summary["note"]
+                    .as_str()
+                    .unwrap()
+                    .contains("during execution")
+            );
+        }
+        if let Some(observed) = observed {
+            assert_preflight_observation(&observed, source_root, &environment);
+        }
+    }
+}
+
 #[test]
 fn upgrade_prepares_target_before_cutover_and_bounds_stop_to_ready() {
     let root = TestDir::new("upgrade-availability-ordering");
@@ -301,7 +705,7 @@ fn upgrade_prepares_target_before_cutover_and_bounds_stop_to_ready() {
         &old_tarball,
         8,
     );
-    let new_tarball = openclaw_package_tarball(&fixture_openclaw_script("2026.8.14"), "2026.8.14");
+    let new_tarball = preflight_package("2026.8.14", serde_json::json!(1));
     let new_integrity = sha512_integrity(&new_tarball);
     let (new_url, delayed_server) = delayed_bytes_server(
         "/openclaw-2026.8.14.tgz",
@@ -362,6 +766,9 @@ fn upgrade_prepares_target_before_cutover_and_bounds_stop_to_ready() {
     let env_show = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
     assert!(env_show.status.success(), "{}", stderr(&env_show));
     let env_json: Value = serde_json::from_slice(&env_show.stdout).unwrap();
+    let source_runtime = ocm::store::get_runtime("stable", &env, &cwd).unwrap();
+    let source_runtime = fs::canonicalize(&source_runtime.binary_path).unwrap();
+    let source_runtime = source_runtime.parent().unwrap().to_path_buf();
     let snapshot_fixture = PathBuf::from(env_json["root"].as_str().unwrap()).join("fanout");
     fs::create_dir_all(&snapshot_fixture).unwrap();
     for index in 0..2_000 {
@@ -412,6 +819,24 @@ fn upgrade_prepares_target_before_cutover_and_bounds_stop_to_ready() {
         env.insert(key.to_string(), value.to_string());
     }
 
+    let preflight_observation = root.child("preflight-observation");
+    let preflight_receipt = root.child("preflight-receipt.json");
+    fs::write(
+        &preflight_receipt,
+        preflight_receipt_json("ready", "2026.8.14").to_string(),
+    )
+    .unwrap();
+    env.insert(
+        "OCM_TEST_PREFLIGHT_OBSERVATION".into(),
+        path_string(&preflight_observation),
+    );
+    env.insert(
+        "OCM_TEST_PREFLIGHT_RECEIPT".into(),
+        path_string(&preflight_receipt),
+    );
+    // Even inherited cold-finalizer authority must be removed from the probe.
+    env.insert("OPENCLAW_UPDATE_POST_CORE".into(), "1".into());
+    env.insert("OPENCLAW_UPDATE_SKIP_RESTART".into(), "1".into());
     let runtime_path = supervisor_runtime_path(&env, &cwd).unwrap();
     let supervisor_lock_path = supervisor_state_path(&env, &cwd)
         .unwrap()
@@ -419,7 +844,14 @@ fn upgrade_prepares_target_before_cutover_and_bounds_stop_to_ready() {
     fs::create_dir_all(supervisor_lock_path.parent().unwrap()).unwrap();
     fs::create_dir_all(runtime_path.parent().unwrap()).unwrap();
     let ocm_home = env.get("OCM_HOME").unwrap().clone();
-    write_running_supervisor_runtime(&runtime_path, &ocm_home, "stable", 4242, health_server.port);
+    write_running_supervisor_runtime(
+        &runtime_path,
+        &ocm_home,
+        "runtime",
+        "stable",
+        4242,
+        health_server.port,
+    );
 
     let observer_done = Arc::new(AtomicBool::new(false));
     let observer_done_thread = Arc::clone(&observer_done);
@@ -442,6 +874,7 @@ fn upgrade_prepares_target_before_cutover_and_bounds_stop_to_ready() {
                     write_running_supervisor_runtime(
                         &observer_runtime_path,
                         &observer_ocm_home,
+                        "runtime",
                         "stable",
                         4243,
                         health_port,
@@ -520,6 +953,13 @@ fn upgrade_prepares_target_before_cutover_and_bounds_stop_to_ready() {
     health_server.stop();
 
     assert!(upgrade.status.success(), "{}", stderr(&upgrade));
+    // The source path is passed before publication, even though the named runtime
+    // now contains the candidate after the successful cutover.
+    assert_preflight_observation(
+        &fs::read_to_string(&preflight_observation).unwrap(),
+        &source_runtime,
+        &env_json,
+    );
     let prepare_released = timeline.at("target_prepare_released");
     let service_stopped = timeline.at("service_stopped");
     let finalization_started = timeline.at("finalization_started");

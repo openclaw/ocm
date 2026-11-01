@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 mod diagnostics;
+mod preflight;
 mod pull_request;
 pub(super) mod source;
 mod source_update;
@@ -151,16 +152,21 @@ impl<'a> UpgradeCommandLocks<'a> {
     }
 
     fn output(&self, mut command: Command) -> std::io::Result<std::process::Output> {
+        self.retain_for_child(&mut command);
+        command.output()
+    }
+
+    fn retain_for_child(&self, command: &mut Command) {
         if let Some(runtime) = &self.runtime {
-            runtime.retain_for_child(&mut command);
+            runtime.retain_for_child(command);
         }
         if let Some(source_runtime) = &self.source_runtime {
-            source_runtime.retain_for_child(&mut command);
+            source_runtime.retain_for_child(command);
         }
         if let Some(target_runtime) = &self.target_runtime {
-            target_runtime.retain_for_child(&mut command);
+            target_runtime.retain_for_child(command);
         }
-        self.environment.output(command)
+        self.environment.retain_for_child(command)
     }
 }
 
@@ -2967,6 +2973,23 @@ impl Cli {
                 return Ok(summary);
             }
         }
+        if let Err(error) = self.preflight_target_readiness(
+            env_name,
+            &prepared.meta,
+            &prepared.prepared_binary_path,
+            operation_lock,
+        ) {
+            return self.fail_upgrade_before_cutover(
+                env_name,
+                previous_binding_kind,
+                previous_binding_name,
+                "runtime",
+                target_runtime_name,
+                target_release_version,
+                target_channel,
+                error,
+            );
+        }
         let target_changed = !matches!(prepared.action, OfficialRuntimePrepareAction::Reused);
         let mut transaction = self.begin_upgrade_transaction_locked(
             env_name,
@@ -3351,6 +3374,23 @@ impl Cli {
                 summary.runtime_release_channel = target_channel;
                 return Ok(summary);
             }
+            if let Err(error) = self.preflight_target_readiness(
+                env_name,
+                &prepared.meta,
+                &prepared.prepared_binary_path,
+                operation_lock,
+            ) {
+                return self.fail_upgrade_before_cutover(
+                    env_name,
+                    "runtime",
+                    previous_binding_name,
+                    "runtime",
+                    target_runtime_name,
+                    target_release_version,
+                    target_channel,
+                    error,
+                );
+            }
             let changed = matches!(
                 prepared.action,
                 OfficialRuntimePrepareAction::Installed | OfficialRuntimePrepareAction::Updated
@@ -3656,6 +3696,23 @@ impl Cli {
             .with_runtime(Some(runtime_guard))
             .with_source_runtime(&current.name, &self.env, &self.cwd)?;
         let operation_lock = &command_locks;
+        if let Err(error) = self.preflight_target_readiness(
+            env_name,
+            prepared.meta(),
+            &prepared.prepared_binary_path(),
+            operation_lock,
+        ) {
+            return self.fail_upgrade_before_cutover(
+                env_name,
+                "runtime",
+                previous_binding_name,
+                "runtime",
+                current.name,
+                Some(target_version.clone()),
+                current.release_channel,
+                error,
+            );
+        }
         timings.finish(
             "ocm",
             "preparation",

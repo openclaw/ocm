@@ -281,6 +281,29 @@ pub(crate) fn read_private_config_command(
     }
 }
 
+/// Run a read-only upgrade probe through the existing bounded child owner.
+pub(crate) fn run_upgrade_preflight_command(
+    command: Command,
+    timeout: Duration,
+    operation_generation: u64,
+) -> Result<(ExitStatus, Vec<u8>), String> {
+    let interrupt = CaptureInterrupt::enter(operation_generation)?;
+    let output = run_captured_machine_command(
+        command,
+        timeout,
+        "upgrade readiness preflight",
+        Some(&interrupt),
+    )
+    .map_err(|error| {
+        if error.cleanup_verified {
+            "OpenClaw update preflight failed, timed out, or was interrupted".to_string()
+        } else {
+            error.detail
+        }
+    })?;
+    Ok((output.status, output.stdout))
+}
+
 fn run_captured_machine_command(
     mut command: Command,
     timeout: Duration,
@@ -298,6 +321,11 @@ fn run_captured_machine_command(
         .stderr(stderr_writer);
     #[cfg(unix)]
     command.process_group(0);
+    #[cfg(windows)]
+    let job = crate::infra::windows_child_job::ChildJob::create()
+        .map_err(|error| format!("failed creating restart-handoff process job: {error}"))?;
+    #[cfg(windows)]
+    job.configure_command(&mut command);
     if interrupt.is_some_and(CaptureInterrupt::interrupted) {
         return Err(
             "private configuration command was interrupted before startup"
@@ -314,13 +342,37 @@ fn run_captured_machine_command(
     // Command retains the parent-side writers even after spawn.
     drop(command);
     let deadline = Instant::now() + timeout;
-    let result = collect_command(&mut child, &mut stdout, &mut stderr, deadline, interrupt);
+    let result = (|| {
+        #[cfg(windows)]
+        {
+            job.assign_child(&child).map_err(|error| {
+                format!("failed assigning restart-handoff process job: {error}")
+            })?;
+            if interrupt.is_some_and(CaptureInterrupt::interrupted) {
+                return Err(
+                    "private configuration command was interrupted before startup".to_string(),
+                );
+            }
+            job.start_child(&child)
+                .map_err(|error| format!("failed starting restart-handoff process job: {error}"))?;
+        }
+        let status = collect_command(&mut child, &mut stdout, &mut stderr, deadline, interrupt)?;
+        // A successful root can leave descendants that closed both output pipes.
+        // Settle the owned tree before publishing captured output on Windows too.
+        #[cfg(windows)]
+        job.stop_remaining()
+            .map_err(|error| format!("failed settling restart-handoff process job: {error}"))?;
+        Ok(status)
+    })();
     match result {
         Ok(status) => Ok(CommandOutput {
             status,
             stdout: stdout.bytes,
         }),
         Err(detail) => {
+            #[cfg(windows)]
+            let cleanup_verified = terminate_command(&mut child, &mut stdout, &mut stderr, &job);
+            #[cfg(not(windows))]
             let cleanup_verified = terminate_command(&mut child, &mut stdout, &mut stderr);
             let detail = if cleanup_verified {
                 detail
@@ -468,7 +520,10 @@ fn terminate_command(
     child: &mut Child,
     stdout: &mut CommandCapture,
     stderr: &mut CommandCapture,
+    #[cfg(windows)] job: &crate::infra::windows_child_job::ChildJob,
 ) -> bool {
+    #[cfg(windows)]
+    let group_settled = job.stop_remaining().is_ok();
     #[cfg(unix)]
     {
         // The leader is still unreaped. Escalate even when it exited already:
@@ -498,7 +553,7 @@ fn terminate_command(
         #[cfg(unix)]
         let group_settled = (unsafe { libc::kill(-(child.id() as libc::pid_t), 0) }) == -1
             && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         let group_settled = true;
         if reaped && stdout.eof && stderr.eof && group_settled {
             // macOS can report EPERM for signals sent to a zombie group.
@@ -594,6 +649,93 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn machine_command_windows_settles_descendants_without_touching_control() {
+        struct OwnedChild(Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        // Reuse the real-Node fixture pattern from Windows runtime custody tests.
+        let mut control = OwnedChild(
+            Command::new("node")
+                .args(["-e", "setInterval(() => {}, 1000)"])
+                .env_remove("NODE_OPTIONS")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        for mode in ["inherit", "closed", "root-live"] {
+            let dir = tempfile::tempdir().unwrap();
+            let pid_path = dir.path().join("descendant.pid");
+            let mut command = Command::new("node");
+            command
+                .args([
+                    "-e",
+                    r#"
+const fs = require('node:fs');
+const {spawn} = require('node:child_process');
+const [pidPath, mode] = process.argv.slice(1);
+const child = spawn(process.execPath, ['-e', `
+  require('node:fs').writeFileSync(process.argv[1], String(process.pid));
+  setInterval(() => {}, 1000);
+`, '--', pidPath], {detached: true, stdio: mode === 'inherit' ? 'inherit' : 'ignore'});
+child.on('error', error => { throw error; });
+child.unref();
+const ready = setInterval(() => {
+  if (!fs.existsSync(pidPath)) return;
+  clearInterval(ready);
+  process.stdout.write('valid response', () => {
+    if (mode === 'root-live') setInterval(() => {}, 1000);
+    else process.exit(0);
+  });
+}, 5);
+"#,
+                    "--",
+                ])
+                .arg(&pid_path)
+                .arg(mode)
+                .env_remove("NODE_OPTIONS");
+            let started = Instant::now();
+            let result = run_captured_machine_command(
+                command,
+                Duration::from_secs(2),
+                "Windows capture fixture",
+                None,
+            );
+            assert!(started.elapsed() < Duration::from_secs(8), "{mode}");
+            if mode == "closed" {
+                let output = result.unwrap();
+                assert!(output.status.success());
+                assert_eq!(output.stdout, b"valid response");
+            } else {
+                let error = result.err().unwrap();
+                assert!(error.cleanup_verified, "{mode}: {}", error.detail);
+                assert!(error.detail.contains("timed out"), "{}", error.detail);
+            }
+            let pid = std::fs::read_to_string(pid_path)
+                .unwrap()
+                .parse::<u32>()
+                .unwrap();
+            assert!(
+                crate::infra::process_identity::observe_process(pid)
+                    .unwrap()
+                    .is_none_or(|process| !process.running),
+                "owned descendant is still running ({mode})"
+            );
+            assert!(
+                control.0.try_wait().unwrap().is_none(),
+                "control was stopped"
+            );
+        }
+    }
 
     fn direct_spec() -> SupervisorChildSpec {
         SupervisorChildSpec {

@@ -9,4 +9,4 @@ pub use resolution::{
 };
 pub(crate) use resolution::{parse_literal_launcher_command, resolve_direct_launcher_command};
 
-pub(crate) use source::{launcher_source_root, read_source_json};
+pub(crate) use source::{launcher_package_root, launcher_source_root, read_source_json};

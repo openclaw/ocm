@@ -415,6 +415,10 @@ does not sandbox repository code.
 - a selected runtime that changes before the clone switches fails the `prepare target` check instead of validating a different release; rerun the simulation to select the target again
 - `--scenario all` runs built-in current, clean minimum, and Telegram-configured env shapes as separate simulation clones
 - target runtime installation, checkpoint preflight, and runtime recovery preparation run while the current managed gateway remains available; preparation failure leaves it unchanged
+- prepared candidates declaring `package.json.openclaw.updatePreflightProtocol: 1` run native `update preflight --json --source-root <current-package-root> --timeout 300` before source shutdown, with source profile paths and no update or supervisor authority; OCM bounds capture to six minutes, allowing native cleanup after its five-minute timeout
+- OCM requires exit zero and a version-matched protocol-1 `ready` receipt with `isolated-core-startup` coverage; blocked, unverified, malformed, and unsupported advertised protocols fail preparation while the source remains running
+- native preflight rehearses core startup on an isolated copy and defers plugin downloads and convergence; it does not establish live model/provider, channel, or complete plugin readiness
+- packages without a preflight capability retain cold finalization and rollback; in-place source-checkout updates retain their existing path because their future candidate is not prepared before shutdown
 - a running managed gateway is stopped only for checkpoint capture, runtime publication, environment mutation, and finalization
 - new checkpoints capture the complete environment root; APFS clone support is used when available and a metadata-preserving full copy is the fallback
 - when an env moves to a new runtime, OCM runs OpenClaw's update finalization path cold before service restart
