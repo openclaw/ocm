@@ -18,7 +18,8 @@ fn find_executable(name: &str) -> Option<PathBuf> {
 fn bin_wrapper_runs_with_an_overridden_home() {
     let root = TestDir::new("bin-wrapper-home-override");
     let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let wrapper = repo_root.join("bin/ocm");
+    let fixture = root.child("fixture");
+    let wrapper = fixture.join("bin/ocm");
     let home = root.child("isolated-home");
     let ocm_home = root.child("ocm-home");
     let shim_bin = root.child("shim-bin");
@@ -26,6 +27,20 @@ fn bin_wrapper_runs_with_an_overridden_home() {
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&ocm_home).unwrap();
     std::fs::create_dir_all(&shim_bin).unwrap();
+    std::fs::create_dir_all(fixture.join("bin")).unwrap();
+    std::fs::create_dir_all(fixture.join("src")).unwrap();
+    std::fs::copy(repo_root.join("bin/ocm"), &wrapper).unwrap();
+    // Exercise the real wrapper and Cargo without rebuilding OCM's dependency tree.
+    std::fs::write(
+        fixture.join("Cargo.toml"),
+        "[package]\nname = \"wrapper-fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.join("src/main.rs"),
+        r#"fn main() { println!("wrapper fixture:{}", std::env::args().nth(1).unwrap_or_default()); }"#,
+    )
+    .unwrap();
 
     // Homebrew's rustup shell wrapper preserves its own command name, so
     // renaming it to cargo does not select Cargo proxy dispatch.
@@ -51,7 +66,7 @@ fn bin_wrapper_runs_with_an_overridden_home() {
     .unwrap();
 
     let mut command = Command::new(&wrapper);
-    command.current_dir(&repo_root);
+    command.current_dir(root.path());
     command.arg("help");
     command.env_clear();
     command.env("HOME", path_string(&home));
@@ -67,5 +82,5 @@ fn bin_wrapper_runs_with_an_overridden_home() {
         stdout(&output),
         stderr(&output)
     );
-    assert!(stdout(&output).contains("OpenClaw Manager"));
+    assert_eq!(stdout(&output), "wrapper fixture:help\n");
 }
