@@ -17,6 +17,8 @@ import sys
 import tempfile
 from urllib.parse import urlsplit
 
+from native_gateway_provider import ProviderFixture
+
 LABEL = "ai.openclaw.ocm"
 ENV_NAME = "native-gateway"
 
@@ -157,6 +159,7 @@ def main():
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
+    provider = ProviderFixture()
     install_attempted = False
     failure = None
     try:
@@ -169,15 +172,19 @@ def main():
         inventory = oc_json("plugin inventory", "@" + ENV_NAME, "--", "plugins", "list")
         assert inventory["plugins"]
         assert not [item["id"] for item in inventory["plugins"] if item.get("status") == "error"]
+        details = oc_json("provider environment", "env", "show", ENV_NAME)
+        provider.configure(Path(details["configPath"]))
         # Package installation awaited network work; recheck native custody at the effect.
         preflight()
         install_attempted = True
         assert oc_json("service install", "service", "install", ENV_NAME)["installed"]
         assert oc_json("service start", "service", "start", ENV_NAME)["gatewayReady"] is True
         before = healthy("authenticated health")
+        provider.check(oc_json, ENV_NAME, "before restart")
         assert oc_json("service restart", "service", "restart", ENV_NAME)["gatewayReady"] is True
         after = healthy("authenticated health after restart")
         assert after["childPid"] != before["childPid"] and not exists(before["childPid"])
+        provider.check(oc_json, ENV_NAME, "after restart")
         stopped = oc_json("service stop", "service", "stop", ENV_NAME)
         assert not stopped["running"] and not stopped["desiredRunning"]
         status = oc_json("stopped status", "service", "status", ENV_NAME)
@@ -190,20 +197,23 @@ def main():
         failure = error
         raise
     finally:
-        if install_attempted:
-            try:
-                observed = owned_job()
-                if observed and observed.get("pid"):
-                    pids.add(int(observed["pid"]))
-                assert not oc_json("service uninstall", "service", "uninstall", ENV_NAME)["installed"]
-                assert oc_json("uninstalled environment policy", "env", "show", ENV_NAME)["serviceEnabled"] is False
-                assert job() is None and not definition.exists() and not definition.is_symlink()
-                assert all(not exists(pid) for pid in pids)
-            except BaseException as error:
-                print("native cleanup failed; retain isolated state:", root, file=sys.stderr)
-                if failure is None:
-                    raise
-                print(type(error).__name__ + ": " + str(error), file=sys.stderr)
+        try:
+            if install_attempted:
+                try:
+                    observed = owned_job()
+                    if observed and observed.get("pid"):
+                        pids.add(int(observed["pid"]))
+                    assert not oc_json("service uninstall", "service", "uninstall", ENV_NAME)["installed"]
+                    assert oc_json("uninstalled environment policy", "env", "show", ENV_NAME)["serviceEnabled"] is False
+                    assert job() is None and not definition.exists() and not definition.is_symlink()
+                    assert all(not exists(pid) for pid in pids)
+                except BaseException as error:
+                    print("native cleanup failed; retain isolated state:", root, file=sys.stderr)
+                    if failure is None:
+                        raise
+                    print(type(error).__name__ + ": " + str(error), file=sys.stderr)
+        finally:
+            provider.close()
     # launchctl's task-created enabled override remains on this disposable user.
     shutil.rmtree(root)
     print("PASS: published Gateway lifecycle and native launchd cleanup", flush=True)
