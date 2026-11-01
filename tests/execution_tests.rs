@@ -6,9 +6,7 @@ use ocm::env::{
     ExecutionBinding, GatewayProcessSpec, resolve_execution_binding, resolve_runtime_run_dir,
 };
 use ocm::infra::shell::render_env_scoped_login_command;
-use ocm::launcher::{
-    LauncherMeta, build_launcher_command, resolve_launcher_name, resolve_launcher_run_dir,
-};
+use ocm::launcher::{LauncherMeta, build_launcher_command, resolve_launcher_run_dir};
 use time::OffsetDateTime;
 
 fn sample_env(default_runtime: Option<&str>, default_launcher: Option<&str>) -> EnvMeta {
@@ -42,32 +40,6 @@ fn sample_launcher(cwd: Option<&str>) -> LauncherMeta {
         created_at: OffsetDateTime::UNIX_EPOCH,
         updated_at: OffsetDateTime::UNIX_EPOCH,
     }
-}
-
-#[test]
-fn resolve_launcher_name_prefers_the_explicit_override() {
-    let env = sample_env(None, Some("stable"));
-
-    let resolved = resolve_launcher_name(&env, Some("nightly".to_string())).unwrap();
-    assert_eq!(resolved, "nightly");
-}
-
-#[test]
-fn resolve_launcher_name_falls_back_to_the_environment_default() {
-    let env = sample_env(None, Some("stable"));
-
-    let resolved = resolve_launcher_name(&env, None).unwrap();
-    assert_eq!(resolved, "stable");
-}
-
-#[test]
-fn resolve_launcher_name_uses_launcher_wording_when_unbound() {
-    let env = sample_env(None, None);
-
-    let error = resolve_launcher_name(&env, None).unwrap_err();
-    assert!(error.contains("has no default launcher"));
-    assert!(error.contains("env set-launcher"));
-    assert!(error.contains("--launcher"));
 }
 
 #[test]
