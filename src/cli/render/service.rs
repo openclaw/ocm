@@ -1,4 +1,4 @@
-use super::RenderProfile;
+use super::{RenderProfile, optional_value_row};
 use crate::infra::terminal::{
     Cell, KeyValueRow, Tone, paint, render_key_value_card, render_table, terminal_width,
 };
@@ -73,13 +73,6 @@ fn state_tone(state: &str) -> Tone {
         "pending" | "starting" | "loaded" | "installed" | "backoff" | "restarting" => Tone::Warning,
         "stopped" | "disabled" | "absent" => Tone::Muted,
         _ => Tone::Plain,
-    }
-}
-
-fn optional_value_row(label: &str, value: Option<String>) -> KeyValueRow {
-    match value {
-        Some(value) => KeyValueRow::plain(label, value),
-        None => KeyValueRow::muted(label, "—"),
     }
 }
 

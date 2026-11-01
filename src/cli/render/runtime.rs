@@ -1,14 +1,12 @@
 use std::collections::BTreeMap;
 
-use crate::infra::terminal::{
-    Cell, KeyValueRow, Tone, paint, render_key_value_card, render_table, terminal_width,
-};
+use crate::infra::terminal::{Cell, KeyValueRow, Tone, paint, render_table, terminal_width};
 use crate::runtime::{
     RuntimeBinarySummary, RuntimeMeta, RuntimeRelease, RuntimeReleaseSelectorKind,
     RuntimeSourceKind, RuntimeUpdateBatchSummary, RuntimeVerifySummary,
 };
 
-use super::{RenderProfile, format_key_value_lines, format_rfc3339};
+use super::{RenderProfile, format_key_value_lines, format_rfc3339, push_card};
 
 pub fn runtime_added(
     meta: &RuntimeMeta,
@@ -380,16 +378,6 @@ fn runtime_show_raw(meta: &RuntimeMeta) -> Result<Vec<String>, String> {
         );
     }
     Ok(format_key_value_lines(lines))
-}
-
-fn push_card(lines: &mut Vec<String>, title: &str, rows: Vec<KeyValueRow>, color: bool) {
-    if rows.is_empty() {
-        return;
-    }
-    if !lines.is_empty() {
-        lines.push(String::new());
-    }
-    lines.extend(render_key_value_card(title, &rows, color));
 }
 
 fn source_label(source_kind: &RuntimeSourceKind) -> &'static str {
