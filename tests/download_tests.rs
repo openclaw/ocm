@@ -27,18 +27,22 @@ fn artifact_file_name_from_url_requires_a_file_name() {
 }
 
 #[test]
-fn download_to_file_fetches_the_http_response_body() {
+fn download_to_file_persists_repeated_http_response_bodies() {
     let root = TestDir::new("download-helper-success");
     let destination = root.child("downloads/openclaw");
-    let server = TestHttpServer::serve_bytes(
+    let second_destination = root.child("downloads/openclaw-second");
+    let server = TestHttpServer::serve_bytes_times(
         "/artifacts/openclaw",
         "application/octet-stream",
         b"openclaw-binary",
+        2,
     );
 
     download_to_file(&server.url(), &destination).unwrap();
+    download_to_file(&server.url(), &second_destination).unwrap();
 
     assert_eq!(fs::read(&destination).unwrap(), b"openclaw-binary");
+    assert_eq!(fs::read(&second_destination).unwrap(), b"openclaw-binary");
 }
 
 #[test]
@@ -55,25 +59,6 @@ fn download_to_file_reports_http_errors() {
 
     assert!(error.contains("failed to download runtime URL"));
     assert!(error.contains("404"));
-}
-
-#[test]
-fn download_to_file_can_reuse_a_repeatable_server() {
-    let root = TestDir::new("download-helper-repeatable");
-    let first_destination = root.child("downloads/openclaw-first");
-    let second_destination = root.child("downloads/openclaw-second");
-    let server = TestHttpServer::serve_bytes_times(
-        "/artifacts/openclaw",
-        "application/octet-stream",
-        b"openclaw-binary",
-        2,
-    );
-
-    download_to_file(&server.url(), &first_destination).unwrap();
-    download_to_file(&server.url(), &second_destination).unwrap();
-
-    assert_eq!(fs::read(&first_destination).unwrap(), b"openclaw-binary");
-    assert_eq!(fs::read(&second_destination).unwrap(), b"openclaw-binary");
 }
 
 #[test]
