@@ -17,9 +17,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 mod diagnostics;
+mod pull_request;
 pub(super) mod source;
 mod source_update;
 use diagnostics::{CandidateFailure, CandidateFailureKind};
+use pull_request::{PreparedPullRequest, PullRequestIdentity};
 
 use super::{Cli, render};
 use crate::env::{
@@ -358,6 +360,8 @@ pub(crate) struct UpgradeSimulationSummary {
     pub to_binding_kind: String,
     pub to_binding_name: String,
     pub to: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<PullRequestIdentity>,
     pub outcome: String,
     pub checks: Vec<UpgradeSimulationCheck>,
     pub cleanup_command: String,
@@ -370,6 +374,8 @@ pub(crate) struct UpgradeSimulationSummary {
 pub(crate) struct UpgradeSimulationBatchSummary {
     pub source_env: String,
     pub to: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<PullRequestIdentity>,
     pub count: usize,
     pub passed: usize,
     pub failed: usize,
@@ -398,7 +404,7 @@ struct ResolvedUpgradeTarget {
     named_runtime_guard: Option<Arc<RuntimeBindingGuard>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 enum UpgradeSimulationTarget {
     Official {
         target: UpgradeTarget,
@@ -408,6 +414,7 @@ enum UpgradeSimulationTarget {
         repo_root: PathBuf,
         display: String,
     },
+    PullRequest(PreparedPullRequest),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1957,7 +1964,7 @@ impl Cli {
         };
         let (args, to) = Self::consume_option(args, "--to")?;
         let to = Self::require_option_value(to, "--to")?.ok_or_else(|| {
-            "upgrade simulate requires --to <version|channel|repo-path>".to_string()
+            "upgrade simulate requires --to <version|channel|repo-path|owner/repo#PR>".to_string()
         })?;
         let (args, scenario) = Self::consume_option(args, "--scenario")?;
         let scenario = Self::require_option_value(scenario, "--scenario")?;
@@ -2092,7 +2099,10 @@ impl Cli {
                 }
             }
 
-            if matches!(target, UpgradeSimulationTarget::LocalRepo { .. }) {
+            if matches!(
+                target,
+                UpgradeSimulationTarget::LocalRepo { .. } | UpgradeSimulationTarget::PullRequest(_)
+            ) {
                 for (name, script) in [("pnpm build", "build"), ("pnpm ui:build", "ui:build")] {
                     if interrupt_fence.requested() {
                         break 'checks;
@@ -2135,7 +2145,7 @@ impl Cli {
             to_binding_kind,
             to_binding_name,
             scenario,
-            target.display(),
+            target,
             checks,
         );
         self.finish_simulation_summary(summary, &cloned, options)
@@ -2200,6 +2210,9 @@ impl Cli {
                 repo_root,
             });
         }
+        if let Some(target) = PreparedPullRequest::resolve(to, &self.env, &self.cwd)? {
+            return Ok(UpgradeSimulationTarget::PullRequest(target));
+        }
 
         let trimmed = to.trim();
         if matches!(trimmed, "stable" | "latest" | "beta" | "dev") {
@@ -2261,7 +2274,7 @@ impl Cli {
     ) -> Result<(String, String, String), String> {
         let (mut meta, lock) = self.environment_service().lock_simulation(simulation)?;
         let simulation_name = &simulation.name;
-        match target {
+        let repo_root = match target {
             UpgradeSimulationTarget::Official { .. } => {
                 let prepared_runtime = prepared_runtime.ok_or_else(|| {
                     "simulation target runtime was not prepared before scenario execution"
@@ -2282,44 +2295,41 @@ impl Cli {
                 }
                 self.environment_service()
                     .set_runtime_locked(simulation_name, &prepared_runtime.name)?;
-                Ok((
+                return Ok((
                     "runtime".to_string(),
                     prepared_runtime.name.clone(),
                     prepared_runtime.note.clone(),
-                ))
+                ));
             }
-            UpgradeSimulationTarget::LocalRepo { repo_root, .. } => {
-                meta.default_runtime = None;
-                meta.default_launcher = None;
-                let mut meta = with_prepared_dev_source(
-                    repo_root,
-                    simulation_name,
-                    &self.env,
-                    &self.cwd,
-                    |dev, registration| {
-                        meta.dev = Some(dev);
-                        save_environment_with_dev_registration(
-                            meta,
-                            registration,
-                            &self.env,
-                            &self.cwd,
-                        )
-                    },
-                )?;
-                meta = self
-                    .environment_service()
-                    .apply_effective_gateway_port(meta)?;
-                self.prepare_minimum_local_config(&meta, meta.gateway_port.unwrap_or_default())?
-                    .apply()?;
-                drop(lock);
-                self.ensure_simulation_dev_dependencies(&meta)?;
-                Ok((
-                    "dev".to_string(),
-                    "local-repo".to_string(),
-                    format!("prepared local repo {}", display_path(repo_root)),
-                ))
+            UpgradeSimulationTarget::LocalRepo { repo_root, .. } => repo_root.clone(),
+            UpgradeSimulationTarget::PullRequest(prepared) => {
+                prepared.materialize(Path::new(&meta.root))?
             }
-        }
+        };
+        meta.default_runtime = None;
+        meta.default_launcher = None;
+        let mut meta = with_prepared_dev_source(
+            &repo_root,
+            simulation_name,
+            &self.env,
+            &self.cwd,
+            |dev, registration| {
+                meta.dev = Some(dev);
+                save_environment_with_dev_registration(meta, registration, &self.env, &self.cwd)
+            },
+        )?;
+        meta = self
+            .environment_service()
+            .apply_effective_gateway_port(meta)?;
+        self.prepare_minimum_local_config(&meta, meta.gateway_port.unwrap_or_default())?
+            .apply()?;
+        drop(lock);
+        self.ensure_simulation_dev_dependencies(&meta)?;
+        Ok((
+            "dev".to_string(),
+            "local-repo".to_string(),
+            format!("prepared local repo {}", display_path(&repo_root)),
+        ))
     }
 
     fn prepare_shared_simulation_runtime(
@@ -2673,7 +2683,7 @@ impl Cli {
         to_binding_kind: String,
         to_binding_name: String,
         scenario: UpgradeSimulationScenario,
-        to: String,
+        target: &UpgradeSimulationTarget,
         checks: Vec<UpgradeSimulationCheck>,
     ) -> UpgradeSimulationSummary {
         let failed = checks.iter().any(|check| check.status == "failed");
@@ -2685,7 +2695,11 @@ impl Cli {
             from_binding_name,
             to_binding_kind,
             to_binding_name,
-            to,
+            to: target.display(),
+            pull_request: match target {
+                UpgradeSimulationTarget::PullRequest(prepared) => Some(prepared.identity.clone()),
+                _ => None,
+            },
             outcome: if failed { "failed" } else { "passed" }.to_string(),
             cleanup_command: format!(
                 "{} env destroy {} --yes",
@@ -5969,6 +5983,10 @@ impl UpgradeSimulationTarget {
     fn display(&self) -> String {
         match self {
             Self::Official { display, .. } | Self::LocalRepo { display, .. } => display.clone(),
+            Self::PullRequest(prepared) => format!(
+                "{}#{}@{}",
+                prepared.identity.repository, prepared.identity.number, prepared.identity.head_sha
+            ),
         }
     }
 
@@ -5991,7 +6009,7 @@ impl UpgradeSimulationTarget {
                 }
                 Some(args)
             }
-            Self::LocalRepo { .. } => None,
+            Self::LocalRepo { .. } | Self::PullRequest(_) => None,
         }
     }
 }
@@ -6301,6 +6319,9 @@ fn build_simulation_batch_summary(
     UpgradeSimulationBatchSummary {
         source_env,
         to,
+        pull_request: summaries
+            .first()
+            .and_then(|summary| summary.pull_request.clone()),
         count: summaries.len(),
         passed: summaries.len().saturating_sub(failed),
         failed,
@@ -7076,6 +7097,7 @@ mod tests {
             to_binding_kind: "runtime".to_string(),
             to_binding_name: "to".to_string(),
             to: "target".to_string(),
+            pull_request: None,
             outcome: outcome.to_string(),
             checks: Vec::new(),
             cleanup_command: "ocm env destroy simulation --yes".to_string(),

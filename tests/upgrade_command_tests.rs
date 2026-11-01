@@ -4570,6 +4570,216 @@ fn upgrade_simulate_all_scenarios_reports_plugin_specific_failures() {
 }
 
 #[test]
+#[cfg(unix)]
+fn upgrade_simulate_pins_pull_request_targets_and_owns_their_checkouts() {
+    for (target, keep) in [
+        ("example/openclaw#123", false),
+        ("https://github.com/example/openclaw/pull/123", true),
+    ] {
+        let root = TestDir::new("upgrade-simulate-pr");
+        let repo = init_openclaw_repo(&root);
+        let head = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(head.status.success());
+        let head = String::from_utf8(head.stdout).unwrap().trim().to_string();
+        let mut env = simulation_pull_request_fixture(&root, &repo, &head);
+        let releases = TestHttpServer::serve_bytes_times(
+            "/openclaw",
+            "application/json",
+            br#"{"dist-tags":{},"versions":{}}"#,
+            1,
+        );
+        env.insert("OCM_INTERNAL_OPENCLAW_RELEASES_URL".into(), releases.url());
+        let build_log = root.child("built-head");
+        env.insert("OCM_TEST_PR_BUILD_HEAD".into(), path_string(&build_log));
+        let pnpm = root.child("fake-sim-bin/pnpm");
+        let original = fs::read_to_string(&pnpm).unwrap();
+        write_executable_script(
+            &pnpm,
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = build ]; then git rev-parse HEAD > \"$OCM_TEST_PR_BUILD_HEAD\"; fi\n{original}"
+            ),
+        );
+        let created = run_ocm(root.path(), &env, &["env", "create", "demo"]);
+        assert!(created.status.success(), "{}", stderr(&created));
+        let source = run_ocm(root.path(), &env, &["env", "show", "demo", "--json"]);
+        assert!(source.status.success(), "{}", stderr(&source));
+        let mut args = vec!["upgrade", "simulate", "demo", "--to", target, "--json"];
+        if keep {
+            args.push("--keep-simulations");
+            args.extend(["--scenario", "all"]);
+        }
+        let simulation = run_ocm(root.path(), &env, &args);
+        assert!(
+            simulation.status.success(),
+            "{} {}",
+            stdout(&simulation),
+            stderr(&simulation)
+        );
+        let json: Value = serde_json::from_str(&stdout(&simulation)).unwrap();
+        assert_eq!(json["pullRequest"]["repository"], "example/openclaw");
+        assert_eq!(json["pullRequest"]["number"], 123);
+        assert_eq!(json["pullRequest"]["headSha"], head);
+        assert_eq!(
+            json["pullRequest"]["url"],
+            "https://github.com/example/openclaw/pull/123"
+        );
+        assert_eq!(fs::read_to_string(&build_log).unwrap().trim(), head);
+        let after = run_ocm(root.path(), &env, &["env", "show", "demo", "--json"]);
+        assert_eq!(stdout(&source), stdout(&after));
+        let results = match json["results"].as_array() {
+            Some(results) => results.iter().collect::<Vec<_>>(),
+            None => vec![&json],
+        };
+        assert_eq!(results.len(), if keep { 3 } else { 1 });
+        for result in results {
+            assert_eq!(result["outcome"], "passed");
+            assert_eq!(result["pullRequest"], json["pullRequest"]);
+            let name = result["simulationEnv"].as_str().unwrap();
+            if keep {
+                assert_eq!(result["cleanup"], "kept");
+                let kept = run_ocm(root.path(), &env, &["env", "show", name, "--json"]);
+                assert!(kept.status.success(), "{}", stderr(&kept));
+                let kept: Value = serde_json::from_str(&stdout(&kept)).unwrap();
+                let env_root = PathBuf::from(kept["root"].as_str().unwrap());
+                let repo_root = PathBuf::from(kept["devRepoRoot"].as_str().unwrap());
+                assert!(repo_root.starts_with(&env_root));
+                let git = Command::new("git")
+                    .arg("-C")
+                    .arg(&repo_root)
+                    .args(["fsck", "--full"])
+                    .output()
+                    .unwrap();
+                assert!(git.status.success(), "{:?}", git);
+                // Kept simulations preserve build artifacts; ordinary dev
+                // destruction requires the operator to remove those first.
+                let worktree = PathBuf::from(kept["devWorktreeRoot"].as_str().unwrap());
+                for output in [".artifacts", "dist", "dist-runtime", "packages/demo/dist"] {
+                    fs::remove_dir_all(worktree.join(output)).unwrap();
+                }
+                let removed = run_ocm(root.path(), &env, &["env", "destroy", name, "--yes"]);
+                assert!(removed.status.success(), "{}", stderr(&removed));
+                assert!(!env_root.exists());
+            } else {
+                assert_eq!(result["cleanup"], "cleaned");
+            }
+        }
+        let envs = run_ocm(root.path(), &env, &["env", "list", "--json"]);
+        let envs: Value = serde_json::from_str(&stdout(&envs)).unwrap();
+        assert_eq!(envs.as_array().unwrap().len(), 1);
+        assert_eq!(envs[0]["name"], "demo");
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn upgrade_simulate_refuses_changed_or_unavailable_pull_requests_before_cloning() {
+    for mode in ["ref-changed", "metadata-changed", "unavailable"] {
+        let root = TestDir::new("upgrade-simulate-pr-refused");
+        let repo = init_openclaw_repo(&root);
+        let mut env = simulation_pull_request_fixture(&root, &repo, &"0".repeat(40));
+        if mode == "unavailable" {
+            env.insert("OCM_TEST_PR_UNAVAILABLE".into(), "1".into());
+        }
+        if mode == "metadata-changed" {
+            let head = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap();
+            assert!(head.status.success());
+            env.insert(
+                "OCM_TEST_PR_HEAD".into(),
+                String::from_utf8(head.stdout).unwrap().trim().into(),
+            );
+            env.insert("OCM_TEST_PR_CHANGE_AFTER_FETCH".into(), "1".into());
+        }
+        let created = run_ocm(root.path(), &env, &["env", "create", "demo"]);
+        assert!(created.status.success(), "{}", stderr(&created));
+        let result = run_ocm(
+            root.path(),
+            &env,
+            &[
+                "upgrade",
+                "simulate",
+                "demo",
+                "--to",
+                "example/openclaw#123",
+                "--json",
+            ],
+        );
+        assert!(!result.status.success(), "{}", stdout(&result));
+        let error = stderr(&result);
+        assert!(
+            error.contains(if mode == "unavailable" {
+                "resolve GitHub PR"
+            } else {
+                "changed"
+            }),
+            "{error}"
+        );
+        let envs = run_ocm(root.path(), &env, &["env", "list", "--json"]);
+        let envs: Value = serde_json::from_str(&stdout(&envs)).unwrap();
+        assert_eq!(envs.as_array().unwrap().len(), 1);
+        assert_eq!(envs[0]["name"], "demo");
+    }
+}
+
+#[cfg(unix)]
+fn simulation_pull_request_fixture(
+    root: &TestDir,
+    repo: &Path,
+    head: &str,
+) -> BTreeMap<String, String> {
+    let reference = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["update-ref", "refs/pull/123/head", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(reference.status.success());
+    let mut env = ocm_env(root);
+    install_fake_node_and_npm(root, &mut env, "22.22.3");
+    install_fake_simulation_pnpm(root, &mut env);
+    env.insert("OCM_TEST_SIMULATION_DOCTOR_OK".into(), "1".into());
+    env.insert("OCM_TEST_PR_HEAD".into(), head.into());
+    env.insert(
+        "OCM_TEST_PR_QUERIES".into(),
+        path_string(&root.child("gh-queries")),
+    );
+    env.insert("GIT_CONFIG_COUNT".into(), "1".into());
+    env.insert(
+        "GIT_CONFIG_KEY_0".into(),
+        format!(
+            "url.{}.insteadOf",
+            url::Url::from_directory_path(repo).unwrap()
+        ),
+    );
+    env.insert(
+        "GIT_CONFIG_VALUE_0".into(),
+        "https://github.com/example/openclaw.git".into(),
+    );
+    write_executable_script(
+        &root.child("fake-sim-bin/gh"),
+        r#"#!/bin/sh
+if [ -n "${OCM_TEST_PR_UNAVAILABLE:-}" ]; then exit 1; fi
+if [ -n "${OCM_TEST_PR_CHANGE_AFTER_FETCH:-}" ] && [ -e "$OCM_TEST_PR_QUERIES" ]; then
+  printf '{"number":123,"headRefOid":"0000000000000000000000000000000000000000"}\n'
+  exit 0
+fi
+touch "$OCM_TEST_PR_QUERIES"
+printf '{"number":123,"headRefOid":"%s"}\n' "$OCM_TEST_PR_HEAD"
+"#,
+    );
+    env
+}
+
+#[test]
 fn upgrade_simulate_reports_local_repo_doctor_failures() {
     let root = TestDir::new("upgrade-simulate-local-repo");
     let cwd = root.child("workspace");

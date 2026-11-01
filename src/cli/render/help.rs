@@ -629,7 +629,7 @@ pub fn upgrade_help(cmd: &str) -> String {
                 "{cmd} upgrade rollback <env> [--transaction <id>] [--dry-run] [--raw] [--json]"
             ),
             format!(
-                "{cmd} upgrade simulate <env> --to <version|channel|repo-path> [--scenario current|minimum|telegram|all] [--keep-simulations] [--raw] [--json]"
+                "{cmd} upgrade simulate <env> --to <version|channel|repo-path|owner/repo#PR> [--scenario current|minimum|telegram|all] [--keep-simulations] [--raw] [--json]"
             ),
             format!(
                 "{cmd} upgrade <env> [--version <version> | --channel <channel> | --runtime <runtime>] [--dry-run] [--no-rollback] [--raw] [--json]"
@@ -700,6 +700,7 @@ pub fn upgrade_help(cmd: &str) -> String {
             format!("{cmd} upgrade simulate mira --to 2026.4.20 --scenario all"),
             format!("{cmd} upgrade simulate mira --to beta --scenario all"),
             format!("{cmd} upgrade simulate mira --to ./openclaw"),
+            format!("{cmd} upgrade simulate mira --to 'openclaw/openclaw#123'"),
             format!("{cmd} upgrade mira"),
             format!("{cmd} upgrade mira --channel beta"),
             format!("{cmd} upgrade mira --version 2026.3.24"),

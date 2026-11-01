@@ -456,6 +456,7 @@ impl DevSourceRegistration {
     }
 }
 
+/// The caller holds `name`'s environment operation lock through publication.
 pub(crate) fn with_prepared_dev_source<T>(
     repo: &Path,
     name: &str,
@@ -468,8 +469,13 @@ pub(crate) fn with_prepared_dev_source<T>(
         repo_root: display_path(repo),
         worktree_root: display_path(&default_worktree_root(repo, &name)),
     };
-    let mut registration =
-        DevSourceRegistration::lock_source(&dev, &list_environments(env, cwd)?, env, cwd)?;
+    let mut registration = DevSourceRegistration::lock_source_holding(
+        &name,
+        &dev,
+        &list_environments(env, cwd)?,
+        env,
+        cwd,
+    )?;
     with_locked_environments(env, cwd, |envs| registration.recheck_source(&dev, envs))?;
     let worktree = ensure_openclaw_worktree(repo, &name)?;
     let result = registration
