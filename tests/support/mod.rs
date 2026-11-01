@@ -799,6 +799,15 @@ fn append_tar_file(
 }
 
 pub fn openclaw_package_tarball(script_body: &str, version: &str) -> Vec<u8> {
+    openclaw_package_tarball_with_manifest(
+        script_body,
+        &format!(
+            "{{\"name\":\"openclaw\",\"version\":\"{version}\",\"bin\":{{\"openclaw\":\"openclaw.mjs\"}}}}"
+        ),
+    )
+}
+
+pub fn openclaw_package_tarball_with_manifest(script_body: &str, manifest: &str) -> Vec<u8> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     {
         let mut builder = Builder::new(&mut encoder);
@@ -811,10 +820,7 @@ pub fn openclaw_package_tarball(script_body: &str, version: &str) -> Vec<u8> {
         append_tar_file(
             &mut builder,
             "package/package.json",
-            format!(
-                "{{\"name\":\"openclaw\",\"version\":\"{version}\",\"bin\":{{\"openclaw\":\"openclaw.mjs\"}}}}"
-            )
-            .as_bytes(),
+            manifest.as_bytes(),
             0o644,
         );
         builder.finish().unwrap();

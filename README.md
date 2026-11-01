@@ -311,6 +311,18 @@ checkpoint and previous runtime as the coherent rollback state. A running
 managed service is considered recovered only
 after its HTTP health endpoint responds and OpenClaw's gateway status proves the
 gateway is reachable; otherwise the upgrade follows the normal rollback path.
+
+Prepared candidates advertising `package.json.openclaw.updatePreflightProtocol: 1`
+run native `update preflight` before OCM stops the source gateway. OCM requires a
+matching version-1 `ready` receipt covering `isolated-core-startup`; blocked,
+unverified, malformed, or unsupported-protocol results leave the source running.
+This rehearses core startup on an isolated copy, without update or service
+authority. Plugin downloads and convergence remain deferred; it does not prove
+live model/provider calls, channel connectivity, or complete plugin behavior.
+Packages without this capability retain cold
+finalization and rollback. In-place source-checkout updates do not have a
+prepared future candidate and retain their existing upgrade path.
+
 By default, checkpoints preserve the complete environment root, including credentials,
 browser profiles, plugin payloads, unknown future directories, modes, symlinks,
 and SQLite sidecars. OCM verifies tree contents and SQLite integrity before

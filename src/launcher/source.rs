@@ -5,6 +5,14 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 pub(crate) fn launcher_source_root(launcher: &LauncherMeta) -> Option<PathBuf> {
+    let root = launcher_package_root(launcher)?;
+    let runner = fs::canonicalize(root.join("scripts/run-node.mjs")).ok()?;
+    (runner.starts_with(&root) && runner.is_file()).then_some(root)
+}
+
+/// Identify the package behind a literal native OpenClaw launcher, including an
+/// installed package that does not contain the development checkout runner.
+pub(crate) fn launcher_package_root(launcher: &LauncherMeta) -> Option<PathBuf> {
     let cwd = launcher.cwd.as_deref().map(Path::new);
     let words = super::parse_literal_launcher_command(&launcher.command)?;
     let (program, args) = words.split_first()?;
@@ -36,8 +44,7 @@ pub(crate) fn launcher_source_root(launcher: &LauncherMeta) -> Option<PathBuf> {
     {
         return None;
     }
-    let runner = fs::canonicalize(root.join("scripts/run-node.mjs")).ok()?;
-    (runner.starts_with(&root) && runner.is_file()).then_some(root)
+    Some(root)
 }
 
 pub(crate) fn read_source_json(root: &Path, relative: &str, limit: u64) -> Result<Value, String> {

@@ -17,8 +17,6 @@ use std::time::{Duration, Instant};
 use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(unix)]
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
-#[cfg(windows)]
-use std::os::windows::{io::AsRawHandle, process::CommandExt as _};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -3419,7 +3417,7 @@ struct SourceWatchProcessGuard {
     #[cfg(unix)]
     dependency_install: bool,
     #[cfg(windows)]
-    job: windows_sys::Win32::Foundation::HANDLE,
+    job: crate::infra::windows_child_job::ChildJob,
 }
 
 #[cfg(unix)]
@@ -3468,38 +3466,8 @@ impl SourceWatchProcessGuard {
         }
         #[cfg(windows)]
         {
-            use windows_sys::Win32::System::JobObjects::{
-                CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-                JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-                SetInformationJobObject,
-            };
-
-            let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-            if job.is_null() {
-                return Err(format!(
-                    "failed creating source watch process job: {}",
-                    io::Error::last_os_error()
-                ));
-            }
-            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            let configured = unsafe {
-                SetInformationJobObject(
-                    job,
-                    JobObjectExtendedLimitInformation,
-                    std::ptr::from_ref(&info).cast(),
-                    std::mem::size_of_val(&info) as u32,
-                )
-            };
-            if configured == 0 {
-                unsafe {
-                    windows_sys::Win32::Foundation::CloseHandle(job);
-                }
-                return Err(format!(
-                    "failed configuring source watch process job: {}",
-                    io::Error::last_os_error()
-                ));
-            }
+            let job = crate::infra::windows_child_job::ChildJob::create()
+                .map_err(|error| format!("failed creating source watch process job: {error}"))?;
             Ok(Self { job })
         }
         #[cfg(not(any(unix, windows)))]
@@ -3528,7 +3496,7 @@ impl SourceWatchProcessGuard {
         }
         #[cfg(windows)]
         {
-            command.creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
+            self.job.configure_command(command);
         }
         #[cfg(not(any(unix, windows)))]
         let _ = command;
@@ -3537,20 +3505,9 @@ impl SourceWatchProcessGuard {
 
     fn assign_child(&self, child: &std::process::Child) -> Result<(), String> {
         #[cfg(windows)]
-        {
-            let assigned = unsafe {
-                windows_sys::Win32::System::JobObjects::AssignProcessToJobObject(
-                    self.job,
-                    child.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
-                )
-            };
-            if assigned == 0 {
-                return Err(format!(
-                    "failed assigning source watch to process job: {}",
-                    io::Error::last_os_error()
-                ));
-            }
-        }
+        self.job
+            .assign_child(child)
+            .map_err(|error| format!("failed assigning source watch to process job: {error}"))?;
         #[cfg(unix)]
         if let Some(terminal) = &self.terminal
             && terminal.foreground_was_owned
@@ -3574,7 +3531,9 @@ impl SourceWatchProcessGuard {
                 .map_err(|error| format!("failed releasing source watch startup gate: {error}"))?;
         }
         #[cfg(windows)]
-        resume_windows_process(_child.id())?;
+        self.job
+            .start_child(_child)
+            .map_err(|error| format!("failed resuming suspended source watch: {error}"))?;
         Ok(())
     }
 
@@ -3656,15 +3615,12 @@ impl SourceWatchProcessGuard {
     fn stop_remaining(&self, root_pid: u32) -> Result<(), String> {
         #[cfg(windows)]
         {
-            use windows_sys::Win32::System::JobObjects::TerminateJobObject;
-
-            if unsafe { TerminateJobObject(self.job, 1) } == 0 {
-                return Err(format!(
-                    "{SOURCE_WATCH_TREE_ACTIVE_ERROR}; failed terminating the process job: {}; the background service was not restored",
-                    io::Error::last_os_error()
-                ));
-            }
-            return self.wait_for_windows_job_to_stop();
+            let _ = root_pid;
+            return self.job.stop_remaining().map_err(|error| {
+                format!(
+                    "{SOURCE_WATCH_TREE_ACTIVE_ERROR}; {error}; the background service was not restored"
+                )
+            });
         }
         #[cfg(unix)]
         {
@@ -3675,44 +3631,6 @@ impl SourceWatchProcessGuard {
         let _ = root_pid;
         #[cfg(not(any(unix, windows)))]
         Ok(())
-    }
-
-    #[cfg(windows)]
-    fn wait_for_windows_job_to_stop(&self) -> Result<(), String> {
-        use windows_sys::Win32::System::JobObjects::{
-            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation,
-            QueryInformationJobObject,
-        };
-
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        loop {
-            let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
-            let queried = unsafe {
-                QueryInformationJobObject(
-                    self.job,
-                    JobObjectBasicAccountingInformation,
-                    std::ptr::from_mut(&mut info).cast(),
-                    std::mem::size_of_val(&info) as u32,
-                    std::ptr::null_mut(),
-                )
-            };
-            if queried == 0 {
-                return Err(format!(
-                    "{SOURCE_WATCH_TREE_ACTIVE_ERROR}; failed querying the process job: {}; the background service was not restored",
-                    io::Error::last_os_error()
-                ));
-            }
-            if info.ActiveProcesses == 0 {
-                return Ok(());
-            }
-            if std::time::Instant::now() >= deadline {
-                return Err(format!(
-                    "{SOURCE_WATCH_TREE_ACTIVE_ERROR}; the Windows process job still has {} active processes; the background service was not restored",
-                    info.ActiveProcesses
-                ));
-            }
-            thread::sleep(Duration::from_millis(25));
-        }
     }
 }
 
@@ -3741,15 +3659,6 @@ fn source_watch_startup_pair() -> Result<(io::PipeReader, io::PipeWriter), Strin
 impl Drop for SourceWatchProcessGuard {
     fn drop(&mut self) {
         let _ = self.restore_terminal();
-    }
-}
-
-#[cfg(windows)]
-impl Drop for SourceWatchProcessGuard {
-    fn drop(&mut self) {
-        unsafe {
-            windows_sys::Win32::Foundation::CloseHandle(self.job);
-        }
     }
 }
 
@@ -3859,54 +3768,6 @@ fn signal_unix_target(target: i32, signal: i32) -> Result<bool, String> {
     } else {
         Err(format!(
             "failed signaling source watch process target {target}: {error}"
-        ))
-    }
-}
-
-#[cfg(windows)]
-fn resume_windows_process(pid: u32) -> Result<(), String> {
-    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
-    };
-    use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
-
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
-    if snapshot == INVALID_HANDLE_VALUE {
-        return Err(format!(
-            "failed listing suspended source watch threads: {}",
-            io::Error::last_os_error()
-        ));
-    }
-    let mut entry = THREADENTRY32 {
-        dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
-        ..Default::default()
-    };
-    let mut found = unsafe { Thread32First(snapshot, &mut entry) } != 0;
-    let mut resumed = false;
-    while found {
-        if entry.th32OwnerProcessID == pid {
-            let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
-            if !thread.is_null() {
-                let result = unsafe { ResumeThread(thread) };
-                unsafe {
-                    CloseHandle(thread);
-                }
-                resumed = result != u32::MAX;
-                break;
-            }
-        }
-        found = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
-    }
-    unsafe {
-        CloseHandle(snapshot);
-    }
-    if resumed {
-        Ok(())
-    } else {
-        Err(format!(
-            "failed resuming suspended source watch process {pid}: {}",
-            io::Error::last_os_error()
         ))
     }
 }
