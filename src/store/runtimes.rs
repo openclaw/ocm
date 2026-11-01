@@ -2754,8 +2754,15 @@ fn pack_local_source_extensions(
         .arg("--json")
         .arg("--ignore-scripts")
         .arg("--pack-destination")
-        .arg(pack_dir)
-        .args(extensions.iter().map(|extension| &extension.source_dir))
+        .arg(pack_dir);
+    for extension in &extensions {
+        #[cfg(windows)]
+        let source_dir = npm_command_prefix(&extension.source_dir);
+        #[cfg(not(windows))]
+        let source_dir = &extension.source_dir;
+        command.arg(source_dir);
+    }
+    command
         .env("npm_config_fund", "false")
         .env("npm_config_audit", "false")
         .env("npm_config_update_notifier", "false")

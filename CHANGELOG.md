@@ -6,7 +6,7 @@ All notable changes to OCM are documented here.
 
 ### Fixed
 
-- Skip incompatible OS- or architecture-specific plugins when including source extensions in a local runtime build. Refuse explicitly required incompatible plugins without changing the target environment's config.
+- Skip incompatible OS- or architecture-specific plugins when including source extensions in a local runtime build. Refuse explicitly required incompatible plugins without changing the target environment's config, and pack compatible source plugins through native npm paths on Windows.
 
 ## 0.3.8 - 2026-10-29
 
