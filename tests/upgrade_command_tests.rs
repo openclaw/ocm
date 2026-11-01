@@ -15,7 +15,6 @@ use std::sync::{
 use std::thread::{self, sleep};
 use std::time::{Duration, Instant};
 
-use base64::Engine;
 use flate2::{Compression, write::GzEncoder};
 use ocm::infra::download::file_sha256;
 use ocm::store::{env_registry_path, now_utc, supervisor_runtime_path, supervisor_state_path};
@@ -29,8 +28,8 @@ use tar::{Builder, Header};
 use crate::support::{
     TestDir, TestHttpServer, hold_environment_operation,
     install_fake_launchctl as install_base_fake_launchctl, install_fake_node_and_npm, ocm_env,
-    path_string, run_ocm, stderr, stdout, write_executable_script, write_json_replacing_path,
-    write_text,
+    path_string, run_ocm, sha512_integrity, stderr, stdout, write_executable_script,
+    write_json_replacing_path, write_text,
 };
 
 fn install_fake_launchctl(root: &TestDir, env: &mut std::collections::BTreeMap<String, String>) {
@@ -858,14 +857,6 @@ esac
 echo "unexpected args: $*" >&2
 exit 1
 "#
-    )
-}
-
-fn sha512_integrity(body: &[u8]) -> String {
-    let digest = Sha512::digest(body);
-    format!(
-        "sha512-{}",
-        base64::engine::general_purpose::STANDARD.encode(digest)
     )
 }
 

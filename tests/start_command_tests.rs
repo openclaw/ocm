@@ -7,59 +7,14 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use base64::Engine;
-use flate2::{Compression, write::GzEncoder};
 use serde_json::Value;
-use sha2::{Digest, Sha512};
-use tar::{Builder, Header};
 
 use crate::support::{
     TestDir, TestHttpServer, hold_environment_operation, install_fake_launchctl,
     install_fake_managed_node_archive, install_fake_node_and_npm, install_fake_systemd_tools,
-    ocm_env, ocm_test_binary_path, path_string, run_ocm, stderr, stdout, write_executable_script,
+    ocm_env, ocm_test_binary_path, openclaw_package_tarball, path_string, run_ocm,
+    sha512_integrity, stderr, stdout, write_executable_script,
 };
-
-fn append_tar_file(
-    builder: &mut Builder<&mut GzEncoder<Vec<u8>>>,
-    path: &str,
-    body: &[u8],
-    mode: u32,
-) {
-    let mut header = Header::new_gnu();
-    header.set_size(body.len() as u64);
-    header.set_mode(mode);
-    header.set_cksum();
-    builder.append_data(&mut header, path, body).unwrap();
-}
-
-fn openclaw_package_tarball(script_body: &str) -> Vec<u8> {
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    {
-        let mut builder = Builder::new(&mut encoder);
-        append_tar_file(
-            &mut builder,
-            "package/openclaw.mjs",
-            script_body.as_bytes(),
-            0o755,
-        );
-        append_tar_file(
-            &mut builder,
-            "package/package.json",
-            br#"{"name":"openclaw","version":"2026.3.24","bin":{"openclaw":"openclaw.mjs"}}"#,
-            0o644,
-        );
-        builder.finish().unwrap();
-    }
-    encoder.finish().unwrap()
-}
-
-fn sha512_integrity(body: &[u8]) -> String {
-    let digest = Sha512::digest(body);
-    format!(
-        "sha512-{}",
-        base64::engine::general_purpose::STANDARD.encode(digest)
-    )
-}
 
 #[test]
 fn start_generates_an_env_name_and_uses_latest_stable_runtime() {
@@ -67,7 +22,8 @@ fn start_generates_an_env_name_and_uses_latest_stable_runtime() {
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
 
-    let tarball = openclaw_package_tarball("#!/usr/bin/env node\nconsole.log('stable');\n");
+    let tarball =
+        openclaw_package_tarball("#!/usr/bin/env node\nconsole.log('stable');\n", "2026.3.24");
     let integrity = sha512_integrity(&tarball);
     let tarball_server = TestHttpServer::serve_bytes(
         "/openclaw-2026.3.24.tgz",
@@ -139,7 +95,8 @@ fn start_without_a_name_generates_a_new_env_each_time() {
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
 
-    let tarball = openclaw_package_tarball("#!/usr/bin/env node\nconsole.log('stable');\n");
+    let tarball =
+        openclaw_package_tarball("#!/usr/bin/env node\nconsole.log('stable');\n", "2026.3.24");
     let integrity = sha512_integrity(&tarball);
     let tarball_server = TestHttpServer::serve_bytes(
         "/openclaw-2026.3.24.tgz",
@@ -1172,7 +1129,8 @@ fn start_uses_managed_node_fallback_without_host_doctor_noise() {
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
 
-    let tarball = openclaw_package_tarball("#!/usr/bin/env node\nconsole.log('stable');\n");
+    let tarball =
+        openclaw_package_tarball("#!/usr/bin/env node\nconsole.log('stable');\n", "2026.3.24");
     let integrity = sha512_integrity(&tarball);
     let tarball_server = TestHttpServer::serve_bytes(
         "/openclaw-2026.3.24.tgz",
