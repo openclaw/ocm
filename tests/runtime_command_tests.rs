@@ -3087,6 +3087,149 @@ fn runtime_build_local_installs_native_packages_through_store_aliases() {
 }
 
 #[test]
+fn runtime_build_local_omits_platform_incompatible_source_extensions() {
+    let root = TestDir::new("runtime-source-extension-platforms");
+    let cwd = root.child("workspace");
+    let repo = cwd.join("openclaw");
+    fs::create_dir_all(&repo).unwrap();
+    let mut env = ocm_env(&root);
+    #[cfg(windows)]
+    env.insert("OCM_INTERNAL_NPM_BIN".into(), "npm.cmd".into());
+    for (key, value) in [
+        ("npm_config_offline", "true".to_string()),
+        ("npm_config_cache", path_string(&root.child("npm-cache"))),
+        ("npm_config_audit", "false".to_string()),
+        ("npm_config_fund", "false".to_string()),
+    ] {
+        env.insert(key.to_string(), value);
+    }
+    let platform = Command::new("node")
+        .args([
+            "-p",
+            "JSON.stringify({os:process.platform,cpu:process.arch})",
+        ])
+        .output()
+        .unwrap();
+    assert!(platform.status.success(), "{}", stderr(&platform));
+    let platform: Value = serde_json::from_slice(&platform.stdout).unwrap();
+    fs::write(
+        repo.join("package.json"),
+        serde_json::json!({
+            "name":"openclaw", "version":"2026.4.25", "bin":{"openclaw":"openclaw.mjs"},
+            "files":["openclaw.mjs"], "engines":{"node":">=22.22.3"}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    write_executable_script(
+        &repo.join("openclaw.mjs"),
+        "#!/usr/bin/env node\nconsole.log('2026.4.25');\n",
+    );
+    for (id, restrictions) in [
+        (
+            "compatible",
+            serde_json::json!({"os":[platform["os"],"!unsupported-example"],"cpu":"any"}),
+        ),
+        (
+            "denied-os",
+            serde_json::json!({"os":format!("!{}",platform["os"].as_str().unwrap())}),
+        ),
+        (
+            "denied-cpu",
+            serde_json::json!({"cpu":[format!("!{}",platform["cpu"].as_str().unwrap())]}),
+        ),
+    ] {
+        for prefix in ["extensions", "dist/extensions"] {
+            let dir = repo.join(prefix).join(id);
+            fs::create_dir_all(&dir).unwrap();
+            let mut package = serde_json::json!({
+                "name":format!("@openclaw/{id}"), "version":"2026.4.25", "type":"module",
+                "files":["index.js","openclaw.plugin.json"], "openclaw":{"runtimeExtensions":["./index.js"]}
+            });
+            package
+                .as_object_mut()
+                .unwrap()
+                .extend(restrictions.as_object().unwrap().clone());
+            fs::write(dir.join("package.json"), package.to_string()).unwrap();
+            fs::write(
+                dir.join("openclaw.plugin.json"),
+                serde_json::json!({
+                    "id":id, "configSchema":{"type":"object"}
+                })
+                .to_string(),
+            )
+            .unwrap();
+            fs::write(
+                dir.join("index.js"),
+                format!("export default {{id:{id:?}}};\n"),
+            )
+            .unwrap();
+        }
+    }
+    let build = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "runtime",
+            "build-local",
+            "compatible",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--include-source-extensions",
+            "--json",
+        ],
+    );
+    assert!(build.status.success(), "{}", stderr(&build));
+    let built = runtime_install_root("compatible", &env, &cwd)
+        .unwrap()
+        .join("files/node_modules/openclaw/dist/extensions");
+    let ids = fs::read_dir(&built)
+        .unwrap()
+        .map(|entry| {
+            let manifest: Value = serde_json::from_slice(
+                &fs::read(entry.unwrap().path().join("openclaw.plugin.json")).unwrap(),
+            )
+            .unwrap();
+            manifest["id"].as_str().unwrap().to_string()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(ids, ["compatible"]);
+    let create = run_ocm(
+        &cwd,
+        &env,
+        &["env", "create", "primary", "--runtime", "compatible"],
+    );
+    assert!(create.status.success(), "{}", stderr(&create));
+    let config_path = root.child("ocm-home/envs/primary/.openclaw/openclaw.json");
+    for id in ["denied-os", "denied-cpu"] {
+        let config = serde_json::json!({"plugins":{"entries":{(id):{"enabled":true}}}}).to_string();
+        fs::write(&config_path, &config).unwrap();
+        let result = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "runtime",
+                "build-local",
+                id,
+                "--repo",
+                repo.to_str().unwrap(),
+                "--for-env",
+                "primary",
+                "--json",
+            ],
+        );
+        assert!(!result.status.success(), "{id}");
+        assert!(
+            stderr(&result).contains(id) && stderr(&result).contains("platform"),
+            "{}",
+            stderr(&result)
+        );
+        assert!(!runtime_meta_path(id, &env, &cwd).unwrap().exists());
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), config);
+    }
+}
+
+#[test]
 fn runtime_build_local_resolves_manifest_aliases_with_real_npm() {
     let root = TestDir::new("runtime-manifest-aliases-real-npm");
     let cwd = root.child("workspace");

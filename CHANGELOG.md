@@ -6,6 +6,7 @@ All notable changes to OCM are documented here.
 
 ### Fixed
 
+- Skip incompatible OS- or architecture-specific plugins when including source extensions in a local runtime build. Refuse explicitly required incompatible plugins without changing the target environment's config, and pack compatible source plugins through native npm paths on Windows.
 - Find the installed npm launcher by default when building and installing runtimes on Windows.
 
 ## 0.3.8 - 2026-10-29
