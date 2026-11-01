@@ -111,6 +111,10 @@ def main():
             log = root / (label.replace(" ", "-") + ".log")
             log.write_text(result.stdout + result.stderr)
             log.chmod(0o600)
+            if arguments[0] == "service":
+                detail = result.stderr.strip().replace(str(root), "<state>")
+                detail = detail.replace(str(home), "<home>")
+                print(label + " error: " + detail[-2000:], file=sys.stderr, flush=True)
             raise RuntimeError(label + " failed; private diagnostics retained")
         return json.loads(result.stdout)
 
