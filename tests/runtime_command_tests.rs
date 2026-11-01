@@ -3103,6 +3103,8 @@ fn runtime_build_local_omits_platform_incompatible_source_extensions() {
     let repo = cwd.join("openclaw");
     fs::create_dir_all(&repo).unwrap();
     let mut env = ocm_env(&root);
+    #[cfg(windows)]
+    env.insert("OCM_INTERNAL_NPM_BIN".into(), "npm.cmd".into());
     for (key, value) in [
         ("npm_config_offline", "true".to_string()),
         ("npm_config_cache", path_string(&root.child("npm-cache"))),
