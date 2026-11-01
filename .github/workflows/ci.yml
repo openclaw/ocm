@@ -168,6 +168,9 @@ jobs:
         with:
           node-version: '24.22.1'
           package-manager-cache: false
+      - name: Prove native Windows source plugin platforms
+        timeout-minutes: 5
+        run: cargo test --locked --test runtime_command_tests runtime_build_local_omits_platform_incompatible_source_extensions -- --exact --nocapture
       - name: Prove native Windows companion dependency bindings
         timeout-minutes: 5
         shell: pwsh
