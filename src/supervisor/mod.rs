@@ -560,9 +560,6 @@ impl<'a> SupervisorService<'a> {
         let _lock = lock_supervisor_state(&state_path)?;
         let mut state = self.build_state()?;
         preserve_persisted_restart_requests(&state_path, &mut state);
-        if let Some(parent) = state_path.parent() {
-            ensure_dir(parent)?;
-        }
         ensure_dir(&supervisor_logs_dir(self.env, self.cwd)?)?;
         write_json(&state_path, &state)?;
         Ok(view_from_state(&state_path, true, state))
@@ -611,9 +608,6 @@ impl<'a> SupervisorService<'a> {
             merge_targeted_supervisor_state(&mut state, persisted_state, &refreshed_envs);
         }
 
-        if let Some(parent) = state_path.parent() {
-            ensure_dir(parent)?;
-        }
         ensure_dir(&supervisor_logs_dir(self.env, self.cwd)?)?;
         write_json(&state_path, &state)?;
         Ok(view_from_state(&state_path, true, state))
@@ -1172,9 +1166,6 @@ impl<'a> SupervisorService<'a> {
             env_name: name.to_string(),
             request_id: request_id.clone(),
         });
-        if let Some(parent) = state_path.parent() {
-            ensure_dir(parent)?;
-        }
         ensure_dir(&supervisor_logs_dir(self.env, self.cwd)?)?;
         write_json(&state_path, &state)?;
         Ok(request_id)
@@ -1813,14 +1804,7 @@ impl<'a> SupervisorService<'a> {
         let mut running = BTreeMap::new();
         let mut pending = BTreeMap::new();
         let mut inactive = BTreeMap::new();
-        queue_missing_children(
-            &mut pending,
-            &running,
-            &inactive,
-            &active_state.children,
-            0,
-            Instant::now(),
-        );
+        queue_missing_children(&mut pending, &running, &inactive, &active_state.children);
         // Only the initial daemon plan can overlap an outgoing Gateway. Later
         // starts and crash retries keep their ordinary failure policy.
         let startup_port_deadline =
@@ -1881,7 +1865,7 @@ impl<'a> SupervisorService<'a> {
                     inactive: &mut inactive,
                     results: &mut child_results,
                 },
-            )?;
+            );
 
             runtime_dirty |= start_due_children(
                 &mut running,
@@ -1992,7 +1976,6 @@ struct ExitedSupervisorChildDecision {
     last_error: Option<String>,
 }
 
-#[derive(Clone)]
 struct InactiveSupervisorChild {
     spec: SupervisorChildSpec,
     gateway_state: String,
@@ -2686,14 +2669,7 @@ fn reconcile_running_children(
             );
         }
     }
-    queue_missing_children(
-        pending,
-        running,
-        inactive,
-        &desired_state.children,
-        0,
-        Instant::now(),
-    );
+    queue_missing_children(pending, running, inactive, &desired_state.children);
     runtime_dirty
 }
 
@@ -2857,7 +2833,7 @@ fn process_exited_children(
     active_state: &mut SupervisorState,
     managed_child_count: &mut usize,
     children: SupervisorChildCollections<'_>,
-) -> Result<bool, String> {
+) -> bool {
     let SupervisorChildCollections {
         running,
         pending,
@@ -2939,11 +2915,10 @@ fn process_exited_children(
                 } else {
                     0
                 };
-            let issue = decision.last_error.clone();
             pending.insert(
                 exited_child.env_name.clone(),
                 pending_supervisor_child(
-                    next_spec.clone(),
+                    next_spec,
                     Some(
                         previous_child
                             .restart_handoff_support
@@ -2954,26 +2929,7 @@ fn process_exited_children(
                     next_quick_clean_restart_count,
                     restart_delay_ms(next_restart_count),
                     exited_child.exit_code,
-                    issue.clone(),
-                ),
-            );
-            inactive.insert(
-                exited_child.env_name,
-                inactive_supervisor_child(
-                    next_spec,
-                    "backoff",
-                    Some(
-                        previous_child
-                            .restart_handoff_support
-                            .status_label()
-                            .to_string(),
-                    ),
-                    next_restart_count,
-                    exited_child.exit_code,
-                    issue,
-                    pending
-                        .get(&previous_child.spec.env_name)
-                        .map(|child| child.retry_at_utc),
+                    decision.last_error,
                 ),
             );
         } else {
@@ -3008,7 +2964,7 @@ fn process_exited_children(
         );
     }
 
-    Ok(runtime_dirty)
+    runtime_dirty
 }
 
 fn exited_child_restart_decision(
@@ -3129,9 +3085,8 @@ fn queue_missing_children(
     running: &BTreeMap<String, RunningSupervisorChild>,
     inactive: &BTreeMap<String, InactiveSupervisorChild>,
     desired_children: &[SupervisorChildSpec],
-    restart_count: usize,
-    retry_at: Instant,
 ) {
+    let retry_at = Instant::now();
     for next_spec in desired_children {
         if running.contains_key(&next_spec.env_name)
             || pending.contains_key(&next_spec.env_name)
@@ -3144,7 +3099,7 @@ fn queue_missing_children(
             PendingSupervisorChild {
                 spec: next_spec.clone(),
                 restart_handoff: None,
-                restart_count,
+                restart_count: 0,
                 quick_clean_restart_count: 0,
                 retry_at,
                 startup_port_deadline: None,
@@ -3215,15 +3170,6 @@ fn start_due_children(
                 entry.last_error = Some(error.clone());
                 entry.last_event_at = Some(now_utc());
             }
-            inactive.insert(
-                env_name.clone(),
-                inactive_from_pending(
-                    pending
-                        .get(&env_name)
-                        .expect("pending child should still exist after preflight failure"),
-                    "backoff",
-                ),
-            );
             runtime_dirty = true;
             eprintln!("{error}");
             continue;
@@ -3321,15 +3267,6 @@ fn start_due_children(
                     entry.last_error = Some(error.clone());
                     entry.last_event_at = Some(now_utc());
                 }
-                inactive.insert(
-                    env_name.clone(),
-                    inactive_from_pending(
-                        pending
-                            .get(&env_name)
-                            .expect("pending child should still exist after spawn failure"),
-                        "backoff",
-                    ),
-                );
                 runtime_dirty = true;
             }
         }
@@ -3795,16 +3732,9 @@ fn supervisor_service_environment(
             .map(|value| value.trim().to_string())
             .unwrap_or_else(|| DEFAULT_SERVICE_PATH.to_string()),
     );
-    for key in SERVICE_PROXY_ENV_KEYS {
-        if let Some(value) = process_env
-            .get(key)
-            .filter(|value| !value.trim().is_empty())
-        {
-            service_env.insert(key.to_string(), value.trim().to_string());
-        }
-    }
-    for key in SERVICE_EXTRA_ENV_KEYS
+    for key in SERVICE_PROXY_ENV_KEYS
         .into_iter()
+        .chain(SERVICE_EXTRA_ENV_KEYS)
         .chain(SERVICE_USER_ENV_KEYS)
     {
         if let Some(value) = process_env
@@ -4109,15 +4039,10 @@ fn write_supervisor_runtime_state(
     inactive: &BTreeMap<String, InactiveSupervisorChild>,
     gateway_admission: &SupervisorGatewayAdmission,
 ) -> Result<(), String> {
-    if let Some(parent) = runtime_path.parent() {
-        ensure_dir(parent)?;
-    }
-
-    let mut children = running
+    let children = running
         .values()
         .map(supervisor_runtime_child)
         .collect::<Vec<_>>();
-    children.sort_by(|left, right| left.env_name.cmp(&right.env_name));
     let mut services = running
         .values()
         .map(supervisor_runtime_service_running)
@@ -4139,7 +4064,6 @@ fn write_supervisor_runtime_state(
             .filter(|child| !pending.contains_key(&child.spec.env_name))
             .map(supervisor_runtime_service_inactive),
     );
-    services.sort_by(|left, right| left.env_name.cmp(&right.env_name));
 
     ownership::write_runtime(
         runtime_path,
@@ -4718,9 +4642,28 @@ mod tests {
                 .unwrap()
                 .contains("directory")
         );
-        assert_eq!(inactive["demo"].gateway_state, "backoff");
+        assert!(inactive.is_empty());
 
         fs::remove_dir(&runtime_path).unwrap();
+        write_supervisor_runtime_state(
+            &runtime_path,
+            &env["OCM_HOME"],
+            &running,
+            &pending,
+            &inactive,
+            &admission,
+        )
+        .unwrap();
+        let backoff = read_json::<SupervisorRuntimeState>(&runtime_path).unwrap();
+        assert!(backoff.children.is_empty());
+        assert_eq!(backoff.services.len(), 1);
+        assert_eq!(backoff.services[0].gateway_state, "backoff");
+        assert_eq!(backoff.services[0].restart_count, 1);
+        assert_eq!(backoff.services[0].last_error, pending["demo"].last_error);
+        assert_eq!(
+            backoff.services[0].next_retry_at,
+            Some(pending["demo"].retry_at_utc)
+        );
         pending.get_mut("demo").unwrap().retry_at = Instant::now();
         assert!(
             start_due_children(
@@ -6042,10 +5985,7 @@ mod tests {
                 ),
             ),
         ]);
-        let mut inactive = pending
-            .iter()
-            .map(|(name, child)| (name.clone(), inactive_from_pending(child, "backoff")))
-            .collect::<BTreeMap<_, _>>();
+        let mut inactive = BTreeMap::new();
 
         let runtime_dirty =
             reconcile_running_children(&mut running, &mut pending, &mut inactive, &desired);
@@ -6054,7 +5994,7 @@ mod tests {
         assert!(!pending.contains_key("rosita"));
         assert!(!inactive.contains_key("rosita"));
         assert_eq!(pending.get("control").unwrap().spec, control);
-        assert!(inactive.contains_key("control"));
+        assert!(inactive.is_empty());
     }
 
     #[test]
