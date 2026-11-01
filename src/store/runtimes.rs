@@ -1601,6 +1601,31 @@ fn prepare_npm_install_prefix(install_directory: &Path) -> Result<PathBuf, Strin
     Ok(npm_prefix)
 }
 
+fn runtime_npm_install_command(
+    archive_path: &Path,
+    cwd: &Path,
+    env: &BTreeMap<String, String>,
+    local_adapter: Option<&LocalBuildNpmAdapter>,
+) -> Result<CommandSpec, String> {
+    let requirement = if local_adapter.is_some() {
+        NodeRequirement::default()
+    } else {
+        NodeRequirement::from_archive(archive_path)?
+    };
+    let host_ready = verify_package_runtime_host(env, &requirement).is_ok();
+    Ok(if let Some(local_adapter) = local_adapter {
+        local_adapter.command.clone()
+    } else if host_ready {
+        CommandSpec {
+            program: npm_program(env),
+            args: Vec::new(),
+            path_prepend: None,
+        }
+    } else {
+        managed_runtime_install_command(env, cwd, &requirement)?
+    })
+}
+
 fn install_openclaw_package_with_npm(
     archive_path: &Path,
     additional_archives: &[PathBuf],
@@ -1611,23 +1636,7 @@ fn install_openclaw_package_with_npm(
     owner: &RuntimeInstallTarget,
 ) -> Result<(), String> {
     let npm_prefix = prepare_npm_install_prefix(install_files)?;
-    let requirement = if local_adapter.is_some() {
-        NodeRequirement::default()
-    } else {
-        NodeRequirement::from_archive(archive_path)?
-    };
-    let host_ready = verify_package_runtime_host(env, &requirement).is_ok();
-    let install_command = if let Some(local_adapter) = local_adapter {
-        local_adapter.command.clone()
-    } else if host_ready {
-        CommandSpec {
-            program: npm_program(env),
-            args: Vec::new(),
-            path_prepend: None,
-        }
-    } else {
-        managed_runtime_install_command(env, cwd, &requirement)?
-    };
+    let install_command = runtime_npm_install_command(archive_path, cwd, env, local_adapter)?;
 
     let mut command = Command::new(&install_command.program);
     command
@@ -2556,11 +2565,44 @@ fn npm_package_relative_path(package_name: &str) -> Option<PathBuf> {
     valid_component(package_name).then(|| PathBuf::from(package_name))
 }
 
+#[derive(serde::Deserialize)]
+struct NpmPlatform {
+    os: String,
+    cpu: String,
+}
+
+fn npm_platform_allows(value: &serde_json::Value, current: &str) -> Result<bool, String> {
+    let values = match value {
+        serde_json::Value::String(value) => vec![value.as_str()],
+        serde_json::Value::Array(values) => values
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .ok_or_else(|| "expected platform strings".to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        _ => return Err("expected a platform string or array of strings".to_string()),
+    };
+    if values == ["any"] {
+        return Ok(true);
+    }
+    if values
+        .iter()
+        .any(|value| value.strip_prefix('!') == Some(current))
+    {
+        return Ok(false);
+    }
+    Ok(values.iter().all(|value| value.starts_with('!')) || values.contains(&current))
+}
+
 fn local_source_extensions_from_build(
     repo_path: &Path,
     packaged_ids: &BTreeSet<String>,
-    include_packaged: bool,
     target_ids: Option<&BTreeSet<String>>,
+    install_command: &CommandSpec,
+    env: &BTreeMap<String, String>,
+    owner: &RuntimeInstallTarget,
 ) -> Result<Vec<LocalSourceExtension>, String> {
     let extensions_dir = repo_path.join("dist/extensions");
     let entries = fs::read_dir(&extensions_dir).map_err(|error| {
@@ -2571,6 +2613,7 @@ fn local_source_extensions_from_build(
     })?;
     let mut extensions = Vec::new();
     let mut package_names = BTreeSet::new();
+    let mut platform: Option<NpmPlatform> = None;
     for entry in entries {
         let entry = entry.map_err(|error| error.to_string())?;
         let source_dir = entry.path();
@@ -2583,7 +2626,7 @@ fn local_source_extensions_from_build(
         }
         let directory_name = entry.file_name().to_string_lossy().to_string();
         if directory_name == "node_modules"
-            || (!include_packaged && packaged_ids.contains(&directory_name))
+            || (target_ids.is_none() && packaged_ids.contains(&directory_name))
         {
             continue;
         }
@@ -2619,6 +2662,47 @@ fn local_source_extensions_from_build(
                 display_path(&package_json_path)
             )
         })?;
+        if package_json.get("os").is_some() || package_json.get("cpu").is_some() {
+            if platform.is_none() {
+                // Use the Node selected for npm, including the managed fallback;
+                // its architecture can differ from OCM's under translation.
+                let mut command = Command::new("node");
+                command.args([
+                    "-p",
+                    "JSON.stringify({os:process.platform,cpu:process.arch})",
+                ]);
+                install_command.apply_environment(&mut command, env)?;
+                let output = owner
+                    .output(&mut command)
+                    .map_err(|error| format!("failed to inspect npm's Node platform: {error}"))?;
+                if !output.status.success() {
+                    return Err("failed to inspect npm's Node platform".to_string());
+                }
+                platform = Some(
+                    serde_json::from_slice(&output.stdout)
+                        .map_err(|error| format!("failed to read npm's Node platform: {error}"))?,
+                );
+            }
+            if let Some(platform) = &platform {
+                let mut supported = true;
+                for (field, current) in [("os", &platform.os), ("cpu", &platform.cpu)] {
+                    if let Some(value) = package_json.get(field) {
+                        supported &= npm_platform_allows(value, current).map_err(|error| {
+                            format!("source extension \"{id}\" has invalid {field}: {error}")
+                        })?;
+                    }
+                }
+                if !supported {
+                    if target_ids.is_some() {
+                        return Err(format!(
+                            "required source extension \"{id}\" does not support npm's platform {}/{}",
+                            platform.os, platform.cpu
+                        ));
+                    }
+                    continue;
+                }
+            }
+        }
         let package_name = package_json
             .get("name")
             .and_then(serde_json::Value::as_str)
@@ -4297,34 +4381,37 @@ pub(crate) fn install_runtime_from_local_openclaw_build(
         .then(|| packaged_openclaw_extension_ids(&archive_path))
         .transpose()?
         .unwrap_or_default();
-    let source_extensions = if options.include_source_extensions {
-        let extensions =
-            local_source_extensions_from_build(&repo_path, &packaged_ids, false, None)?;
-        pack_local_source_extensions(extensions, &pack_dir, context.env, &target)?
-    } else if let Some(target_source_plugins) = target_source_plugins
-        .as_ref()
-        .filter(|plugins| !plugins.is_empty())
-    {
+    let source_extensions = if needs_source_extensions {
+        let install_command = runtime_npm_install_command(
+            &archive_path,
+            context.cwd,
+            context.env,
+            local_adapter.as_ref(),
+        )?;
         let extensions = local_source_extensions_from_build(
             &repo_path,
             &packaged_ids,
-            true,
-            Some(target_source_plugins),
+            target_source_plugins.as_ref(),
+            &install_command,
+            context.env,
+            &target,
         )?;
-        let available_ids = extensions
-            .iter()
-            .map(|extension| extension.id.clone())
-            .collect::<BTreeSet<_>>();
-        let missing = target_source_plugins
-            .difference(&available_ids)
-            .cloned()
-            .collect::<Vec<_>>();
-        if !missing.is_empty() {
-            return Err(format!(
-                "the local OpenClaw build did not produce required source plugins for target environment {}: {}",
-                options.target_env.as_deref().unwrap_or_default(),
-                missing.join(", ")
-            ));
+        if let Some(target_source_plugins) = &target_source_plugins {
+            let available_ids = extensions
+                .iter()
+                .map(|extension| extension.id.clone())
+                .collect::<BTreeSet<_>>();
+            let missing = target_source_plugins
+                .difference(&available_ids)
+                .cloned()
+                .collect::<Vec<_>>();
+            if !missing.is_empty() {
+                return Err(format!(
+                    "the local OpenClaw build did not produce required source plugins for target environment {}: {}",
+                    options.target_env.as_deref().unwrap_or_default(),
+                    missing.join(", ")
+                ));
+            }
         }
         pack_local_source_extensions(extensions, &pack_dir, context.env, &target)?
     } else {

@@ -288,7 +288,8 @@ ocm runtime build-local upstream-main \
 ```
 
 OCM packages only built extensions under that checkout's `dist/extensions`
-that are absent from the core tarball, installs their runtime dependencies, and
+that are absent from the core tarball and support the installation Node's OS and
+architecture, installs their runtime dependencies, and
 places them in the managed runtime's bundled-extension root. Extensions from
 global, state, workspace, or other external paths are not included or promoted.
 Materialized extensions retain the installed dependency bindings, including
@@ -296,7 +297,7 @@ when npm hoists a version that differs from the core package's private version.
 These builds also support an existing directory alias in `OCM_HOME`, including
 native npm's `linked` installation strategy, without changing the caller's npm settings.
 Without the flag, `build-local` remains release-shaped.
-Because the opt-in installs every omitted extension and its dependency closure,
+Because the opt-in installs every compatible omitted extension and its dependency closure,
 the resulting runtime can take longer to build and use substantially more disk
 space than the release-shaped default.
 
@@ -309,6 +310,9 @@ ocm runtime build-local primary-test \
   --for-env primary \
   --force
 ```
+
+If a required source plugin excludes the installation Node's OS or architecture,
+OCM refuses the build and leaves the target environment's config unchanged.
 
 OCM reads the target environment's effective plugin policy before `npm pack`, validates
 explicit plugin references against the checkout and installed-plugin records,

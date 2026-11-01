@@ -4,6 +4,10 @@ All notable changes to OCM are documented here.
 
 ## Unreleased
 
+### Fixed
+
+- Skip incompatible OS- or architecture-specific plugins when including source extensions in a local runtime build. Refuse explicitly required incompatible plugins without changing the target environment's config.
+
 ## 0.3.8 - 2026-10-29
 
 **Highlights:** Safer environment copies and recovery, stronger runtime ownership, and reliable Windows runtime installation and launch.
