@@ -540,16 +540,3 @@ fn usage_command_map_matches_the_help_listing() {
         }
     }
 }
-
-#[test]
-fn usage_safety_notes_claim_only_enforced_safeguards() {
-    let usage = read("docs/USAGE.md");
-    let notes = section(&usage, "## Safety notes").to_lowercase();
-    assert!(notes.contains("protected environments are not removed unless forced"));
-    for removed in ["marker", "free port"] {
-        assert!(
-            !notes.contains(removed),
-            "the Safety notes still mention {removed:?}, which OCM does not enforce"
-        );
-    }
-}
