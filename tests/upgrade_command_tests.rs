@@ -28,8 +28,8 @@ use tar::{Builder, Header};
 use crate::support::{
     TestDir, TestHttpServer, hold_environment_operation,
     install_fake_launchctl as install_base_fake_launchctl, install_fake_node_and_npm, ocm_env,
-    path_string, run_ocm, sha512_integrity, stderr, stdout, write_executable_script,
-    write_json_replacing_path, write_text,
+    path_string, run_ocm, sha512_integrity, stderr, stdout, write_empty_supervisor_runtime,
+    write_executable_script, write_json_replacing_path, write_text,
 };
 
 fn install_fake_launchctl(root: &TestDir, env: &mut std::collections::BTreeMap<String, String>) {
@@ -142,30 +142,10 @@ fn write_running_supervisor_binding(
                 .map(|byte| format!("{byte:02x}"))
                 .collect()
         });
-    let runtime = SupervisorRuntimeState {
-        retained_ownership: None,
-        kind: "ocm-supervisor-runtime".to_string(),
-        ocm_home: ocm_home.to_string(),
-        daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-        gateway_admission: Some(support::fake_daemon_gateway_admission()),
-        updated_at: now_utc(),
-        services: vec![SupervisorRuntimeService {
-            env_name: "demo".to_string(),
-            binding_kind: binding_kind.to_string(),
-            binding_name: binding_name.to_string(),
-            gateway_state: "running".to_string(),
-            restart_handoff: Some("none".to_string()),
-            restart_count: 0,
-            child_port,
-            pid: Some(pid),
-            stdout_path: stdout_path.clone(),
-            stderr_path: stderr_path.clone(),
-            last_exit_code: None,
-            last_error: None,
-            last_event_at: None,
-            next_retry_at: None,
-        }],
-        children: vec![SupervisorRuntimeChild {
+    support::write_running_supervisor_runtime(
+        runtime_path,
+        ocm_home,
+        SupervisorRuntimeChild {
             launch_spec_sha256,
             env_name: "demo".to_string(),
             binding_kind: binding_kind.to_string(),
@@ -175,23 +155,8 @@ fn write_running_supervisor_binding(
             child_port,
             stdout_path,
             stderr_path,
-        }],
-    };
-    write_json_replacing_path(runtime_path, &runtime);
-}
-
-fn write_empty_supervisor_runtime(runtime_path: &Path, ocm_home: &str) {
-    let runtime = SupervisorRuntimeState {
-        retained_ownership: None,
-        kind: "ocm-supervisor-runtime".to_string(),
-        ocm_home: ocm_home.to_string(),
-        daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-        gateway_admission: Some(support::fake_daemon_gateway_admission()),
-        updated_at: now_utc(),
-        services: Vec::new(),
-        children: Vec::new(),
-    };
-    write_json_replacing_path(runtime_path, &runtime);
+        },
+    );
 }
 
 fn write_backoff_supervisor_runtime(

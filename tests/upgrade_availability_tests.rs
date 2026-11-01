@@ -11,14 +11,14 @@ use std::thread::{self, JoinHandle, sleep};
 use std::time::{Duration, Instant};
 
 use fs2::FileExt;
-use ocm::store::{env_registry_path, now_utc, supervisor_runtime_path, supervisor_state_path};
-use ocm::supervisor::{SupervisorRuntimeChild, SupervisorRuntimeService, SupervisorRuntimeState};
+use ocm::store::{env_registry_path, supervisor_runtime_path, supervisor_state_path};
+use ocm::supervisor::SupervisorRuntimeChild;
 use serde_json::Value;
 
 use crate::support::{
     TestDir, TestHttpServer, install_fake_launchctl, install_fake_node_and_npm, ocm_env,
     openclaw_package_tarball, path_string, run_ocm, sha512_integrity, stderr,
-    write_json_replacing_path,
+    write_empty_supervisor_runtime,
 };
 
 const PREPARE_DELAY: Duration = Duration::from_millis(1_500);
@@ -197,30 +197,10 @@ fn write_running_supervisor_runtime(
     let log_root = runtime_path.parent().unwrap();
     let stdout_path = path_string(&log_root.join("demo.stdout.log"));
     let stderr_path = path_string(&log_root.join("demo.stderr.log"));
-    let runtime = SupervisorRuntimeState {
-        retained_ownership: None,
-        kind: "ocm-supervisor-runtime".to_string(),
-        ocm_home: ocm_home.to_string(),
-        daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-        gateway_admission: Some(support::fake_daemon_gateway_admission()),
-        updated_at: now_utc(),
-        services: vec![SupervisorRuntimeService {
-            env_name: "demo".to_string(),
-            binding_kind: "runtime".to_string(),
-            binding_name: binding_name.to_string(),
-            gateway_state: "running".to_string(),
-            restart_handoff: Some("none".to_string()),
-            restart_count: 0,
-            child_port,
-            pid: Some(pid),
-            stdout_path: stdout_path.clone(),
-            stderr_path: stderr_path.clone(),
-            last_exit_code: None,
-            last_error: None,
-            last_event_at: None,
-            next_retry_at: None,
-        }],
-        children: vec![SupervisorRuntimeChild {
+    support::write_running_supervisor_runtime(
+        runtime_path,
+        ocm_home,
+        SupervisorRuntimeChild {
             launch_spec_sha256: None,
             env_name: "demo".to_string(),
             binding_kind: "runtime".to_string(),
@@ -230,23 +210,8 @@ fn write_running_supervisor_runtime(
             child_port,
             stdout_path,
             stderr_path,
-        }],
-    };
-    write_json_replacing_path(runtime_path, &runtime);
-}
-
-fn write_empty_supervisor_runtime(runtime_path: &Path, ocm_home: &str) {
-    let runtime = SupervisorRuntimeState {
-        retained_ownership: None,
-        kind: "ocm-supervisor-runtime".to_string(),
-        ocm_home: ocm_home.to_string(),
-        daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-        gateway_admission: Some(support::fake_daemon_gateway_admission()),
-        updated_at: now_utc(),
-        services: Vec::new(),
-        children: Vec::new(),
-    };
-    write_json_replacing_path(runtime_path, &runtime);
+        },
+    );
 }
 
 fn fixture_openclaw_script(version: &str) -> String {
