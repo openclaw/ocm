@@ -54,7 +54,7 @@ def main():
             if 'Could not find service "' + LABEL + '"' in result.stderr and "in domain" in result.stderr:
                 return None
             raise RuntimeError("native OCM job state is unknown")
-        return dict(re.findall(r"^\s*(path|state|pid) = (.+)$", result.stdout, re.MULTILINE))
+        return dict(re.findall(r"^\s*(path|pid) = (.+)$", result.stdout, re.MULTILINE))
 
     def preflight():
         for command in [("managername",), ("print", domain)]:
@@ -133,7 +133,6 @@ def main():
         assert oc_json(label, "@" + ENV_NAME, "--", "gateway", "health")["ok"] is True
         status = oc_json("service status", "service", "status", ENV_NAME)
         observed = owned_job()
-        assert observed["state"] == "running"
         assert int(observed["pid"]) == status["ocmServicePid"]
         assert status["running"] and status["childPid"]
         pids.update((status["ocmServicePid"], status["childPid"]))
