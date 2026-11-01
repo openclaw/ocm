@@ -13,6 +13,12 @@ repository root; a passing focused test does not replace a preceding check.
 [CI](.github/workflows/ci.yml) remains the source of truth for the supported
 toolchain and platform matrix.
 
+CI uses line-table debug information for development and test builds. Backtraces
+retain source locations, while binaries omit type and variable debug data to
+reduce compilation, copying, and integrity-hashing work in lifecycle tests.
+Local Cargo defaults and release builds keep their existing profiles. New PR
+commits cancel obsolete runs for that PR; main-branch runs remain independent.
+
 ### Prepare once
 
 Prepare stable Rust, Cargo, rustfmt, Python 3, Git, Perl, `gh`, `ssh-keygen`, and
