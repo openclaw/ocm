@@ -4,6 +4,10 @@ All notable changes to OCM are documented here.
 
 ## Unreleased
 
+### Fixed
+
+- Find the installed npm launcher by default when building and installing runtimes on Windows.
+
 ## 0.3.8 - 2026-10-29
 
 **Highlights:** Safer environment copies and recovery, stronger runtime ownership, and reliable Windows runtime installation and launch.
