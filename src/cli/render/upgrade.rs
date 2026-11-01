@@ -1057,6 +1057,7 @@ mod tests {
         let summary = UpgradeSimulationBatchSummary {
             source_env: "demo".to_string(),
             to: "2026.4.23".to_string(),
+            pull_request: None,
             count: 1,
             passed: 0,
             failed: 1,
@@ -1069,6 +1070,7 @@ mod tests {
                 to_binding_kind: "unknown".to_string(),
                 to_binding_name: "unknown".to_string(),
                 to: "2026.4.23".to_string(),
+                pull_request: None,
                 outcome: "failed".to_string(),
                 checks: vec![UpgradeSimulationCheck {
                     name: "prepare target".to_string(),

@@ -381,10 +381,24 @@ ocm upgrade simulate mira --to 2026.4.20
 ocm upgrade simulate mira --to 2026.4.20 --scenario all
 ocm upgrade simulate mira --to beta --scenario all
 ocm upgrade simulate mira --to ./openclaw
+ocm upgrade simulate mira --to 'openclaw/openclaw#123'
 ```
 
 Use this when a newer OpenClaw release is available and you want your environments to move forward without manually updating runtimes and restarting services.
 Use `upgrade simulate` when you want to test what would happen against a published release or local OpenClaw repo before touching the real env.
+
+`--to` also accepts `owner/repo#123` or
+`https://github.com/owner/repo/pull/123`. Install and authenticate `gh`, and use
+your existing Git credentials for private repositories. The fetched target must
+be an OpenClaw checkout. Resolution pins and rechecks the PR head before any
+scenario is created; unavailable targets or head changes fail without creating
+scenario envs. JSON reports `pullRequest: {repository, number, headSha, url}` on
+each result and on multi-scenario summaries. Each scenario owns an independent
+checkout, so `--keep-simulations` remains usable after the run. Remove retained
+build artifacts before destroying a kept env, as with other dev worktrees; env
+destruction then removes its checkout. PR source runs the same dependency and build scripts as
+local source. Use a disposable worker for untrusted PRs: environment isolation
+does not sandbox repository code.
 
 `upgrade` is env-first:
 

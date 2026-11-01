@@ -279,6 +279,7 @@ ocm upgrade simulate mira --to 2026.4.20
 ocm upgrade simulate mira --to 2026.4.20 --scenario all
 ocm upgrade simulate mira --to beta --scenario all
 ocm upgrade simulate mira --to ./openclaw
+ocm upgrade simulate mira --to 'openclaw/openclaw#123'
 ```
 
 On Unix, `ocm upgrade job start mira --json` starts an independent OCM worker and returns its request ID before the upgrade runs.
@@ -469,6 +470,14 @@ directory fails the simulation before anything is installed. Use
 `--scenario all` to test the current env config plus built-in clean minimum and
 Telegram-configured env shapes. Use `--keep-simulations` only when you need
 retained simulation envs and temporary runtimes for debugging.
+
+PR targets accept `owner/repo#123` or a GitHub pull-request URL. They use `gh`
+and your existing GitHub/Git authentication, record the repository, PR number,
+and exact head SHA in JSON's `pullRequest` field, and reject a head that changes
+during resolution. Every scenario owns its checkout and uses the existing local
+source checks; `--keep-simulations` retains those checkouts until their envs are
+destroyed. A simulation isolates environment state, not build scripts' access to
+your computer. Run untrusted PRs on a disposable worker.
 
 ### Use a local checkout or dev build
 
