@@ -460,14 +460,14 @@ pub(crate) fn deactivate_managed_service(
             if !stop.status.success() {
                 return Err(format!(
                     "systemctl --user stop failed: {}",
-                    systemctl_detail(&stop)
+                    service_manager_detail(&stop)
                 ));
             }
             let disable = run_systemctl(env, ["--user", "disable", definition.label.as_str()])?;
             if !disable.status.success() {
                 return Err(format!(
                     "systemctl --user disable failed: {}",
-                    systemctl_detail(&disable)
+                    service_manager_detail(&disable)
                 ));
             }
         }
@@ -490,7 +490,7 @@ pub(crate) fn deactivate_managed_service(
         if !reload.status.success() {
             return Err(format!(
                 "systemctl --user daemon-reload failed: {}",
-                systemctl_detail(&reload)
+                service_manager_detail(&reload)
             ));
         }
     }
@@ -514,17 +514,17 @@ fn deactivate_launchd_service(
     if !launchd_job_is_loaded(&target, env)? {
         return Ok(());
     }
-    failures.push(launchctl_detail(&output));
+    failures.push(service_manager_detail(&output));
     let output = run_launchctl(env, ["bootout", domain, definition_path.as_str()])?;
     if !launchd_job_is_loaded(&target, env)? {
         return Ok(());
     }
-    failures.push(launchctl_detail(&output));
+    failures.push(service_manager_detail(&output));
     let output = run_launchctl(env, ["unload", definition_path.as_str()])?;
     if !launchd_job_is_loaded(&target, env)? {
         return Ok(());
     }
-    failures.push(launchctl_detail(&output));
+    failures.push(service_manager_detail(&output));
 
     let details = failures
         .into_iter()
@@ -543,7 +543,7 @@ fn launchd_job_is_loaded(target: &str, env: &BTreeMap<String, String>) -> Result
     if output.status.success() {
         return Ok(true);
     }
-    let detail = launchctl_detail(&output);
+    let detail = service_manager_detail(&output);
     if detail
         .to_ascii_lowercase()
         .contains("could not find service")
@@ -599,7 +599,7 @@ pub(crate) fn managed_service_enablement(
     if !output.status.success() {
         return Err(format!(
             "launchctl print-disabled failed for {domain}: {}",
-            launchctl_detail(&output)
+            service_manager_detail(&output)
         ));
     }
     let disabled = String::from_utf8_lossy(&output.stdout)
@@ -662,7 +662,7 @@ fn stop_launchd_job_for_restore(
     if !terminate.status.success() {
         return Err(format!(
             "launchctl kill failed while restoring {target}: {}",
-            launchctl_detail(&terminate)
+            service_manager_detail(&terminate)
         ));
     }
     let deadline = Instant::now() + Duration::from_secs(1);
@@ -697,7 +697,7 @@ fn set_launchd_service_enablement(
     } else {
         Err(format!(
             "launchctl {action} failed while restoring {target}: {}",
-            launchctl_detail(&output)
+            service_manager_detail(&output)
         ))
     }
 }
@@ -707,7 +707,7 @@ fn launchd_job_is_running(target: &str, env: &BTreeMap<String, String>) -> Resul
     if !output.status.success() {
         return Err(format!(
             "launchctl lost {target} while restoring its stopped state: {}",
-            launchctl_detail(&output)
+            service_manager_detail(&output)
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout)
@@ -986,7 +986,7 @@ fn activate_launchd_service(
     if !bootstrap.status.success() {
         return Err(format!(
             "launchctl bootstrap failed: {}",
-            launchctl_detail(&bootstrap)
+            service_manager_detail(&bootstrap)
         ));
     }
     Ok(())
@@ -1007,8 +1007,8 @@ fn activate_systemd_user_service(
     if !start.status.success() {
         return Err(format!(
             "systemctl --user restart/start failed: {}; {}",
-            systemctl_detail(&restart),
-            systemctl_detail(&start)
+            service_manager_detail(&restart),
+            service_manager_detail(&start)
         ));
     }
 
@@ -1023,7 +1023,7 @@ fn register_systemd_user_service(
     if !reload.status.success() {
         return Err(format!(
             "systemctl --user daemon-reload failed: {}",
-            systemctl_detail(&reload)
+            service_manager_detail(&reload)
         ));
     }
 
@@ -1031,7 +1031,7 @@ fn register_systemd_user_service(
     if !enable.status.success() {
         return Err(format!(
             "systemctl --user enable failed: {}",
-            systemctl_detail(&enable)
+            service_manager_detail(&enable)
         ));
     }
     Ok(())
@@ -1049,7 +1049,7 @@ fn restore_systemd_user_service_registration(
     if !reload.status.success() {
         return Err(format!(
             "systemctl --user daemon-reload failed: {}",
-            systemctl_detail(&reload)
+            service_manager_detail(&reload)
         ));
     }
     let running_result = if running {
@@ -1063,8 +1063,8 @@ fn restore_systemd_user_service_registration(
             } else {
                 Err(format!(
                     "systemctl --user restart/start failed while restoring {label}: {}; {}",
-                    systemctl_detail(&restart),
-                    systemctl_detail(&start)
+                    service_manager_detail(&restart),
+                    service_manager_detail(&start)
                 ))
             }
         }
@@ -1101,7 +1101,7 @@ fn set_systemd_service_enablement(
     if !output.status.success() {
         return Err(format!(
             "systemctl --user {action} failed while restoring {label}: {}",
-            systemctl_detail(&output)
+            service_manager_detail(&output)
         ));
     }
     Ok(())
@@ -1180,15 +1180,7 @@ fn retry_service_manager_executable_busy<T>(
     unreachable!("busy retry loop always returns on its final attempt")
 }
 
-fn launchctl_detail(output: &Output) -> String {
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if !stderr.is_empty() {
-        return stderr;
-    }
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
-}
-
-fn systemctl_detail(output: &Output) -> String {
+fn service_manager_detail(output: &Output) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     if !stderr.is_empty() {
         return stderr;

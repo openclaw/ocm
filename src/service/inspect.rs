@@ -7,7 +7,8 @@ use std::time::Duration;
 use serde::Serialize;
 
 use super::platform::{
-    ManagedServiceEnablement, ServiceManagerKind, gui_domain, service_manager_kind,
+    ManagedServiceEnablement, ServiceManagerKind, gui_domain, service_manager_binary,
+    service_manager_kind,
 };
 use crate::cli::render::format_rfc3339;
 use crate::env::GatewayProcessSpec;
@@ -20,18 +21,6 @@ use crate::supervisor::{
     SupervisorChildSpec, SupervisorDaemonSummary, SupervisorInspection, SupervisorRuntimeChild,
     SupervisorRuntimeService, SupervisorService,
 };
-
-fn launchctl_binary(env: &BTreeMap<String, String>) -> String {
-    env.get("OCM_INTERNAL_LAUNCHCTL_BIN")
-        .cloned()
-        .unwrap_or_else(|| "launchctl".to_string())
-}
-
-fn systemctl_binary(env: &BTreeMap<String, String>) -> String {
-    env.get("OCM_INTERNAL_SYSTEMCTL_BIN")
-        .cloned()
-        .unwrap_or_else(|| "systemctl".to_string())
-}
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct LaunchdJobStatus {
@@ -747,7 +736,7 @@ fn inspect_job_inner(
             } else {
                 format!("gui/{}", current_uid().ok_or_else(unknown)?)
             };
-            let output = Command::new(launchctl_binary(env))
+            let output = Command::new(service_manager_binary(env, ServiceManagerKind::Launchd))
                 .args(["print", &format!("{domain}/{label}")])
                 .output()
                 .map_err(|error| format!("failed to inspect managed service {label}: {error}"))?;
@@ -783,7 +772,7 @@ fn inspect_job_inner(
             }
         }
         ServiceManagerKind::SystemdUser => {
-            let output = Command::new(systemctl_binary(env))
+            let output = Command::new(service_manager_binary(env, ServiceManagerKind::SystemdUser))
                 .args([
                     "--user",
                     "show",
@@ -853,7 +842,7 @@ pub(crate) fn observe_job_for_source_watch(
     let inactive = match service_manager_kind(env) {
         ServiceManagerKind::Launchd => {
             let domain = gui_domain(env)?;
-            let output = Command::new(launchctl_binary(env))
+            let output = Command::new(service_manager_binary(env, ServiceManagerKind::Launchd))
                 .args(["print", &format!("{domain}/{label}")])
                 .output()
                 .map_err(|error| format!("failed to inspect managed service {label}: {error}"))?;
@@ -874,7 +863,7 @@ pub(crate) fn observe_job_for_source_watch(
             matches!(status.state.as_deref(), Some("not running" | "stopped"))
         }
         ServiceManagerKind::SystemdUser => {
-            let output = Command::new(systemctl_binary(env))
+            let output = Command::new(service_manager_binary(env, ServiceManagerKind::SystemdUser))
                 .args([
                     "--user",
                     "show",
@@ -982,10 +971,6 @@ fn parse_launchctl_print(raw: &str, status: &mut LaunchdJobStatus) {
             status.pid = pid.ok();
             continue;
         }
-        if trimmed.starts_with("OPENCLAW_CONFIG_PATH => ") {
-            continue;
-        }
-        if trimmed.starts_with("OPENCLAW_GATEWAY_PORT => ") {}
     }
 }
 
@@ -1019,13 +1004,6 @@ fn parse_systemctl_show(raw: &str, status: &mut LaunchdJobStatus) {
             status.definition_path = Some(value.trim().to_string());
             continue;
         }
-        if line.starts_with("ExecStart=") {
-            continue;
-        }
-        if line.starts_with("WorkingDirectory=") {
-            continue;
-        }
-        if line.starts_with("Environment=") {}
     }
 
     status.loaded = load_state.as_deref() == Some("loaded")
