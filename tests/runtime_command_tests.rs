@@ -3189,6 +3189,18 @@ fn runtime_build_local_omits_platform_incompatible_source_extensions() {
             "--json",
         ],
     );
+    #[cfg(windows)]
+    if !build.status.success() {
+        for entry in fs::read_dir(root.child("npm-cache/_logs")).unwrap() {
+            let log = fs::read_to_string(entry.unwrap().path()).unwrap();
+            for line in log
+                .lines()
+                .filter(|line| line.contains("error") || line.contains("argv"))
+            {
+                eprintln!("{line}");
+            }
+        }
+    }
     assert!(build.status.success(), "{}", stderr(&build));
     let built = runtime_install_root("compatible", &env, &cwd)
         .unwrap()
