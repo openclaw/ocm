@@ -86,7 +86,6 @@ impl NativeFixture {
             .unwrap()
             .join("node_modules/npm/bin/npm-cli.js");
         assert!(npm_cli.is_file(), "native npm CLI missing: {npm_cli:?}");
-        env.insert("OCM_INTERNAL_NPM_BIN".into(), path_string(&npm));
         let fixture = Self {
             root,
             env,
