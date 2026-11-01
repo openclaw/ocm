@@ -2845,6 +2845,354 @@ impl Cli {
         ))
     }
 
+    fn upgrade_to_runtime(
+        &self,
+        env_name: &str,
+        previous_binding_name: String,
+        current: Option<&RuntimeMeta>,
+        target: &UpgradeTarget,
+        options: UpgradeOptions,
+        operation_lock: &UpgradeCommandLocks<'_>,
+    ) -> Result<UpgradeEnvSummary, String> {
+        let previous_binding_kind = if current.is_some() {
+            "runtime"
+        } else {
+            "launcher"
+        };
+        let resolved = self.resolve_upgrade_target(target)?;
+        let command_locks =
+            operation_lock.with_target_runtime(resolved.named_runtime_guard.clone());
+        let operation_lock = &command_locks;
+        let target_runtime_name = resolved.name.clone();
+        let target_version = self.resolved_target_version(env_name, &resolved, operation_lock)?;
+        let target_release_version = target_version
+            .clone()
+            .or_else(|| resolved.release_version.clone());
+        let target_channel = resolved.release_channel.clone();
+        let source_version = self.ensure_upgrade_is_not_downgrade(
+            env_name,
+            current.and_then(|current| current.release_version.as_deref()),
+            target_version.as_deref(),
+            operation_lock,
+        )?;
+        if !target.is_named_runtime() {
+            self.ensure_runtime_upgrade_isolated(env_name, &target_runtime_name)?;
+        }
+        let service = self.upgrade_service_status(env_name)?;
+        if options.dry_run {
+            let binding_changed = current.is_none_or(|current| target_runtime_name != current.name);
+            return Ok(UpgradeEnvSummary {
+                source: None,
+                env_name: env_name.to_string(),
+                previous_binding_kind: previous_binding_kind.to_string(),
+                previous_binding_name,
+                binding_kind: "runtime".to_string(),
+                binding_name: target_runtime_name,
+                outcome: if binding_changed {
+                    "would-switch".to_string()
+                } else {
+                    "would-update".to_string()
+                },
+                runtime_release_version: target_release_version.clone(),
+                runtime_release_channel: target_channel,
+                service_action: service_action_for_dry_run(service.as_ref(), binding_changed, true),
+                snapshot_id: None,
+                rollback: None,
+                note: Some(UPGRADE_DRY_RUN_NOTES.join("; ")),
+            });
+        }
+        let runtime_names = if current.is_some() && target.is_named_runtime() {
+            Vec::new()
+        } else {
+            vec![target_runtime_name.clone()]
+        };
+        let mut timings = UpgradeTimingRecorder::new();
+        let preparation_started = timings.start();
+        let prepared = match self.prepare_isolated_upgrade_target(env_name, target, resolved) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return self.fail_upgrade_before_cutover(
+                    env_name,
+                    previous_binding_kind,
+                    previous_binding_name,
+                    "runtime",
+                    target_runtime_name,
+                    target_release_version.clone(),
+                    target_channel,
+                    error,
+                );
+            }
+        };
+        let command_locks = operation_lock
+            .with_runtime(prepared.runtime_guard.clone())
+            .with_target_runtime(prepared.named_runtime_guard.clone());
+        let command_locks = match current {
+            Some(current) => {
+                command_locks.with_source_runtime(&current.name, &self.env, &self.cwd)?
+            }
+            None => command_locks,
+        };
+        let operation_lock = &command_locks;
+        timings.finish(
+            "ocm",
+            "preparation",
+            "preparation",
+            preparation_started,
+            "completed",
+        );
+        if let Some(current) = current {
+            if let Some(mut summary) = self.current_runtime_job_result(
+                env_name,
+                current,
+                &prepared,
+                service.as_ref(),
+                operation_lock,
+            ) {
+                summary.runtime_release_version = target_release_version;
+                summary.runtime_release_channel = target_channel;
+                return Ok(summary);
+            }
+        }
+        let target_changed = !matches!(prepared.action, OfficialRuntimePrepareAction::Reused);
+        let mut transaction = self.begin_upgrade_transaction_locked(
+            env_name,
+            UpgradeTransactionPlan {
+                source: UpgradeHistoryBinding {
+                    kind: previous_binding_kind.to_string(),
+                    name: previous_binding_name.clone(),
+                    openclaw_version: source_version,
+                },
+                target: UpgradeHistoryBinding {
+                    kind: "runtime".to_string(),
+                    name: target_runtime_name.clone(),
+                    openclaw_version: target_version.clone(),
+                },
+            },
+            &runtime_names,
+            options.rollback_enabled,
+            "pre-upgrade",
+            None,
+            timings,
+        )?;
+        transaction.runtime_guard = operation_lock.runtime.clone();
+        transaction._source_runtime_guard = operation_lock.source_runtime.clone();
+        transaction._target_runtime_guard = operation_lock.target_runtime.clone();
+        if transaction.interrupted() {
+            return self.rollback_failed_upgrade(
+                operation_lock,
+                env_name,
+                previous_binding_kind,
+                previous_binding_name,
+                "runtime",
+                target_runtime_name,
+                target_release_version,
+                target_channel,
+                transaction,
+                UPGRADE_INTERRUPTED_ERROR.to_string(),
+            );
+        }
+        if target_changed {
+            transaction.mark_runtime_mutated(&prepared.name);
+        }
+        let prepared = match prepared.commit() {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return self.rollback_failed_upgrade(
+                    operation_lock,
+                    env_name,
+                    previous_binding_kind,
+                    previous_binding_name,
+                    "runtime",
+                    target_runtime_name,
+                    target_release_version.clone(),
+                    target_channel,
+                    transaction,
+                    error,
+                );
+            }
+        };
+        let binding_changed = current.is_none_or(|current| prepared.name != current.name);
+        let post_update = match self.run_post_core_update(
+            env_name,
+            &prepared.meta,
+            &mut transaction.timings,
+            operation_lock,
+        ) {
+            Ok(result) => {
+                transaction.mark_post_update_completed(result.note.as_deref());
+                result
+            }
+            Err(error) => {
+                transaction.mark_post_update_failed(&error);
+                return self.rollback_failed_upgrade(
+                    operation_lock,
+                    env_name,
+                    previous_binding_kind,
+                    previous_binding_name,
+                    "runtime",
+                    prepared.name,
+                    target_release_version,
+                    target_channel,
+                    transaction,
+                    error.to_string(),
+                );
+            }
+        };
+        let post_update_note = post_update.note;
+        let completion_deferred = post_update.completion_deferred;
+        let publish_started = transaction.timings.start();
+        let publish_result = if binding_changed {
+            self.environment_service()
+                .set_runtime_with_guard(
+                    env_name,
+                    prepared.name.as_str(),
+                    transaction.runtime_guard.as_deref(),
+                )
+                .map(|_| ())
+        } else {
+            self.runtime_service()
+                .refresh_supervisor_if_present(&prepared.name)
+        };
+        transaction.timings.finish(
+            "ocm",
+            "bindingPublish",
+            "stopped",
+            publish_started,
+            if publish_result.is_ok() {
+                "completed"
+            } else {
+                "failed"
+            },
+        );
+        if let Err(error) = publish_result {
+            return self.rollback_failed_upgrade(
+                operation_lock,
+                env_name,
+                previous_binding_kind,
+                previous_binding_name,
+                "runtime",
+                prepared.name,
+                target_release_version,
+                target_channel,
+                transaction,
+                format!("failed to publish upgraded runtime: {error}"),
+            );
+        }
+        let service_result = self.reconcile_upgraded_service_locked(
+            env_name,
+            service.as_ref(),
+            binding_changed,
+            true,
+            &mut transaction.timings,
+        );
+        let (service_action, service_note) = match service_result {
+            Ok(result) => result,
+            Err(error) => {
+                return self.rollback_failed_upgrade(
+                    operation_lock,
+                    env_name,
+                    previous_binding_kind,
+                    previous_binding_name,
+                    "runtime",
+                    prepared.name,
+                    target_release_version,
+                    target_channel,
+                    transaction,
+                    error,
+                );
+            }
+        };
+        let runtime_note = service_note.or_else(|| {
+            if binding_changed {
+                Some(format!("env now uses runtime {}", prepared.name))
+            } else {
+                note_for_official_prepare_action(&prepared.action)
+            }
+        });
+        let completion_note = self.refresh_deferred_completion_cache(
+            env_name,
+            &prepared.name,
+            completion_deferred,
+            &mut transaction.timings,
+            operation_lock,
+        );
+        let verification_started = transaction.timings.start();
+        let verification_note = match self.verify_upgraded_openclaw(
+            env_name,
+            target_version
+                .as_deref()
+                .or(prepared.meta.release_version.as_deref()),
+            service_action.is_some(),
+            operation_lock,
+        ) {
+            Ok(note) => {
+                transaction.timings.finish(
+                    "ocm",
+                    "deepVerification",
+                    "post-ready",
+                    verification_started,
+                    "completed",
+                );
+                note
+            }
+            Err(error) => {
+                transaction.timings.finish(
+                    "ocm",
+                    "deepVerification",
+                    "post-ready",
+                    verification_started,
+                    "failed",
+                );
+                return self.rollback_failed_upgrade(
+                    operation_lock,
+                    env_name,
+                    previous_binding_kind,
+                    previous_binding_name,
+                    "runtime",
+                    prepared.name,
+                    target_release_version,
+                    target_channel,
+                    transaction,
+                    error,
+                );
+            }
+        };
+        // Preserve the existing warning order for each source binding.
+        let note = if current.is_some() {
+            join_optional_warnings(
+                join_optional_warnings(post_update_note, runtime_note),
+                completion_note,
+            )
+        } else {
+            join_optional_warnings(
+                join_optional_warnings(post_update_note, completion_note),
+                runtime_note,
+            )
+        };
+        let note = join_optional_warnings(note, verification_note);
+
+        let summary = UpgradeEnvSummary {
+            source: None,
+            env_name: env_name.to_string(),
+            previous_binding_kind: previous_binding_kind.to_string(),
+            previous_binding_name,
+            binding_kind: "runtime".to_string(),
+            binding_name: prepared.name.clone(),
+            outcome: if binding_changed {
+                "switched".to_string()
+            } else {
+                outcome_for_official_prepare_action(&prepared.action)
+            },
+            runtime_release_version: target_release_version,
+            runtime_release_channel: target_channel,
+            service_action,
+            snapshot_id: Some(transaction.snapshot_id.clone()),
+            rollback: None,
+            note,
+        };
+        self.finish_successful_upgrade(operation_lock, summary, transaction)
+    }
+
     fn upgrade_runtime_bound_env(
         &self,
         env_name: &str,
@@ -2857,330 +3205,14 @@ impl Cli {
         let previous_binding_name = current.name.clone();
 
         if target.is_explicit() {
-            let resolved = self.resolve_upgrade_target(target)?;
-            let command_locks =
-                operation_lock.with_target_runtime(resolved.named_runtime_guard.clone());
-            let operation_lock = &command_locks;
-            let target_runtime_name = resolved.name.clone();
-            let target_version =
-                self.resolved_target_version(env_name, &resolved, operation_lock)?;
-            let target_release_version = target_version
-                .clone()
-                .or_else(|| resolved.release_version.clone());
-            let target_channel = resolved.release_channel.clone();
-            let source_version = self.ensure_upgrade_is_not_downgrade(
+            return self.upgrade_to_runtime(
                 env_name,
-                current.release_version.as_deref(),
-                target_version.as_deref(),
-                operation_lock,
-            )?;
-            if !target.is_named_runtime() {
-                self.ensure_runtime_upgrade_isolated(env_name, &target_runtime_name)?;
-            }
-            let service = self.upgrade_service_status(env_name)?;
-            if options.dry_run {
-                let binding_changed = target_runtime_name != current.name;
-                return Ok(UpgradeEnvSummary {
-                    source: None,
-                    env_name: env_name.to_string(),
-                    previous_binding_kind: "runtime".to_string(),
-                    previous_binding_name,
-                    binding_kind: "runtime".to_string(),
-                    binding_name: target_runtime_name,
-                    outcome: if binding_changed {
-                        "would-switch".to_string()
-                    } else {
-                        "would-update".to_string()
-                    },
-                    runtime_release_version: target_release_version.clone(),
-                    runtime_release_channel: target_channel,
-                    service_action: service_action_for_dry_run(
-                        service.as_ref(),
-                        binding_changed,
-                        true,
-                    ),
-                    snapshot_id: None,
-                    rollback: None,
-                    note: Some(UPGRADE_DRY_RUN_NOTES.join("; ")),
-                });
-            }
-            let runtime_names = if target.is_named_runtime() {
-                Vec::new()
-            } else {
-                vec![target_runtime_name.clone()]
-            };
-            let mut timings = UpgradeTimingRecorder::new();
-            let preparation_started = timings.start();
-            let prepared = match self.prepare_isolated_upgrade_target(env_name, target, resolved) {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    return self.fail_upgrade_before_cutover(
-                        env_name,
-                        "runtime",
-                        previous_binding_name,
-                        "runtime",
-                        target_runtime_name,
-                        target_release_version.clone(),
-                        target_channel,
-                        error,
-                    );
-                }
-            };
-            let command_locks = operation_lock
-                .with_runtime(prepared.runtime_guard.clone())
-                .with_target_runtime(prepared.named_runtime_guard.clone())
-                .with_source_runtime(&current.name, &self.env, &self.cwd)?;
-            let operation_lock = &command_locks;
-            timings.finish(
-                "ocm",
-                "preparation",
-                "preparation",
-                preparation_started,
-                "completed",
-            );
-            if let Some(mut summary) = self.current_runtime_job_result(
-                env_name,
-                &current,
-                &prepared,
-                service.as_ref(),
-                operation_lock,
-            ) {
-                summary.runtime_release_version = target_release_version;
-                summary.runtime_release_channel = target_channel;
-                return Ok(summary);
-            }
-            let target_changed = !matches!(prepared.action, OfficialRuntimePrepareAction::Reused);
-            let mut transaction = self.begin_upgrade_transaction_locked(
-                env_name,
-                UpgradeTransactionPlan {
-                    source: UpgradeHistoryBinding {
-                        kind: "runtime".to_string(),
-                        name: current.name.clone(),
-                        openclaw_version: source_version,
-                    },
-                    target: UpgradeHistoryBinding {
-                        kind: "runtime".to_string(),
-                        name: target_runtime_name.clone(),
-                        openclaw_version: target_version.clone(),
-                    },
-                },
-                &runtime_names,
-                options.rollback_enabled,
-                "pre-upgrade",
-                None,
-                timings,
-            )?;
-            transaction.runtime_guard = operation_lock.runtime.clone();
-            transaction._source_runtime_guard = operation_lock.source_runtime.clone();
-            transaction._target_runtime_guard = operation_lock.target_runtime.clone();
-            if transaction.interrupted() {
-                return self.rollback_failed_upgrade(
-                    operation_lock,
-                    env_name,
-                    "runtime",
-                    previous_binding_name,
-                    "runtime",
-                    target_runtime_name,
-                    target_release_version,
-                    target_channel,
-                    transaction,
-                    UPGRADE_INTERRUPTED_ERROR.to_string(),
-                );
-            }
-            if target_changed {
-                transaction.mark_runtime_mutated(&prepared.name);
-            }
-            let prepared = match prepared.commit() {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    return self.rollback_failed_upgrade(
-                        operation_lock,
-                        env_name,
-                        "runtime",
-                        previous_binding_name,
-                        "runtime",
-                        target_runtime_name,
-                        target_release_version.clone(),
-                        target_channel,
-                        transaction,
-                        error,
-                    );
-                }
-            };
-            let binding_changed = prepared.name != current.name;
-            let post_update = match self.run_post_core_update(
-                env_name,
-                &prepared.meta,
-                &mut transaction.timings,
-                operation_lock,
-            ) {
-                Ok(result) => {
-                    transaction.mark_post_update_completed(result.note.as_deref());
-                    result
-                }
-                Err(error) => {
-                    transaction.mark_post_update_failed(&error);
-                    return self.rollback_failed_upgrade(
-                        operation_lock,
-                        env_name,
-                        "runtime",
-                        previous_binding_name,
-                        "runtime",
-                        prepared.name,
-                        target_release_version,
-                        target_channel,
-                        transaction,
-                        error.to_string(),
-                    );
-                }
-            };
-            let post_update_note = post_update.note;
-            let completion_deferred = post_update.completion_deferred;
-            let publish_started = transaction.timings.start();
-            let publish_result = if binding_changed {
-                self.environment_service()
-                    .set_runtime_with_guard(
-                        env_name,
-                        prepared.name.as_str(),
-                        transaction.runtime_guard.as_deref(),
-                    )
-                    .map(|_| ())
-            } else {
-                self.runtime_service()
-                    .refresh_supervisor_if_present(&prepared.name)
-            };
-            transaction.timings.finish(
-                "ocm",
-                "bindingPublish",
-                "stopped",
-                publish_started,
-                if publish_result.is_ok() {
-                    "completed"
-                } else {
-                    "failed"
-                },
-            );
-            if let Err(error) = publish_result {
-                return self.rollback_failed_upgrade(
-                    operation_lock,
-                    env_name,
-                    "runtime",
-                    previous_binding_name,
-                    "runtime",
-                    prepared.name,
-                    target_release_version,
-                    target_channel,
-                    transaction,
-                    format!("failed to publish upgraded runtime: {error}"),
-                );
-            }
-            let service_result = self.reconcile_upgraded_service_locked(
-                env_name,
-                service.as_ref(),
-                binding_changed,
-                true,
-                &mut transaction.timings,
-            );
-            let (service_action, service_note) = match service_result {
-                Ok(result) => result,
-                Err(error) => {
-                    return self.rollback_failed_upgrade(
-                        operation_lock,
-                        env_name,
-                        "runtime",
-                        previous_binding_name,
-                        "runtime",
-                        prepared.name,
-                        target_release_version,
-                        target_channel,
-                        transaction,
-                        error,
-                    );
-                }
-            };
-            let runtime_note = service_note.or_else(|| {
-                if binding_changed {
-                    Some(format!("env now uses runtime {}", prepared.name))
-                } else {
-                    note_for_official_prepare_action(&prepared.action)
-                }
-            });
-            let completion_note = self.refresh_deferred_completion_cache(
-                env_name,
-                &prepared.name,
-                completion_deferred,
-                &mut transaction.timings,
-                operation_lock,
-            );
-            let verification_started = transaction.timings.start();
-            let verification_note = match self.verify_upgraded_openclaw(
-                env_name,
-                target_version
-                    .as_deref()
-                    .or(prepared.meta.release_version.as_deref()),
-                service_action.is_some(),
-                operation_lock,
-            ) {
-                Ok(note) => {
-                    transaction.timings.finish(
-                        "ocm",
-                        "deepVerification",
-                        "post-ready",
-                        verification_started,
-                        "completed",
-                    );
-                    note
-                }
-                Err(error) => {
-                    transaction.timings.finish(
-                        "ocm",
-                        "deepVerification",
-                        "post-ready",
-                        verification_started,
-                        "failed",
-                    );
-                    return self.rollback_failed_upgrade(
-                        operation_lock,
-                        env_name,
-                        "runtime",
-                        previous_binding_name,
-                        "runtime",
-                        prepared.name,
-                        target_release_version,
-                        target_channel,
-                        transaction,
-                        error,
-                    );
-                }
-            };
-            let note = join_optional_warnings(
-                join_optional_warnings(
-                    join_optional_warnings(post_update_note, runtime_note),
-                    completion_note,
-                ),
-                verification_note,
-            );
-
-            let summary = UpgradeEnvSummary {
-                source: None,
-                env_name: env_name.to_string(),
-                previous_binding_kind: "runtime".to_string(),
                 previous_binding_name,
-                binding_kind: "runtime".to_string(),
-                binding_name: prepared.name.clone(),
-                outcome: if binding_changed {
-                    "switched".to_string()
-                } else {
-                    outcome_for_official_prepare_action(&prepared.action)
-                },
-                runtime_release_version: target_release_version,
-                runtime_release_channel: target_channel,
-                service_action,
-                snapshot_id: Some(transaction.snapshot_id.clone()),
-                rollback: None,
-                note,
-            };
-            return self.finish_successful_upgrade(operation_lock, summary, transaction);
+                Some(&current),
+                target,
+                options,
+                operation_lock,
+            );
         }
 
         if current.source_manifest_url.is_none() {
@@ -3889,284 +3921,14 @@ impl Cli {
             });
         }
 
-        let resolved = self.resolve_upgrade_target(target)?;
-        let command_locks =
-            operation_lock.with_target_runtime(resolved.named_runtime_guard.clone());
-        let operation_lock = &command_locks;
-        let target_runtime_name = resolved.name.clone();
-        let target_version = self.resolved_target_version(env_name, &resolved, operation_lock)?;
-        let target_release_version = target_version
-            .clone()
-            .or_else(|| resolved.release_version.clone());
-        let target_channel = resolved.release_channel.clone();
-        let source_version = self.ensure_upgrade_is_not_downgrade(
+        self.upgrade_to_runtime(
             env_name,
+            launcher_name.to_string(),
             None,
-            target_version.as_deref(),
+            target,
+            options,
             operation_lock,
-        )?;
-        if !target.is_named_runtime() {
-            self.ensure_runtime_upgrade_isolated(env_name, &target_runtime_name)?;
-        }
-        let service = self.upgrade_service_status(env_name)?;
-        if options.dry_run {
-            return Ok(UpgradeEnvSummary {
-                source: None,
-                env_name: env_name.to_string(),
-                previous_binding_kind: "launcher".to_string(),
-                previous_binding_name: launcher_name.to_string(),
-                binding_kind: "runtime".to_string(),
-                binding_name: target_runtime_name,
-                outcome: "would-switch".to_string(),
-                runtime_release_version: target_release_version.clone(),
-                runtime_release_channel: target_channel,
-                service_action: service_action_for_dry_run(service.as_ref(), true, true),
-                snapshot_id: None,
-                rollback: None,
-                note: Some(UPGRADE_DRY_RUN_NOTES.join("; ")),
-            });
-        }
-
-        let mut timings = UpgradeTimingRecorder::new();
-        let preparation_started = timings.start();
-        let prepared = match self.prepare_isolated_upgrade_target(env_name, target, resolved) {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                return self.fail_upgrade_before_cutover(
-                    env_name,
-                    "launcher",
-                    launcher_name.to_string(),
-                    "runtime",
-                    target_runtime_name,
-                    target_release_version.clone(),
-                    target_channel,
-                    error,
-                );
-            }
-        };
-        let command_locks = operation_lock
-            .with_runtime(prepared.runtime_guard.clone())
-            .with_target_runtime(prepared.named_runtime_guard.clone());
-        let operation_lock = &command_locks;
-        timings.finish(
-            "ocm",
-            "preparation",
-            "preparation",
-            preparation_started,
-            "completed",
-        );
-        let target_changed = !matches!(prepared.action, OfficialRuntimePrepareAction::Reused);
-        let mut transaction = self.begin_upgrade_transaction_locked(
-            env_name,
-            UpgradeTransactionPlan {
-                source: UpgradeHistoryBinding {
-                    kind: "launcher".to_string(),
-                    name: launcher_name.to_string(),
-                    openclaw_version: source_version,
-                },
-                target: UpgradeHistoryBinding {
-                    kind: "runtime".to_string(),
-                    name: target_runtime_name.clone(),
-                    openclaw_version: target_version.clone(),
-                },
-            },
-            std::slice::from_ref(&target_runtime_name),
-            options.rollback_enabled,
-            "pre-upgrade",
-            None,
-            timings,
-        )?;
-        transaction.runtime_guard = operation_lock.runtime.clone();
-        transaction._source_runtime_guard = operation_lock.source_runtime.clone();
-        transaction._target_runtime_guard = operation_lock.target_runtime.clone();
-        if transaction.interrupted() {
-            return self.rollback_failed_upgrade(
-                operation_lock,
-                env_name,
-                "launcher",
-                launcher_name.to_string(),
-                "runtime",
-                target_runtime_name,
-                target_release_version,
-                target_channel,
-                transaction,
-                UPGRADE_INTERRUPTED_ERROR.to_string(),
-            );
-        }
-        if target_changed {
-            transaction.mark_runtime_mutated(&prepared.name);
-        }
-        let prepared = match prepared.commit() {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                return self.rollback_failed_upgrade(
-                    operation_lock,
-                    env_name,
-                    "launcher",
-                    launcher_name.to_string(),
-                    "runtime",
-                    target_runtime_name,
-                    target_release_version.clone(),
-                    target_channel,
-                    transaction,
-                    error,
-                );
-            }
-        };
-        let post_update = match self.run_post_core_update(
-            env_name,
-            &prepared.meta,
-            &mut transaction.timings,
-            operation_lock,
-        ) {
-            Ok(result) => {
-                transaction.mark_post_update_completed(result.note.as_deref());
-                result
-            }
-            Err(error) => {
-                transaction.mark_post_update_failed(&error);
-                return self.rollback_failed_upgrade(
-                    operation_lock,
-                    env_name,
-                    "launcher",
-                    launcher_name.to_string(),
-                    "runtime",
-                    prepared.name,
-                    target_release_version,
-                    target_channel,
-                    transaction,
-                    error.to_string(),
-                );
-            }
-        };
-        let post_update_note = post_update.note;
-        let completion_deferred = post_update.completion_deferred;
-        let publish_started = transaction.timings.start();
-        let publish_result = self.environment_service().set_runtime_with_guard(
-            env_name,
-            prepared.name.as_str(),
-            transaction.runtime_guard.as_deref(),
-        );
-        transaction.timings.finish(
-            "ocm",
-            "bindingPublish",
-            "stopped",
-            publish_started,
-            if publish_result.is_ok() {
-                "completed"
-            } else {
-                "failed"
-            },
-        );
-        if let Err(error) = publish_result {
-            return self.rollback_failed_upgrade(
-                operation_lock,
-                env_name,
-                "launcher",
-                launcher_name.to_string(),
-                "runtime",
-                prepared.name,
-                target_release_version,
-                target_channel,
-                transaction,
-                format!("failed to publish upgraded runtime: {error}"),
-            );
-        }
-        let service_result = self.reconcile_upgraded_service_locked(
-            env_name,
-            service.as_ref(),
-            true,
-            true,
-            &mut transaction.timings,
-        );
-        let (service_action, service_note) = match service_result {
-            Ok(result) => result,
-            Err(error) => {
-                return self.rollback_failed_upgrade(
-                    operation_lock,
-                    env_name,
-                    "launcher",
-                    launcher_name.to_string(),
-                    "runtime",
-                    prepared.name,
-                    target_release_version,
-                    target_channel,
-                    transaction,
-                    error,
-                );
-            }
-        };
-        let completion_note = self.refresh_deferred_completion_cache(
-            env_name,
-            &prepared.name,
-            completion_deferred,
-            &mut transaction.timings,
-            operation_lock,
-        );
-        let verification_started = transaction.timings.start();
-        let verification_note = match self.verify_upgraded_openclaw(
-            env_name,
-            target_version
-                .as_deref()
-                .or(prepared.meta.release_version.as_deref()),
-            service_action.is_some(),
-            operation_lock,
-        ) {
-            Ok(note) => {
-                transaction.timings.finish(
-                    "ocm",
-                    "deepVerification",
-                    "post-ready",
-                    verification_started,
-                    "completed",
-                );
-                note
-            }
-            Err(error) => {
-                transaction.timings.finish(
-                    "ocm",
-                    "deepVerification",
-                    "post-ready",
-                    verification_started,
-                    "failed",
-                );
-                return self.rollback_failed_upgrade(
-                    operation_lock,
-                    env_name,
-                    "launcher",
-                    launcher_name.to_string(),
-                    "runtime",
-                    prepared.name,
-                    target_release_version,
-                    target_channel,
-                    transaction,
-                    error,
-                );
-            }
-        };
-        let summary = UpgradeEnvSummary {
-            source: None,
-            env_name: env_name.to_string(),
-            previous_binding_kind: "launcher".to_string(),
-            previous_binding_name: launcher_name.to_string(),
-            binding_kind: "runtime".to_string(),
-            binding_name: prepared.name.clone(),
-            outcome: "switched".to_string(),
-            runtime_release_version: target_release_version,
-            runtime_release_channel: target_channel,
-            service_action,
-            snapshot_id: Some(transaction.snapshot_id.clone()),
-            rollback: None,
-            note: join_optional_warnings(
-                join_optional_warnings(
-                    join_optional_warnings(post_update_note, completion_note),
-                    service_note
-                        .or_else(|| Some(format!("env now uses runtime {}", prepared.name))),
-                ),
-                verification_note,
-            ),
-        };
-        self.finish_successful_upgrade(operation_lock, summary, transaction)
+        )
     }
 
     fn current_runtime_job_result(
