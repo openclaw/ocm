@@ -67,6 +67,9 @@ jobs:
           git rev-parse HEAD 'HEAD^{tree}'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo check --workspace --all-targets --locked
+      - name: Prove native Windows launcher shell arguments
+        timeout-minutes: 5
+        run: cargo test --locked --test execution_tests gateway_process_spec_shell_arguments_wrap_the_launcher_command -- --exact --nocapture
       - name: Prove Windows configuration include guards
         timeout-minutes: 5
         run: cargo test --locked --lib store::config_include_read::tests -- --nocapture
