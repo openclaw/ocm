@@ -214,8 +214,11 @@ python3 -B scripts/validate-native-gateway.py \
 
 Choose an exact published OpenClaw version. This downloads the real package,
 checks plugin discovery and runtime integrity, and exercises native service
-install, start, authenticated health, restart, stop, and uninstall. It does not
-make model or channel calls. Run it exclusively on that disposable user; OCM's
+install, start, authenticated health, restart, stop, and uninstall. Before and
+after restart, a real agent turn sends its configured model, synthetic credential,
+and message to a loopback OpenAI-compatible HTTP fixture and returns its reply.
+This checks provider transport through the running Gateway, not external provider
+authentication or channel delivery. Run it exclusively on that disposable user; OCM's
 native service label is shared across stores. An existing unit or definition
 causes refusal. The check isolates `OCM_HOME`, keeps the real user bus and home,
 and uses no service-manager or readiness overrides. Successful runs remove their

@@ -14,6 +14,8 @@ import sys
 import tempfile
 from urllib.parse import urlsplit
 
+from native_gateway_provider import ProviderFixture
+
 UNIT = "ai.openclaw.ocm.service"
 ENV_NAME = "native-gateway"
 
@@ -54,9 +56,6 @@ def main():
     if definition.exists() or definition.is_symlink() or unit_property("LoadState") != "not-found":
         raise RuntimeError("existing native OCM service; use a fresh disposable user")
 
-    with socket.socket() as listener:
-        listener.bind(("127.0.0.1", 0))
-        port = listener.getsockname()[1]
     root = Path(tempfile.mkdtemp(prefix="ocm-native-gateway-"))
     print("isolated test state:", root, flush=True)
     # Cargo artifacts may intentionally select an installed OCM for the daemon.
@@ -114,15 +113,17 @@ def main():
         )
         return observed
 
+    provider = ProviderFixture()
     created = False
     try:
         installed = oc_json(
             "published install", "start", ENV_NAME,
-            "--version", args.openclaw_version, "--port", port, "--no-service",
+            "--version", args.openclaw_version, "--no-service",
             timeout=1200,
         )
         created = installed["created"]
         assert created and not installed["serviceRequested"]
+        port = installed["gatewayPort"]
         runtime = installed["defaultRuntime"]
         oc_json("runtime integrity", "runtime", "verify", runtime)
         version = run("published version", "@" + ENV_NAME, "--", "--version")
@@ -133,13 +134,18 @@ def main():
         assert not errors, errors
         print("native plugin discovery:", len(inventory["plugins"]), "plugins", flush=True)
 
+        details = oc_json("provider environment", "env", "show", ENV_NAME)
+        provider.configure(Path(details["configPath"]))
+
         assert oc_json("service install", "service", "install", ENV_NAME)["installed"]
         assert oc_json("service start", "service", "start", ENV_NAME)["gatewayReady"] is True
         before = healthy("authenticated health")
+        provider.check(oc_json, ENV_NAME, "before restart")
         assert oc_json("service restart", "service", "restart", ENV_NAME)["gatewayReady"] is True
         after = healthy("authenticated health after restart")
         assert after["childPid"] != before["childPid"]
         assert not (Path("/proc") / str(before["childPid"])).exists()
+        provider.check(oc_json, ENV_NAME, "after restart")
         stopped = oc_json("service stop", "service", "stop", ENV_NAME)
         assert not stopped["running"] and not stopped["desiredRunning"]
         final = status()
@@ -150,15 +156,18 @@ def main():
             connection.settimeout(2)
             assert connection.connect_ex(("127.0.0.1", port)) != 0
     finally:
-        # Stop can remove the shared unit while leaving environment service policy enabled.
-        if created or definition.exists() or definition.is_symlink() or unit_property("LoadState") != "not-found":
-            daemon_pid = int(unit_property("MainPID"))
-            removed = oc_json("service uninstall", "service", "uninstall", ENV_NAME)
-            assert not removed["installed"]
-            assert oc_json("uninstalled environment policy", "env", "show", ENV_NAME)["serviceEnabled"] is False
-            assert unit_property("LoadState") == "not-found"
-            assert not definition.exists() and not definition.is_symlink()
-            assert not daemon_pid or not (Path("/proc") / str(daemon_pid)).exists()
+        try:
+            # Stop can remove the shared unit while leaving environment service policy enabled.
+            if created or definition.exists() or definition.is_symlink() or unit_property("LoadState") != "not-found":
+                daemon_pid = int(unit_property("MainPID"))
+                removed = oc_json("service uninstall", "service", "uninstall", ENV_NAME)
+                assert not removed["installed"]
+                assert oc_json("uninstalled environment policy", "env", "show", ENV_NAME)["serviceEnabled"] is False
+                assert unit_property("LoadState") == "not-found"
+                assert not definition.exists() and not definition.is_symlink()
+                assert not daemon_pid or not (Path("/proc") / str(daemon_pid)).exists()
+        finally:
+            provider.close()
     shutil.rmtree(root)
     print("PASS: published Gateway lifecycle and native service cleanup", flush=True)
 
