@@ -22,6 +22,7 @@ use std::time::Duration;
 
 use base64::Engine;
 use flate2::{Compression, write::GzEncoder};
+use ocm::supervisor::{SupervisorRuntimeChild, SupervisorRuntimeService, SupervisorRuntimeState};
 use serde::Serialize;
 use sha2::Digest;
 use sha2::Sha512;
@@ -522,26 +523,60 @@ pub fn enable_fake_daemon_gateway_admission(
     root: &TestDir,
     env: &mut BTreeMap<String, String>,
 ) -> ocm::supervisor::SupervisorGatewayAdmission {
-    let capability = fake_daemon_gateway_admission();
+    let runtime = empty_supervisor_runtime(env.get("OCM_HOME").unwrap());
+    let capability = runtime.gateway_admission.as_ref().unwrap().clone();
     env.insert(
         "OCM_TEST_NATIVE_DAEMON_PID".to_string(),
         std::process::id().to_string(),
     );
-    let runtime = ocm::supervisor::SupervisorRuntimeState {
-        retained_ownership: None,
-        kind: "ocm-supervisor-runtime".to_string(),
-        ocm_home: env.get("OCM_HOME").unwrap().clone(),
-        daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-        gateway_admission: Some(capability.clone()),
-        updated_at: ocm::store::now_utc(),
-        services: Vec::new(),
-        children: Vec::new(),
-    };
     write_json_replacing_path(
         &ocm::store::supervisor_runtime_path(env, root.path()).unwrap(),
         &runtime,
     );
     capability
+}
+
+pub fn empty_supervisor_runtime(ocm_home: &str) -> SupervisorRuntimeState {
+    SupervisorRuntimeState {
+        retained_ownership: None,
+        kind: "ocm-supervisor-runtime".to_string(),
+        ocm_home: ocm_home.to_string(),
+        daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        gateway_admission: Some(fake_daemon_gateway_admission()),
+        updated_at: ocm::store::now_utc(),
+        services: Vec::new(),
+        children: Vec::new(),
+    }
+}
+
+pub fn write_empty_supervisor_runtime(runtime_path: &Path, ocm_home: &str) {
+    write_json_replacing_path(runtime_path, &empty_supervisor_runtime(ocm_home));
+}
+
+pub fn write_running_supervisor_runtime(
+    runtime_path: &Path,
+    ocm_home: &str,
+    child: SupervisorRuntimeChild,
+) {
+    let mut runtime = empty_supervisor_runtime(ocm_home);
+    runtime.services.push(SupervisorRuntimeService {
+        env_name: child.env_name.clone(),
+        binding_kind: child.binding_kind.clone(),
+        binding_name: child.binding_name.clone(),
+        gateway_state: "running".to_string(),
+        restart_handoff: Some("none".to_string()),
+        restart_count: child.restart_count,
+        child_port: child.child_port,
+        pid: Some(child.pid),
+        stdout_path: child.stdout_path.clone(),
+        stderr_path: child.stderr_path.clone(),
+        last_exit_code: None,
+        last_error: None,
+        last_event_at: None,
+        next_retry_at: None,
+    });
+    runtime.children.push(child);
+    write_json_replacing_path(runtime_path, &runtime);
 }
 
 /// Current process identity for a synthetic daemon owned by this test process.
