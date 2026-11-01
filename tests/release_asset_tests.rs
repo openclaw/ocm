@@ -45,7 +45,7 @@ struct ReleaseCommitFixture {
 }
 
 impl ReleaseCommitFixture {
-    fn new(label: &str) -> Self {
+    fn new(label: &str, version: &str) -> Self {
         let root = TestDir::new(label);
         let repo = root.child("repo");
         fs::create_dir_all(repo.join("scripts")).unwrap();
@@ -91,21 +91,18 @@ impl ReleaseCommitFixture {
 
         fs::write(
             repo.join("Cargo.toml"),
-            "[package]\nname = \"ocm\"\nversion = \"0.2.32\"\nrepository = \"https://github.com/shakkernerd/ocm\"\n",
+            format!("[package]\nname = \"ocm\"\nversion = \"{version}\"\nrepository = \"https://github.com/shakkernerd/ocm\"\n"),
         )
         .unwrap();
         fs::write(
             repo.join("Cargo.lock"),
-            "version = 4\n\n[[package]]\nname = \"ocm\"\nversion = \"0.2.32\"\n",
+            format!("version = 4\n\n[[package]]\nname = \"ocm\"\nversion = \"{version}\"\n"),
         )
         .unwrap();
+        let subject = format!("chore(release): bump version to {version} (#81)");
         for args in [
             vec!["add", "Cargo.toml", "Cargo.lock"],
-            vec![
-                "commit",
-                "-m",
-                "chore(release): bump version to 0.2.32 (#81)",
-            ],
+            vec!["commit", "-m", &subject],
         ] {
             let output = Command::new("git")
                 .current_dir(&repo)
@@ -811,6 +808,7 @@ struct PublishResult {
     commands: String,
     draft: Option<String>,
     assets: Vec<String>,
+    checksums: Option<String>,
 }
 
 fn run_publish_scenario(
@@ -821,7 +819,8 @@ fn run_publish_scenario(
     query: &str,
     valid_assets: bool,
 ) -> PublishResult {
-    let verification = ReleaseCommitFixture::new("publish-release-verification");
+    let version = tag.strip_prefix('v').unwrap();
+    let verification = ReleaseCommitFixture::new("publish-release-verification", version);
     let root = TestDir::new("publish-release-draft-first");
     let asset_dir = root.child("dist");
     let fake_bin = root.child("bin");
@@ -874,7 +873,7 @@ if [[ "${1:-}" == "api" ]]; then
         [[ "$TEST_AUTHORITY" == "post-upload-retarget" && "$count" -gt 4 ]]; then
         target="0000000000000000000000000000000000000000"
       fi
-      printf 'v0.2.32\tcommit\t%s\t%s\n' "$target" "$verified"
+      printf '%s\tcommit\t%s\t%s\n' "$TEST_RELEASE_TAG" "$target" "$verified"
       exit 0
       ;;
     repos/openclaw/ocm/git/ref/heads/main)
@@ -886,7 +885,7 @@ if [[ "${1:-}" == "api" ]]; then
       exit 0
       ;;
     repos/openclaw/ocm/commits/*/pulls)
-      printf '81\tclosed\t2026-08-16T01:41:59Z\tmain\trelease/v0.2.32\t%s\tchore(release): bump version to 0.2.32\n' "$TEST_EXPECTED_COMMIT"
+      printf '81\tclosed\t2026-08-16T01:41:59Z\tmain\trelease/%s\t%s\tchore(release): bump version to %s\n' "$TEST_RELEASE_TAG" "$TEST_EXPECTED_COMMIT" "$TEST_RELEASE_VERSION"
       exit 0
       ;;
     repos/openclaw/ocm)
@@ -926,6 +925,9 @@ case "${1:-} ${2:-}" in
       case "$arg" in
         *.tar.gz|*/SHA256SUMS|*/install.sh) basename "$arg" >>"${TEST_GH_STATE}/assets" ;;
       esac
+      if [[ "$arg" == */SHA256SUMS ]]; then
+        cp "$arg" "${TEST_GH_STATE}/checksums"
+      fi
     done
     sort -o "${TEST_GH_STATE}/assets" "${TEST_GH_STATE}/assets"
     if [[ "$TEST_UPLOAD" == "mismatch" ]]; then
@@ -959,8 +961,11 @@ esac
         ])
         .arg(&asset_dir)
         .env("PATH", path)
+        .env("OCM_GH_BIN", fake_bin.join("gh"))
         .env("TEST_GH_STATE", &state_dir)
         .env("TEST_EXPECTED_COMMIT", &verification.commit)
+        .env("TEST_RELEASE_TAG", tag)
+        .env("TEST_RELEASE_VERSION", version)
         .env("TEST_AUTHORITY", authority)
         .env("TEST_LOOKUP", lookup)
         .env("TEST_UPLOAD", upload)
@@ -980,48 +985,70 @@ esac
         commands,
         draft,
         assets,
+        checksums: fs::read_to_string(state_dir.join("checksums")).ok(),
     }
 }
 
 #[test]
-fn publish_release_settles_stable_draft_after_authority_and_asset_verification() {
-    let result = run_publish_scenario("v0.2.32", "success", "missing", "success", "success", true);
-    assert!(result.output.status.success(), "{}", stderr(&result.output));
-    assert_eq!(
-        result.assets.into_iter().collect::<BTreeSet<_>>(),
-        RELEASE_ASSETS
-            .into_iter()
-            .map(str::to_string)
-            .collect::<BTreeSet<_>>()
-    );
-    assert_eq!(result.draft.as_deref(), Some("false\n"));
+fn publish_release_settles_verified_drafts_with_channel_flags() {
+    for (tag, prerelease) in [("v0.2.32", false), ("v0.2.32-beta.1", true)] {
+        let result = run_publish_scenario(tag, "success", "missing", "success", "success", true);
+        assert!(
+            result.output.status.success(),
+            "{tag}: {}",
+            stderr(&result.output)
+        );
+        let assets = result.assets.into_iter().collect::<BTreeSet<_>>();
+        assert_eq!(
+            assets,
+            RELEASE_ASSETS
+                .into_iter()
+                .map(str::to_string)
+                .collect::<BTreeSet<_>>()
+        );
+        let checksum_payloads = result
+            .checksums
+            .unwrap()
+            .lines()
+            .map(|line| line.split_whitespace().nth(1).unwrap().to_string())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            checksum_payloads,
+            assets
+                .iter()
+                .filter(|name| name.as_str() != "SHA256SUMS")
+                .cloned()
+                .collect()
+        );
+        assert_eq!(result.draft.as_deref(), Some("false\n"));
 
-    let commands = result.commands;
-    let tag_checks = commands
-        .match_indices("/git/tags/")
-        .map(|(index, _)| index)
-        .collect::<Vec<_>>();
-    assert_eq!(tag_checks.len(), 6);
-    let ci = commands.find("actions/workflows/ci.yml/runs").unwrap();
-    let create = commands.find("release create").unwrap();
-    let upload = commands.find("release upload").unwrap();
-    let query = commands.find("--json assets").unwrap();
-    let publish = commands.find("release edit").unwrap();
-    assert!(tag_checks[0] < tag_checks[1] && tag_checks[1] < ci);
-    assert!(ci < tag_checks[2] && tag_checks[2] < tag_checks[3]);
-    assert!(tag_checks[3] < create && create < upload && upload < query);
-    assert!(query < tag_checks[4] && tag_checks[4] < tag_checks[5]);
-    assert!(tag_checks[5] < publish);
-    let publish_command = commands
-        .lines()
-        .find(|line| line.starts_with("release edit"))
-        .unwrap();
-    assert!(publish_command.contains("--draft=false"));
-    assert!(publish_command.contains("--latest"));
-    assert!(!publish_command.contains("--prerelease"));
-
-    let publisher = fs::read_to_string(script("publish-release.sh")).unwrap();
-    assert!(publisher.contains("release_flags+=(--prerelease --latest=false)"));
+        let commands = result.commands;
+        let tag_checks = commands
+            .match_indices("/git/tags/")
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        assert_eq!(tag_checks.len(), 6);
+        let ci = commands.find("actions/workflows/ci.yml/runs").unwrap();
+        let create = commands.find("release create").unwrap();
+        let upload = commands.find("release upload").unwrap();
+        let query = commands.find("--json assets").unwrap();
+        let publish = commands.find("release edit").unwrap();
+        assert!(tag_checks[0] < tag_checks[1] && tag_checks[1] < ci);
+        assert!(ci < tag_checks[2] && tag_checks[2] < tag_checks[3]);
+        assert!(tag_checks[3] < create && create < upload && upload < query);
+        assert!(query < tag_checks[4] && tag_checks[4] < tag_checks[5]);
+        assert!(tag_checks[5] < publish);
+        let publish_command = commands
+            .lines()
+            .find(|line| line.starts_with("release edit"))
+            .unwrap();
+        let arguments = publish_command.split_whitespace().collect::<Vec<_>>();
+        assert!(arguments.contains(&tag));
+        assert!(arguments.contains(&"--draft=false"));
+        assert_eq!(arguments.contains(&"--prerelease"), prerelease, "{tag}");
+        assert_eq!(arguments.contains(&"--latest=false"), prerelease, "{tag}");
+        assert_eq!(arguments.contains(&"--latest"), !prerelease, "{tag}");
+    }
 }
 
 #[test]
@@ -1109,39 +1136,6 @@ fn publish_release_stops_before_release_api_when_asset_preparation_fails() {
 }
 
 #[test]
-fn publish_release_upload_set_matches_checksum_payloads() {
-    let result = run_publish_scenario("v0.2.32", "success", "missing", "success", "success", true);
-    assert!(result.output.status.success(), "{}", stderr(&result.output));
-    assert_eq!(
-        result.assets.into_iter().collect::<BTreeSet<_>>(),
-        RELEASE_ASSETS
-            .into_iter()
-            .map(str::to_string)
-            .collect::<BTreeSet<_>>()
-    );
-
-    let root = TestDir::new("publish-checksum-payloads");
-    let asset_dir = root.child("dist");
-    populate_release_archives(&asset_dir, &root);
-    let prepared = Command::new(script("prepare-release-assets.sh"))
-        .arg(&asset_dir)
-        .output()
-        .unwrap();
-    assert!(prepared.status.success(), "{}", stderr(&prepared));
-    let checksum_names = fs::read_to_string(asset_dir.join("SHA256SUMS"))
-        .unwrap()
-        .lines()
-        .map(|line| line.split_whitespace().nth(1).unwrap().to_string())
-        .collect::<BTreeSet<_>>();
-    let upload_payloads = RELEASE_ASSETS
-        .into_iter()
-        .filter(|name| *name != "SHA256SUMS")
-        .map(str::to_string)
-        .collect::<BTreeSet<_>>();
-    assert_eq!(checksum_names, upload_payloads);
-}
-
-#[test]
 fn package_version_reader_requires_one_matching_local_ocm_record() {
     let root = TestDir::new("package-version-reader");
     let manifest = root.child("Cargo.toml");
@@ -1194,7 +1188,7 @@ fn package_version_reader_requires_one_matching_local_ocm_record() {
 
 #[test]
 fn verify_release_tag_requires_a_verified_annotated_tag_matching_the_package() {
-    let verification = ReleaseCommitFixture::new("verify-release-tag-repo");
+    let verification = ReleaseCommitFixture::new("verify-release-tag-repo", "0.2.32");
     let root = TestDir::new("verify-release-tag");
     let fake_bin = root.child("bin");
     fs::create_dir_all(&fake_bin).unwrap();

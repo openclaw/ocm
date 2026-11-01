@@ -17,17 +17,17 @@ use std::{
 use fs2::FileExt;
 use ocm::env::{EnvDevMeta, EnvironmentService};
 use ocm::store::{
-    env_registry_path, get_environment, now_utc, save_environment, source_watch_override_path,
+    env_registry_path, get_environment, save_environment, source_watch_override_path,
     supervisor_runtime_path,
 };
-use ocm::supervisor::{SupervisorRuntimeChild, SupervisorRuntimeService, SupervisorRuntimeState};
+use ocm::supervisor::{SupervisorRuntimeChild, SupervisorRuntimeState};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 
 use crate::support::{
     TestDir, TestHttpServer, install_fake_launchctl as install_base_fake_launchctl, ocm_env,
-    path_string, run_ocm, stderr, stdout, write_executable_script, write_json_replacing_path,
-    write_text,
+    path_string, run_ocm, stderr, stdout, write_empty_supervisor_runtime, write_executable_script,
+    write_json_replacing_path, write_text,
 };
 
 fn install_fake_launchctl(root: &TestDir, env: &mut std::collections::BTreeMap<String, String>) {
@@ -104,30 +104,10 @@ fn write_running_snapshot_service(
     fs::create_dir_all(runtime_path.parent().unwrap()).unwrap();
     let stdout_path = path_string(&root.child("source.stdout.log"));
     let stderr_path = path_string(&root.child("source.stderr.log"));
-    let runtime = SupervisorRuntimeState {
-        retained_ownership: None,
-        kind: "ocm-supervisor-runtime".to_string(),
-        ocm_home: env.get("OCM_HOME").unwrap().clone(),
-        daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-        gateway_admission: Some(support::fake_daemon_gateway_admission()),
-        updated_at: now_utc(),
-        services: vec![SupervisorRuntimeService {
-            env_name: "source".to_string(),
-            binding_kind: "launcher".to_string(),
-            binding_name: "stable".to_string(),
-            gateway_state: "running".to_string(),
-            restart_handoff: Some("none".to_string()),
-            restart_count: 0,
-            child_port: port,
-            pid: Some(4242),
-            stdout_path: stdout_path.clone(),
-            stderr_path: stderr_path.clone(),
-            last_exit_code: None,
-            last_error: None,
-            last_event_at: None,
-            next_retry_at: None,
-        }],
-        children: vec![SupervisorRuntimeChild {
+    support::write_running_supervisor_runtime(
+        &runtime_path,
+        env.get("OCM_HOME").unwrap(),
+        SupervisorRuntimeChild {
             launch_spec_sha256: None,
             env_name: "source".to_string(),
             binding_kind: "launcher".to_string(),
@@ -137,23 +117,8 @@ fn write_running_snapshot_service(
             child_port: port,
             stdout_path,
             stderr_path,
-        }],
-    };
-    write_json_replacing_path(&runtime_path, &runtime);
-}
-
-fn write_empty_snapshot_service(runtime_path: &Path, ocm_home: &str) {
-    let runtime = SupervisorRuntimeState {
-        retained_ownership: None,
-        kind: "ocm-supervisor-runtime".to_string(),
-        ocm_home: ocm_home.to_string(),
-        daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-        gateway_admission: Some(support::fake_daemon_gateway_admission()),
-        updated_at: now_utc(),
-        services: Vec::new(),
-        children: Vec::new(),
-    };
-    write_json_replacing_path(runtime_path, &runtime);
+        },
+    );
 }
 
 #[test]
@@ -2558,7 +2523,7 @@ fn snapshot_restore_sync_failure_restores_data_and_policy() {
             if present {
                 let install = run_ocm(&cwd, &env, &["service", "install", "source"]);
                 assert!(install.status.success(), "{}", stderr(&install));
-                write_empty_snapshot_service(
+                write_empty_supervisor_runtime(
                     &supervisor_runtime_path(&env, &cwd).unwrap(),
                     env.get("OCM_HOME").unwrap(),
                 );
@@ -2798,7 +2763,7 @@ fn env_snapshot_create_and_restore_quiesce_a_running_managed_gateway() {
                 if desired_running {
                     write_json_replacing_path(&runtime_path, &running_runtime);
                 } else {
-                    write_empty_snapshot_service(&runtime_path, &ocm_home);
+                    write_empty_supervisor_runtime(&runtime_path, &ocm_home);
                 }
                 last_running = desired_running;
             }
@@ -2911,7 +2876,7 @@ fn env_snapshot_create_waits_for_delayed_supervisor_stop_acknowledgement() {
                 } else {
                     delayed_stop = true;
                     thread::sleep(Duration::from_millis(3_200));
-                    write_empty_snapshot_service(&observer_runtime_path, &ocm_home);
+                    write_empty_supervisor_runtime(&observer_runtime_path, &ocm_home);
                 }
                 last_running = desired_running;
             }
@@ -3002,7 +2967,7 @@ fn env_snapshot_create_quiesces_desired_service_before_child_is_observable() {
     let running_runtime: SupervisorRuntimeState =
         serde_json::from_slice(&fs::read(&runtime_path).unwrap()).unwrap();
     let ocm_home = env.get("OCM_HOME").unwrap().clone();
-    write_empty_snapshot_service(&runtime_path, &ocm_home);
+    write_empty_supervisor_runtime(&runtime_path, &ocm_home);
     let registry_path = env_registry_path(&env, &cwd).unwrap();
     let observer_done = Arc::new(AtomicBool::new(false));
     let stop_count = Arc::new(AtomicUsize::new(0));
@@ -3026,7 +2991,7 @@ fn env_snapshot_create_quiesces_desired_service_before_child_is_observable() {
                     write_json_replacing_path(&observer_runtime_path, &running_runtime);
                     observer_start_count.fetch_add(1, Ordering::Relaxed);
                 } else {
-                    write_empty_snapshot_service(&observer_runtime_path, &ocm_home);
+                    write_empty_supervisor_runtime(&observer_runtime_path, &ocm_home);
                     observer_stop_count.fetch_add(1, Ordering::Relaxed);
                 }
                 last_running = desired_running;
@@ -3105,7 +3070,7 @@ fn env_snapshot_create_preserves_disabled_policy_while_stale_child_quiesces() {
     let observer_runtime_path = runtime_path.clone();
     let observer = thread::spawn(move || {
         thread::sleep(Duration::from_millis(200));
-        write_empty_snapshot_service(&observer_runtime_path, &ocm_home);
+        write_empty_supervisor_runtime(&observer_runtime_path, &ocm_home);
     });
     let snapshot = run_ocm(
         &cwd,
@@ -3160,7 +3125,7 @@ fn env_snapshot_create_preserves_already_stopped_enabled_policy() {
     assert!(create.status.success(), "{}", stderr(&create));
     let installed = run_ocm(&cwd, &env, &["service", "install", "source"]);
     assert!(installed.status.success(), "{}", stderr(&installed));
-    write_empty_snapshot_service(
+    write_empty_supervisor_runtime(
         &supervisor_runtime_path(&env, &cwd).unwrap(),
         env.get("OCM_HOME").unwrap(),
     );
@@ -3896,7 +3861,7 @@ fn env_snapshot_rechecks_sqlite_mutated_after_preflight_and_restores_service() {
                     )
                     .unwrap();
                     observer_mutated_thread.store(true, Ordering::Relaxed);
-                    write_empty_snapshot_service(&observer_runtime_path, &ocm_home);
+                    write_empty_supervisor_runtime(&observer_runtime_path, &ocm_home);
                 }
                 last_running = desired_running;
             }

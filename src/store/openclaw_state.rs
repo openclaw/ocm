@@ -19,7 +19,7 @@ use crate::infra::archive::{EnvArchiveEntryKind, EnvArchiveOptions};
 
 use super::common::path_exists;
 use super::layout::{EnvPaths, clean_path, derive_env_paths, display_path};
-use super::openclaw_config::normalize_path_allow_missing;
+use super::openclaw_config::{matching_foreign_env_root, normalize_path_allow_missing};
 use super::openclaw_workspaces::{
     OpenClawCleanupPathError, OpenClawWorkspaceInventory, OpenClawWorkspaceRuntime,
     canonicalize_path_allow_missing, resolve_env_openclaw_cleanup_paths,
@@ -3897,27 +3897,6 @@ fn visit_runtime_state_files(
             on_file(&path);
         }
     }
-}
-
-fn matching_foreign_env_root(
-    current: &EnvMeta,
-    known_envs: &[EnvMeta],
-    path: &Path,
-) -> Option<(String, PathBuf)> {
-    if !path.is_absolute() {
-        return None;
-    }
-
-    for env in known_envs {
-        if env.name == current.name {
-            continue;
-        }
-        let env_root = clean_path(Path::new(&env.root));
-        if path.starts_with(&env_root) {
-            return Some((env.name.clone(), env_root));
-        }
-    }
-    None
 }
 
 fn inferred_foreign_env_root(current_root: &Path, path: &Path) -> Option<PathBuf> {

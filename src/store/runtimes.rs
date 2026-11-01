@@ -474,7 +474,7 @@ fn summarize_command_output(stdout: &[u8], stderr: &[u8]) -> Option<String> {
 }
 
 fn npm_program(env: &BTreeMap<String, String>) -> String {
-    configured_npm_program(env).unwrap_or_else(|| "npm".to_string())
+    crate::host::configured_npm_bin(env).to_string()
 }
 
 fn configured_npm_program(env: &BTreeMap<String, String>) -> Option<String> {
@@ -1519,7 +1519,7 @@ fn local_build_npm_adapter(
             args: vec![display_path(&adapter_path)],
             path_prepend: None,
         },
-        real_npm: "npm".to_string(),
+        real_npm: npm_program(env),
         npm_proxy: display_path(&npm_proxy),
         workspace_dependency_dirs: workspace_dependencies
             .as_ref()
@@ -1920,7 +1920,9 @@ fn pack_local_openclaw_companion(
         .arg("--run")
         .arg(&package_dir)
         .arg("--")
-        .arg(npm_program(env))
+        // The OpenClaw adapter uses this logical token to select its native npm
+        // runner; a concrete npm.cmd here bypasses that adapter on Windows.
+        .arg(configured_npm_program(env).unwrap_or_else(|| "npm".to_string()))
         .arg("pack")
         .arg("--json")
         .arg("--ignore-scripts")

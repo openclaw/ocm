@@ -293,7 +293,7 @@ pub fn configured_npm_bin(env: &BTreeMap<String, String>) -> &str {
     env.get(INTERNAL_NPM_BIN_ENV)
         .map(String::as_str)
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or("npm")
+        .unwrap_or(if cfg!(windows) { "npm.cmd" } else { "npm" })
 }
 
 pub fn verify_git_host_tool(env: &BTreeMap<String, String>) -> Result<String, String> {

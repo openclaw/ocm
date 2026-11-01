@@ -1998,7 +1998,7 @@ fn collect_inferred_foreign_env_roots_inner(
     }
 }
 
-fn matching_foreign_env_root(
+pub(super) fn matching_foreign_env_root(
     current: &EnvMeta,
     known_envs: &[EnvMeta],
     path: &Path,

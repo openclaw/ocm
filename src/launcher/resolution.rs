@@ -3,28 +3,12 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use crate::env::EnvMeta;
 use crate::infra::shell::quote_posix;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DirectLauncherCommand {
     pub(crate) program: String,
     pub(crate) args: Vec<String>,
-}
-
-pub fn resolve_launcher_name(
-    env_meta: &EnvMeta,
-    launcher_override: Option<String>,
-) -> Result<String, String> {
-    launcher_override
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| env_meta.default_launcher.clone())
-        .ok_or_else(|| {
-            format!(
-                "environment \"{}\" has no default launcher; use env set-launcher or pass --launcher",
-                env_meta.name
-            )
-        })
 }
 
 pub fn build_launcher_command(launcher: &LauncherMeta, args: &[String]) -> String {
