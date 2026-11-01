@@ -3150,7 +3150,7 @@ fn runtime_build_local_resolves_manifest_aliases_with_real_npm() {
         // Native locale ordering puts fish before Zulu; byte ordering does not.
         (
             "zulu",
-            serde_json::json!({"id":"Zulu", "legacyPluginIds":["shared"]}),
+            serde_json::json!({"id":"Zulu", "configSchema":{"type":"object"}, "legacyPluginIds":["shared"]}),
         ),
     ] {
         for prefix in ["extensions", "dist/extensions"] {
