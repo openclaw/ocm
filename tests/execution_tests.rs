@@ -5,6 +5,7 @@ use ocm::env::{EnvDevMeta, EnvMeta};
 use ocm::env::{
     ExecutionBinding, GatewayProcessSpec, resolve_execution_binding, resolve_runtime_run_dir,
 };
+#[cfg(not(windows))]
 use ocm::infra::shell::render_env_scoped_login_command;
 use ocm::launcher::{
     LauncherMeta, build_launcher_command, resolve_launcher_name, resolve_launcher_run_dir,
@@ -176,20 +177,31 @@ fn gateway_process_spec_shell_arguments_wrap_the_launcher_command() {
         process_env: BTreeMap::from([("OPENCLAW_HOME".to_string(), "/tmp/demo".to_string())]),
     };
 
-    // The login profile runs first, so the script restores the env's values
-    // before the launcher command.
+    #[cfg(windows)]
     assert_eq!(
         spec.program_arguments(),
-        vec![
-            "/bin/sh".to_string(),
-            "-lc".to_string(),
-            render_env_scoped_login_command("openclaw gateway run --port 18789", &spec.process_env)
-        ]
+        ["cmd", "/C", "openclaw gateway run --port 18789"]
     );
-    assert!(
-        spec.program_arguments()[2]
-            .ends_with("; export OPENCLAW_HOME='/tmp/demo'\nopenclaw gateway run --port 18789")
-    );
+    #[cfg(not(windows))]
+    {
+        // The login profile runs first, so the script restores the env's values
+        // before the launcher command.
+        assert_eq!(
+            spec.program_arguments(),
+            vec![
+                "/bin/sh".to_string(),
+                "-lc".to_string(),
+                render_env_scoped_login_command(
+                    "openclaw gateway run --port 18789",
+                    &spec.process_env
+                )
+            ]
+        );
+        assert!(
+            spec.program_arguments()[2]
+                .ends_with("; export OPENCLAW_HOME='/tmp/demo'\nopenclaw gateway run --port 18789")
+        );
+    }
 }
 
 #[test]
