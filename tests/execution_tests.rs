@@ -133,6 +133,8 @@ fn build_launcher_command_appends_after_recipes_without_a_trailing_comment() {
         "[[ '#' =~ (#) ]] && openclaw",
         "printf '%s\\n' @(foo|#bar)",
         "f() { openclaw; } # x",
+        "declare -A a; a[ # ]=x; openclaw",
+        "openclaw plugins/[ab].mjs # x",
         "openclaw 'unterminated # x",
         "openclaw \"unterminated # x",
     ];

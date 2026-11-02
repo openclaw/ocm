@@ -56,7 +56,7 @@ enum RecipeTail {
 /// starts a comment only at the start of a token outside quotes and
 /// expansions. Anything that can hide or move token boundaries (command and
 /// process substitution, backquotes, `$'...'`, here-documents, line
-/// continuations, `((`, `[[`, parentheses inside a word, `${...}` holding
+/// continuations, `((`, `[[`, brackets or parentheses inside a word, `${...}` holding
 /// quotes or nested expansions) and unterminated quotes return `None`, so those
 /// recipes keep the plain append.
 fn posix_recipe_tail(command: &str) -> Option<RecipeTail> {
@@ -73,9 +73,10 @@ fn posix_recipe_tail(command: &str) -> Option<RecipeTail> {
             b'`' => return None,
             b'$' if matches!(next, Some(b'(' | b'\'')) => return None,
             b'<' | b'>' | b'(' if matches!(next, Some(b'(')) => return None,
-            // Bash reads `[[ ... ]]` regexes and extended globs such as
-            // `@(a|#b)` with their own rules for parentheses and `#`.
-            b'[' if word_start && next == Some(&b'[') => return None,
+            // Bash reads `[[ ... ]]` regexes, array subscripts such as
+            // `a[ # ]=x` and extended globs such as `@(a|#b)` with their own
+            // rules for brackets, parentheses and `#`.
+            b'[' if !word_start || next == Some(&b'[') => return None,
             b'(' | b')' if !word_start && !ends_token(bytes[index - 1]) => return None,
             b'<' if next == Some(&b'<') => return None,
             b'\\' if next == Some(&b'\n') => return None,
