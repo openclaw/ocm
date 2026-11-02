@@ -29,8 +29,8 @@ use super::gateway_ports::{
     resolve_env_gateway_port,
 };
 use super::layout::{
-    clean_path, default_env_root, derive_env_paths, display_path, env_registry_path,
-    resolve_absolute_path, resolve_store_paths, validate_name,
+    OCM_HOME_ENTRIES, clean_path, default_env_root, derive_env_paths, display_path,
+    env_registry_path, resolve_absolute_path, resolve_store_paths, validate_name,
 };
 use super::now_utc;
 use super::openclaw_state::{
@@ -583,6 +583,66 @@ pub fn create_environment(
     create_environment_with_runtime_validation(options, false, None, env, cwd)
 }
 
+/// Resolves a root and returns its location with the links that reach it.
+fn resolve_root_entries(root: &Path) -> Result<(PathBuf, BTreeSet<PathBuf>), String> {
+    let (location, mut entries) =
+        super::dev_registration::registration_path(root).map_err(|error| {
+            format!(
+                "failed to resolve environment root {}: {error}",
+                display_path(root)
+            )
+        })?;
+    entries.insert(location.clone());
+    Ok((location, entries))
+}
+
+/// Removing an environment deletes its root, so a new root must not be the
+/// OCM home, contain it, or overlap one of its store entries. Roots inside
+/// `envs` remain valid; the environment check keeps them apart.
+fn ensure_root_outside_store(
+    name: &str,
+    root: &Path,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<(), String> {
+    let home = resolve_store_paths(env, cwd)?.home;
+    let (target, target_entries) = resolve_root_entries(root)?;
+    let (_, home_entries) = resolve_root_entries(&home)?;
+    for entry in &home_entries {
+        if super::dev_sources::projected_path_contains(&target, entry)? {
+            return Err(format!(
+                "environment {name} root {} overlaps the OCM home {}; choose a separate environment root",
+                display_path(root),
+                display_path(&home)
+            ));
+        }
+    }
+    for store in OCM_HOME_ENTRIES {
+        let store_path = home.join(store);
+        let (location, store_entries) = resolve_root_entries(&store_path)?;
+        let mut overlaps = false;
+        for entry in &store_entries {
+            overlaps |= super::dev_sources::projected_path_contains(&target, entry)?;
+        }
+        // Entries include the target's existing ancestor. Inside `envs`, only
+        // a target that is `envs` itself overlaps the store.
+        for entry in &target_entries {
+            if let Some(relative) = super::dev_sources::projected_path_relative(&location, entry)? {
+                overlaps |=
+                    *store != "envs" || (entry == &target && relative.as_os_str().is_empty());
+            }
+        }
+        if overlaps {
+            return Err(format!(
+                "environment {name} root {} overlaps OCM store {}; choose a separate environment root",
+                display_path(root),
+                display_path(&store_path)
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn ensure_root_outside_environments(
     name: &str,
     root: &Path,
@@ -591,19 +651,9 @@ fn ensure_root_outside_environments(
     if envs.is_empty() {
         return Ok(());
     }
-    let resolve = |root: &Path| {
-        super::dev_registration::registration_path(root).map_err(|error| {
-            format!(
-                "failed to resolve environment root {}: {error}",
-                display_path(root)
-            )
-        })
-    };
-    let (target, mut target_entries) = resolve(root)?;
-    target_entries.insert(target.clone());
+    let (target, target_entries) = resolve_root_entries(root)?;
     for current in envs {
-        let (registered, mut registered_entries) = resolve(Path::new(&current.root))?;
-        registered_entries.insert(registered.clone());
+        let (registered, registered_entries) = resolve_root_entries(Path::new(&current.root))?;
         // Compare both the resolved roots and the links that keep them reachable.
         // A disjoint target reached through a link inside another root is unsafe too.
         for (container, entries) in [
@@ -711,6 +761,7 @@ fn create_environment_with_runtime_validation(
             Path::new(source),
         )?;
     }
+    ensure_root_outside_store(&name, &root, env, cwd)?;
     ensure_root_outside_environments(&name, &root, &registry.envs)?;
     let paths = derive_env_paths(&root);
     if path_exists(&paths.root) {
@@ -861,6 +912,7 @@ fn clone_environment_with_policy(
         default_env_root(&name, env, cwd)?
     };
     ensure_root_outside_dev_sources(&name, &root, &registry.envs)?;
+    ensure_root_outside_store(&name, &root, env, cwd)?;
     ensure_root_outside_environments(&name, &root, &registry.envs)?;
     let target_paths = derive_env_paths(&root);
     if path_exists(&target_paths.root) {
@@ -1460,6 +1512,7 @@ pub(crate) fn import_environment_with_sandbox_origin(
             default_env_root(&name, env, cwd)?
         };
         ensure_root_outside_dev_sources(&name, &root, &registry.envs)?;
+        ensure_root_outside_store(&name, &root, env, cwd)?;
         ensure_root_outside_environments(&name, &root, &registry.envs)?;
         let target_paths = derive_env_paths(&root);
         if path_exists(&target_paths.root) {

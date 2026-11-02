@@ -23,6 +23,27 @@ pub struct StorePaths {
     pub supervisor_dir: PathBuf,
 }
 
+/// Entries OCM keeps directly in `OCM_HOME`. A new environment root may not
+/// overlap one of them, except as a root inside `envs`, because removing an
+/// environment deletes its root. Add each new top-level store entry here.
+pub(crate) const OCM_HOME_ENTRIES: &[&str] = &[
+    "dev-ui-ports.json",
+    "envs",
+    "envs.json",
+    "envs.lock",
+    "import-staging",
+    "launchers",
+    "locks",
+    "runtimes",
+    "snapshots",
+    "source-watch",
+    "supervisor",
+    "tmp",
+    "toolchains",
+    "upgrade-batches",
+    "upgrade-history",
+];
+
 pub fn display_path(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }

@@ -464,3 +464,87 @@ fn new_roots_cannot_contain_links_to_an_existing_environment() {
         assert!(!parent.join(".openclaw").exists());
     }
 }
+
+#[test]
+fn create_clone_and_import_reject_ocm_store_roots_before_writing_state() {
+    let fixture = TestDir::new("environment-store-root-isolation");
+    let env = ocm_env(&fixture);
+    template(&fixture, &env);
+    let home = fixture.child("ocm-home");
+    let stores = [
+        "envs",
+        "import-staging",
+        "launchers",
+        "locks",
+        "runtimes",
+        "snapshots",
+        "source-watch",
+        "supervisor",
+        "tmp",
+        "toolchains",
+        "upgrade-batches",
+        "upgrade-history",
+    ];
+    let outside = fixture.child("outside");
+    fs::create_dir(&outside).unwrap();
+
+    let mut destinations = vec![
+        home.clone(),
+        fixture.path().to_path_buf(),
+        home.join("envs.json"),
+        home.join("runtimes/new"),
+        home.join("snapshots/template"),
+        home.join("unused/../launchers"),
+    ];
+    destinations.extend(stores.iter().map(|store| home.join(store)));
+    #[cfg(unix)]
+    {
+        let links = fixture.child("links");
+        fs::create_dir(&links).unwrap();
+        let alias = links.join("snapshots");
+        std::os::unix::fs::symlink(home.join("snapshots"), &alias).unwrap();
+        destinations.push(alias.clone());
+        destinations.push(alias.join("new"));
+        let escape = home.join("runtimes/escape");
+        std::os::unix::fs::symlink(&outside, &escape).unwrap();
+        destinations.push(escape);
+    }
+
+    let registry = env_registry_path(&env, fixture.path()).unwrap();
+    let before = fs::read(&registry).unwrap();
+    for destination in destinations {
+        for action in ["create", "clone", "import"] {
+            let rejected = admit(&fixture, &env, action, "blocked", &destination);
+            assert!(!rejected.status.success(), "{action}: {destination:?}");
+            let error = stderr(&rejected);
+            assert!(
+                error.contains("overlaps OCM store") || error.contains("overlaps the OCM home"),
+                "{action}: {destination:?}: {error}"
+            );
+            assert_eq!(fs::read(&registry).unwrap(), before);
+            for store in stores {
+                assert!(!home.join(store).join(".openclaw").exists(), "{store}");
+            }
+            assert!(!home.join("runtimes/new").exists());
+            assert!(!home.join("unused").exists());
+            assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+        }
+    }
+
+    // Disjoint custom roots under OCM_HOME and custom roots inside envs stay valid.
+    for action in ["create", "clone", "import"] {
+        for (index, destination) in [
+            home.join(format!("custom/{action}")),
+            home.join(format!("envs/custom-{action}")),
+            fixture.child(format!("elsewhere/{action}")),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let name = format!("{action}-valid-{index}");
+            let accepted = admit(&fixture, &env, action, &name, &destination);
+            assert!(accepted.status.success(), "{}", stderr(&accepted));
+            assert!(destination.join(".openclaw/workspace").is_dir());
+        }
+    }
+}

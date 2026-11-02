@@ -245,6 +245,38 @@ fn start_refused_by_a_non_empty_root_removes_the_launcher_it_created() {
 }
 
 #[test]
+fn start_refused_by_an_ocm_store_root_removes_the_launcher_it_created() {
+    let root = TestDir::new("start-refused-store-root");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    let store = root.child("ocm-home/launchers");
+    let store_arg = path_string(&store);
+
+    let refused = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "start",
+            "demo",
+            "--command",
+            "openclaw",
+            "--root",
+            &store_arg,
+            "--no-service",
+        ],
+    );
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(
+        stderr(&refused).contains("overlaps OCM store"),
+        "{}",
+        stderr(&refused)
+    );
+    assert_launcher_absent(&cwd, &env, "demo.local");
+    assert!(!store.join(".openclaw").exists());
+}
+
+#[test]
 fn start_refused_for_an_existing_env_removes_only_a_launcher_it_created() {
     let root = TestDir::new("start-refused-existing-launcher");
     let cwd = root.child("workspace");

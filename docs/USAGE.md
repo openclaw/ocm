@@ -1148,6 +1148,14 @@ disjoint custom roots remain valid. This applies to `env create`, `env clone`,
 `env import`, and new environments created by `start`, `setup`, `dev`, `migrate`,
 `adopt import`, or upgrade simulation.
 
+A new root also cannot be `OCM_HOME`, contain it, or overlap one of the store
+entries OCM keeps there, such as `runtimes`, `launchers`, `snapshots`,
+`supervisor`, `upgrade-history` or `locks`, including through path aliases.
+Removing an environment deletes its root, so such a root would take other
+environments' runtimes, launchers or snapshots with it. Custom roots inside
+`envs`, such as `$OCM_HOME/envs/custom`, and disjoint roots elsewhere under
+`OCM_HOME` remain valid.
+
 A registered root remains reserved while its directory is missing. Disjoint
 Unicode roots remain valid; case and normalization aliases of a missing root
 are still reserved. On Windows, an ambiguous missing 8.3 short name requires
@@ -1566,12 +1574,12 @@ its former backing directory is left untouched. Older tree checkpoints whose
 artifact is itself a symlink are refused on restore: they did not retain
 historical contents. Create a new snapshot to protect the current contents.
 
-Checkpoint storage must be outside the environment root being captured. If a
-custom root contains `$OCM_HOME/snapshots/<env>`, including through a path alias,
-snapshot and upgrade checkpoint preparation refuse with `checkpoint storage
-overlaps environment root` before copying or stopping a running gateway. This
-preserves live data and existing snapshots without recursively copying the
-preparation directory. Disjoint custom roots, including roots elsewhere under
+Checkpoint storage must be outside the environment root being captured. New
+roots cannot overlap the snapshot store. If an existing custom root contains
+`$OCM_HOME/snapshots/<env>`, including through a path alias, snapshot and upgrade
+checkpoint preparation refuse with `checkpoint storage overlaps environment root`
+before copying or stopping a running gateway. This preserves live data and
+existing snapshots without recursively copying the preparation directory. Disjoint custom roots, including roots elsewhere under
 `OCM_HOME`, remain supported.
 
 Unix sockets are transient process endpoints and are omitted from checkpoints,
