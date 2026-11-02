@@ -94,3 +94,48 @@ impl NpmInstallation {
         Ok(())
     }
 }
+
+/// An executable inside a Homebrew keg, `<cellar>/ocm/<version>/bin/ocm`.
+pub(crate) struct HomebrewKeg {
+    keg: PathBuf,
+    executable: PathBuf,
+}
+
+impl HomebrewKeg {
+    /// Recognizes the path as given; resolve it first to recognize a link into a keg.
+    pub(crate) fn from_executable(executable: &Path) -> Option<Self> {
+        let bin = executable.parent()?;
+        let keg = bin.parent()?;
+        let formula = keg.parent()?;
+        if bin.file_name()? != "bin"
+            || formula.file_name()? != "ocm"
+            || !keg.join("INSTALL_RECEIPT.json").is_file()
+        {
+            return None;
+        }
+        Some(Self {
+            keg: keg.to_path_buf(),
+            executable: executable.to_path_buf(),
+        })
+    }
+
+    /// A link `brew upgrade` repoints at the new keg, while it still resolves
+    /// to this executable: the linked `<prefix>/bin/ocm`, else the formula's
+    /// `<prefix>/opt/ocm/bin/ocm`.
+    pub(crate) fn stable_executable(&self) -> Option<PathBuf> {
+        let prefix = self.keg.parent()?.parent()?.parent()?;
+        let target = self.executable.canonicalize().ok()?;
+        [prefix.join("bin/ocm"), prefix.join("opt/ocm/bin/ocm")]
+            .into_iter()
+            .find(|link| link.canonicalize().is_ok_and(|resolved| resolved == target))
+    }
+}
+
+/// The spelling of a running executable that survives its package manager's
+/// upgrade. Linux reports a Homebrew executable by its versioned keg path,
+/// which `brew upgrade` removes; macOS already reports the invoked link.
+pub(crate) fn durable_executable_path(executable: &Path) -> PathBuf {
+    HomebrewKeg::from_executable(executable)
+        .and_then(|keg| keg.stable_executable())
+        .unwrap_or_else(|| executable.to_path_buf())
+}

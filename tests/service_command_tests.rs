@@ -2840,6 +2840,54 @@ fn npx_cannot_rebind_daemon_but_can_inspect_and_stop_it() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn homebrew_keg_service_records_the_link_brew_upgrade_keeps() {
+    for links in ["bin", "opt", "none"] {
+        let root = TestDir::new("service-homebrew-keg");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let env = systemd_env(&root);
+        setup_launcher_env(&cwd, &env);
+        let prefix = fs::canonicalize(root.path()).unwrap().join("linuxbrew");
+        let keg = prefix.join("Cellar/ocm/0.3.8");
+        let binary = keg.join("bin/ocm");
+        copy_test_ocm_binary(&binary);
+        fs::write(keg.join("INSTALL_RECEIPT.json"), "{}").unwrap();
+        fs::create_dir_all(prefix.join("bin")).unwrap();
+        fs::create_dir_all(prefix.join("opt")).unwrap();
+        let expected = match links {
+            "bin" => {
+                std::os::unix::fs::symlink("../Cellar/ocm/0.3.8/bin/ocm", prefix.join("bin/ocm"))
+                    .unwrap();
+                std::os::unix::fs::symlink("../Cellar/ocm/0.3.8", prefix.join("opt/ocm")).unwrap();
+                prefix.join("bin/ocm")
+            }
+            "opt" => {
+                std::os::unix::fs::symlink("../Cellar/ocm/0.3.8", prefix.join("opt/ocm")).unwrap();
+                prefix.join("opt/ocm/bin/ocm")
+            }
+            _ => binary.clone(),
+        };
+
+        // Linux reports a linked Homebrew executable by its keg path.
+        let output =
+            crate::support::run_ocm_binary(&binary, &cwd, &env, &["service", "install", "demo"]);
+        assert!(output.status.success(), "{links}: {}", stderr(&output));
+        let definition =
+            fs::read_to_string(managed_service_definition_path(&env, &cwd, "ocm")).unwrap();
+        let expected = path_string(&expected);
+        assert!(
+            definition.contains(&format!("\nExecStart={expected} __daemon run\n")),
+            "{links}: {definition}"
+        );
+        assert!(
+            definition.contains(&format!("Environment=\"OCM_SELF={expected}\"")),
+            "{links}: {definition}"
+        );
+    }
+}
+
 #[test]
 fn systemd_service_lifecycle_uses_the_configured_unit_directory() {
     for setting in ["unset", "empty", "relative", "absolute"] {

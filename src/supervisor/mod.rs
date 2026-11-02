@@ -2197,7 +2197,9 @@ fn spawn_supervisor_child(spec: &SupervisorChildSpec) -> Result<Child, String> {
     // regenerated the desired spec (which must not restart a running Gateway).
     #[cfg(unix)]
     {
-        let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+        let executable = crate::infra::install_owner::durable_executable_path(
+            &std::env::current_exe().map_err(|error| error.to_string())?,
+        );
         process_env.insert("OCM_SELF".into(), display_path(&executable));
     }
 
@@ -3759,7 +3761,7 @@ fn resolve_supervisor_executable_path(
     }
 
     if !is_cargo_dev_executable(current_exe) || is_cargo_test_executable(current_exe) {
-        return current_exe.to_path_buf();
+        return crate::infra::install_owner::durable_executable_path(current_exe);
     }
 
     service_executable_from_self(env, cwd)
