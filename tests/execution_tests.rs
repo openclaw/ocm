@@ -107,8 +107,8 @@ fn build_launcher_command_joins_the_last_command_before_a_trailing_comment_or_ba
             "node gw.mjs $((1<<2)) 'gateway' 'two words' # dev",
         ),
         (
-            r#"openclaw $(case x in a) echo;; esac) --mode "$(echo case)" # dev"#,
-            r#"openclaw $(case x in a) echo;; esac) --mode "$(echo case)" 'gateway' 'two words' # dev"#,
+            r#"openclaw --mode "$(echo case)" $(x) # dev"#,
+            r#"openclaw --mode "$(echo case)" $(x) 'gateway' 'two words' # dev"#,
         ),
         // Operators still separate the arguments into a failing command.
         ("openclaw;# dev", "openclaw; 'gateway' 'two words' # dev"),
@@ -137,6 +137,8 @@ fn build_launcher_command_appends_after_recipes_without_a_trailing_comment() {
         // Unmodelled or unterminated forms keep the plain append.
         "cat <<EOF # x",
         "openclaw $'a' # x",
+        "openclaw $(case x in a) echo;; esac) # x",
+        "openclaw $(true; if :; then case x in a) echo;; esac; fi) # x",
         "openclaw 'unterminated # x",
         "openclaw \"$(echo # x\" # y",
     ];

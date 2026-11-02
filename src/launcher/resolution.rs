@@ -53,9 +53,9 @@ enum RecipeTail {
 /// Finds a trailing comment or dangling backslash after the last word of a
 /// POSIX shell recipe. A `#` starts a comment only at the start of a token
 /// outside quotes, expansions and substitutions. Constructs this scan does not
-/// model (here-documents, `$'...'`, nesting deeper than `MAX_SPAN_NESTING`)
-/// and unterminated quotes return `None`, so those recipes keep the plain
-/// append.
+/// model (here-documents, `$'...'`, a `case` statement inside a command
+/// substitution, nesting deeper than `MAX_SPAN_NESTING`) and unterminated
+/// quotes return `None`, so those recipes keep the plain append.
 fn posix_recipe_tail(command: &str) -> Option<RecipeTail> {
     match scan_tokens(command.as_bytes(), 0, false, 0)? {
         (_, 0) => None,
@@ -125,17 +125,13 @@ fn scan_tokens(
                 }
                 None => return (!in_substitution).then_some((ScanEnd::Comment, word_end)),
             },
-            // `case` patterns would unbalance the parentheses, so the statement
-            // is skipped to its `esac`; without one, `case` is an ordinary word.
-            b'c' if in_substitution && word_start && is_word_at(bytes, index, b"case") => {
-                if let Some(end) = (index + 4..bytes.len())
-                    .find(|&at| is_word_at(bytes, at, b"esac"))
-                    .map(|at| at + 4)
-                {
-                    index = end;
-                    word_start = false;
-                    continue;
-                }
+            // `case` statement patterns would unbalance the parentheses. As an
+            // argument, `case` is an ordinary word.
+            b'c' if in_substitution
+                && is_word_at(bytes, index, b"case")
+                && in_command_position(&bytes[start..index]) =>
+            {
+                return None;
             }
             b'(' if in_substitution => open_parens += 1,
             b')' if in_substitution => match open_parens.checked_sub(1) {
@@ -160,6 +156,28 @@ fn is_word_at(bytes: &[u8], index: usize, word: &[u8]) -> bool {
         && bytes
             .get(index + word.len())
             .is_none_or(|&next| ends_token(next))
+}
+
+/// Whether a token following `before` starts a command: nothing, an operator
+/// or a newline precedes it, or a reserved word that a command follows.
+fn in_command_position(before: &[u8]) -> bool {
+    let Some(last) = before
+        .iter()
+        .rposition(|&byte| !matches!(byte, b' ' | b'\t'))
+    else {
+        return true;
+    };
+    if ends_token(before[last]) {
+        return true;
+    }
+    let first = before[..last]
+        .iter()
+        .rposition(|&byte| ends_token(byte))
+        .map_or(0, |at| at + 1);
+    matches!(
+        &before[first..=last],
+        b"if" | b"then" | b"else" | b"elif" | b"while" | b"until" | b"do" | b"!" | b"{"
+    )
 }
 
 /// Blanks and operator characters end a shell token.
