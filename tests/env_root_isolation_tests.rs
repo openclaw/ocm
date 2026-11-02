@@ -492,6 +492,8 @@ fn create_clone_and_import_reject_ocm_store_roots_before_writing_state() {
         home.clone(),
         fixture.path().to_path_buf(),
         home.join("envs.json"),
+        home.join("envs.lock"),
+        home.join("dev-ui-ports.json"),
         home.join("runtimes/new"),
         home.join("snapshots/template"),
         home.join("unused/../launchers"),

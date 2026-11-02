@@ -580,6 +580,25 @@ mod tests {
     }
 
     #[test]
+    fn every_store_directory_is_an_ocm_home_entry() {
+        let mut env = BTreeMap::new();
+        env.insert("OCM_HOME".to_string(), "/ocm-home".to_string());
+        let stores = resolve_store_paths(&env, Path::new("/")).unwrap();
+        for dir in [
+            &stores.envs_dir,
+            &stores.launchers_dir,
+            &stores.runtimes_dir,
+            &stores.snapshots_dir,
+            &stores.upgrade_history_dir,
+            &stores.supervisor_dir,
+            &env_registry_path(&env, Path::new("/")).unwrap(),
+        ] {
+            let name = dir.strip_prefix(&stores.home).unwrap().to_str().unwrap();
+            assert!(OCM_HOME_ENTRIES.contains(&name), "{name}");
+        }
+    }
+
+    #[test]
     fn a_case_variants_service_log_is_renamed_only_when_its_name_is_known_unregistered() {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path();

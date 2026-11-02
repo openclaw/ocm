@@ -607,7 +607,14 @@ fn ensure_root_outside_store(
 ) -> Result<(), String> {
     let home = resolve_store_paths(env, cwd)?.home;
     let (target, target_entries) = resolve_root_entries(root)?;
-    let (_, home_entries) = resolve_root_entries(&home)?;
+    let (home_location, home_entries) = resolve_root_entries(&home)?;
+    let refuse = |store: &str| {
+        Err(format!(
+            "environment {name} root {} overlaps OCM store {}; choose a separate environment root",
+            display_path(root),
+            display_path(&home.join(store))
+        ))
+    };
     for entry in &home_entries {
         if super::dev_sources::projected_path_contains(&target, entry)? {
             return Err(format!(
@@ -617,27 +624,51 @@ fn ensure_root_outside_store(
             ));
         }
     }
+    // Store entries may be missing, so match the first name below the existing
+    // home instead of comparing two missing paths. Entries include the target's
+    // existing ancestor; inside `envs`, only `envs` itself is the store.
+    for entry in &target_entries {
+        let Some(relative) = super::dev_sources::projected_path_relative(&home_location, entry)?
+        else {
+            continue;
+        };
+        let mut components = relative.components();
+        let Some(first) = components
+            .next()
+            .and_then(|first| first.as_os_str().to_str())
+        else {
+            continue;
+        };
+        #[cfg(windows)]
+        let first = first.trim_end_matches(&['.', ' '][..]);
+        let Some(store) = OCM_HOME_ENTRIES
+            .iter()
+            .find(|store| first.eq_ignore_ascii_case(store))
+        else {
+            continue;
+        };
+        if *store != "envs" || (entry == &target && components.next().is_none()) {
+            return refuse(store);
+        }
+    }
+    // An existing store entry can be a link to storage outside the home.
     for store in OCM_HOME_ENTRIES {
         let store_path = home.join(store);
-        let (location, store_entries) = resolve_root_entries(&store_path)?;
-        let mut overlaps = false;
-        for entry in &store_entries {
-            overlaps |= super::dev_sources::projected_path_contains(&target, entry)?;
+        if fs::symlink_metadata(&store_path).is_err() {
+            continue;
         }
-        // Entries include the target's existing ancestor. Inside `envs`, only
-        // a target that is `envs` itself overlaps the store.
-        for entry in &target_entries {
-            if let Some(relative) = super::dev_sources::projected_path_relative(&location, entry)? {
-                overlaps |=
-                    *store != "envs" || (entry == &target && relative.as_os_str().is_empty());
+        let (location, store_entries) = resolve_root_entries(&store_path)?;
+        for entry in &store_entries {
+            if super::dev_sources::projected_path_contains(&target, entry)? {
+                return refuse(store);
             }
         }
-        if overlaps {
-            return Err(format!(
-                "environment {name} root {} overlaps OCM store {}; choose a separate environment root",
-                display_path(root),
-                display_path(&store_path)
-            ));
+        for entry in &target_entries {
+            if let Some(relative) = super::dev_sources::projected_path_relative(&location, entry)?
+                && (*store != "envs" || (entry == &target && relative.as_os_str().is_empty()))
+            {
+                return refuse(store);
+            }
         }
     }
     Ok(())
