@@ -342,7 +342,9 @@ fn upgrade_preflights_the_package_behind_a_migrated_openclaw_executable() {
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
     // A global npm install links bin/openclaw to the installed package entrypoint.
-    let package = root.child("global/lib/node_modules/openclaw");
+    // `ocm migrate` stores this absolute path unquoted although `#` is shell syntax
+    // elsewhere in a launcher command.
+    let package = root.child("npm#1/lib/node_modules/openclaw");
     fs::create_dir_all(&package).unwrap();
     support::write_executable_script(
         &package.join("openclaw.mjs"),
@@ -353,7 +355,7 @@ fn upgrade_preflights_the_package_behind_a_migrated_openclaw_executable() {
         r#"{"name":"openclaw","version":"2026.8.13","bin":{"openclaw":"openclaw.mjs"}}"#,
     )
     .unwrap();
-    let bin = root.child("global/bin");
+    let bin = root.child("npm#1/bin");
     fs::create_dir_all(&bin).unwrap();
     std::os::unix::fs::symlink(
         "../lib/node_modules/openclaw/openclaw.mjs",
@@ -434,7 +436,13 @@ exit 0
     let launcher = run_ocm(&cwd, &env, &["launcher", "show", "mira.migrated", "--json"]);
     assert!(launcher.status.success(), "{}", stderr(&launcher));
     let launcher: Value = serde_json::from_slice(&launcher.stdout).unwrap();
-    assert_eq!(launcher["command"], path_string(&bin.join("openclaw")));
+    // Migration quotes the path only when the shell would not read it as one word.
+    let command = launcher["command"].as_str().unwrap();
+    let executable = path_string(&bin.join("openclaw"));
+    assert!(
+        command == executable || command == format!("'{executable}'"),
+        "{command}"
+    );
 
     let upgraded = run_ocm(
         &cwd,

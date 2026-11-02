@@ -948,6 +948,12 @@ enum LiteralWord {
     Stored,
 }
 
+/// Whether a launcher command is one absolute path that the shell runs as a
+/// single literal word, the unquoted form `ocm migrate` stores.
+pub(crate) fn is_literal_launcher_path(command: &str) -> bool {
+    command.starts_with('/') && is_literal_shell_word(command, LiteralWord::Stored)
+}
+
 /// Whether the shell reads `path`, unquoted, as one literal word.
 fn is_literal_shell_word(path: &str, accept: LiteralWord) -> bool {
     // These are literal inside a word that starts with `/`, but not at its start.

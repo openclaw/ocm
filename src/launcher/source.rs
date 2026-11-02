@@ -20,7 +20,16 @@ pub(crate) fn launcher_package_root(launcher: &LauncherMeta) -> Option<PathBuf> 
 
 fn package_root(launcher: &LauncherMeta, installed_executable: bool) -> Option<PathBuf> {
     let cwd = launcher.cwd.as_deref().map(Path::new);
-    let words = super::parse_literal_launcher_command(&launcher.command)?;
+    let command = launcher.command.trim();
+    let words = match super::parse_literal_launcher_command(command) {
+        Some(words) => words,
+        // `ocm migrate` stores an absolute path unquoted when the shell reads it
+        // as one literal word, including characters the parser keeps opaque.
+        None if installed_executable && crate::migrate::is_literal_launcher_path(command) => {
+            vec![command.to_string()]
+        }
+        None => return None,
+    };
     let (program_path, args) = words.split_first()?;
     let program = Path::new(program_path).file_name()?.to_str()?;
     let root = match (program, args) {
@@ -131,8 +140,9 @@ mod tests {
         fs::write(root.join("bin/wrapper"), "#!/bin/sh\n").unwrap();
         let executable = executable.to_string_lossy().into_owned();
         let bin = root.join("bin");
+        let quoted = |path: &Path| crate::infra::shell::quote_posix(&path.to_string_lossy());
 
-        let installed = launcher(&executable);
+        let installed = launcher(&crate::infra::shell::quote_posix(&executable));
         assert_eq!(
             launcher_package_root(&installed),
             Some(fs::canonicalize(&package).unwrap())
@@ -141,9 +151,12 @@ mod tests {
         assert_eq!(launcher_source_root(&installed), None);
         for command in [
             "openclaw".to_string(),
-            format!("{executable} --profile dev"),
-            bin.join("other").to_string_lossy().into_owned(),
-            bin.join("wrapper").to_string_lossy().into_owned(),
+            format!(
+                "{} --profile dev",
+                crate::infra::shell::quote_posix(&executable)
+            ),
+            quoted(&bin.join("other")),
+            quoted(&bin.join("wrapper")),
         ] {
             assert_eq!(
                 launcher_package_root(&launcher(&command)),
