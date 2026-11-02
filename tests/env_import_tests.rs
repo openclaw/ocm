@@ -2496,3 +2496,82 @@ fn env_import_removes_abandoned_staging_and_keeps_staging_in_use() {
     assert_eq!(import_staging_leaves(&root), ["import-in-use"]);
     drop(in_use_lock);
 }
+
+#[cfg(unix)]
+#[test]
+fn env_import_interrupted_mid_copy_removes_its_root_so_a_retry_succeeds() {
+    use std::os::unix::process::ExitStatusExt;
+
+    const FILES: usize = 10_000;
+    let root = TestDir::new("env-import-interrupt");
+    let env = ocm_env(&root);
+    let created = run_ocm(root.path(), &env, &["env", "create", "source"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    let bulk = root.child("ocm-home/envs/source/.openclaw/workspace/bulk");
+    fs::create_dir_all(&bulk).unwrap();
+    for index in 0..FILES {
+        fs::write(bulk.join(format!("f{index:05}")), [b'x'; 1024]).unwrap();
+    }
+    let target = root.child("ocm-home/envs/imported");
+
+    for (mode, signal) in [("default", libc::SIGTERM), ("state", libc::SIGINT)] {
+        let archive = root.child(format!("{mode}.tar"));
+        let mut export = vec!["env", "export", "source", "--output"];
+        export.push(archive.to_str().unwrap());
+        if mode == "state" {
+            export.push("--include-state");
+        }
+        let exported = run_ocm(root.path(), &env, &export);
+        assert!(exported.status.success(), "{}", stderr(&exported));
+        let import = [
+            "env",
+            "import",
+            archive.to_str().unwrap(),
+            "--name",
+            "imported",
+        ];
+
+        let interrupted = (0..3)
+            .find_map(|_| {
+                let interrupted = support::signal_ocm_while_filling(
+                    root.path(),
+                    &env,
+                    &import,
+                    &target.join(".openclaw/workspace/bulk"),
+                    100,
+                    signal,
+                );
+                // An import that registered completed before the signal took
+                // effect; undo it and try again.
+                let shown = run_ocm(root.path(), &env, &["env", "show", "imported"]);
+                if shown.status.success() {
+                    let removed = run_ocm(root.path(), &env, &["env", "remove", "imported"]);
+                    assert!(removed.status.success(), "{}", stderr(&removed));
+                    return None;
+                }
+                Some(interrupted)
+            })
+            .expect("the import always finished before it could be interrupted");
+        assert_eq!(
+            (interrupted.status.code(), interrupted.status.signal()),
+            (Some(130), None),
+            "{mode}: {}",
+            stderr(&interrupted)
+        );
+        assert!(
+            fs::symlink_metadata(&target).is_err(),
+            "{mode} import left the provisional root"
+        );
+
+        let retried = run_ocm(root.path(), &env, &import);
+        assert!(retried.status.success(), "{}", stderr(&retried));
+        assert_eq!(
+            fs::read_dir(target.join(".openclaw/workspace/bulk"))
+                .unwrap()
+                .count(),
+            FILES
+        );
+        let removed = run_ocm(root.path(), &env, &["env", "remove", "imported"]);
+        assert!(removed.status.success(), "{}", stderr(&removed));
+    }
+}

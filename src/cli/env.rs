@@ -646,6 +646,10 @@ impl Cli {
         };
         Self::assert_no_extra_args(&args[2..])?;
 
+        // A signal stops the clone through its error path, which removes the
+        // provisional root before the environment is registered.
+        crate::infra::interrupt::request_cancellation_on_signal()
+            .map_err(|error| format!("failed to install clone signal handler: {error}"))?;
         let result = self.with_progress(
             format!("Cloning env {source_name} to {target_name}"),
             || {
@@ -658,7 +662,19 @@ impl Cli {
                     sandbox_origin,
                 )
             },
-        )?;
+        );
+        // A clone registered before the signal took effect stays registered.
+        if let Err(error) = &result
+            && crate::infra::interrupt::cancellation_settled()
+        {
+            // The error itself may be a failure that came before the signal.
+            self.stderr_line(format!("ocm: {error}"));
+            self.stderr_line(format!(
+                "ocm: env clone {source_name} {target_name} interrupted by a signal"
+            ));
+            return Ok(130);
+        }
+        let result = result?;
         let meta = result.meta;
         let (gateway_port, gateway_port_source) = self
             .environment_service()
@@ -741,6 +757,10 @@ impl Cli {
         };
         Self::assert_no_extra_args(&args[1..])?;
 
+        // A signal stops the import through its error path, which removes the
+        // provisional root and the extraction staging.
+        crate::infra::interrupt::request_cancellation_on_signal()
+            .map_err(|error| format!("failed to install import signal handler: {error}"))?;
         let result = self.with_progress("Importing environment archive", || {
             self.environment_service().import_with_sandbox_origin(
                 ImportEnvironmentOptions {
@@ -750,7 +770,17 @@ impl Cli {
                 },
                 sandbox_origin,
             )
-        })?;
+        });
+        // An import registered before the signal took effect stays registered.
+        if let Err(error) = &result
+            && crate::infra::interrupt::cancellation_settled()
+        {
+            // The error itself may be a failure that came before the signal.
+            self.stderr_line(format!("ocm: {error}"));
+            self.stderr_line(format!("ocm: env import {archive} interrupted by a signal"));
+            return Ok(130);
+        }
+        let result = result?;
         let summary = result.summary;
         self.warn_cleared_sandbox_origin(
             &summary.name,

@@ -192,6 +192,41 @@ fn lock_open_file(file: File, path: &Path, label: &str) -> Result<ExclusiveFileL
     })
 }
 
+/// Wait for an exclusive lock like `lock_file`, but stop waiting once a signal
+/// has asked the command to stop, so a command queued behind another holder
+/// can still be interrupted. Without such a request this waits indefinitely.
+pub(crate) fn lock_file_until_cancelled(
+    path: &Path,
+    label: &str,
+) -> Result<ExclusiveFileLock, String> {
+    let file = open_lock_file(path, label)?;
+    loop {
+        match FileExt::try_lock_exclusive(&file) {
+            Ok(()) => {
+                return Ok(ExclusiveFileLock {
+                    file,
+                    child_custody: AtomicBool::new(false),
+                });
+            }
+            // Windows reports a held lock as ERROR_LOCK_VIOLATION, which std
+            // does not map to WouldBlock.
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {}
+            Err(error) => {
+                return Err(format!(
+                    "failed to acquire {label} lock at {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+        if crate::infra::interrupt::cancellation_requested() {
+            return Err(crate::infra::interrupt::cancelled_error().to_string());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 pub(crate) fn try_lock_file(path: &Path, label: &str) -> Result<Option<ExclusiveFileLock>, String> {
     if let Some(parent) = path.parent() {
         ensure_dir(parent)?;
@@ -821,6 +856,17 @@ fn copy_path_inner(
     }
     if let Some(parent) = destination.parent() {
         ensure_dir(parent)?;
+    }
+    copy_regular_file(source, destination)
+}
+
+// A command that stops on a signal leaves a copy through its error path, whose
+// cleanup removes what the copy has written so far. Out of line, so the
+// recursive copy's frames do not grow.
+#[inline(never)]
+fn copy_regular_file(source: &Path, destination: &Path) -> Result<(), String> {
+    if crate::infra::interrupt::cancellation_requested() {
+        return Err(crate::infra::interrupt::cancelled_error().to_string());
     }
     fs::copy(source, destination)
         .map(|_| ())

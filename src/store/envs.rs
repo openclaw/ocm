@@ -152,6 +152,20 @@ pub(crate) fn lock_env_registry(
     )
 }
 
+/// `lock_env_registry` for clone and import, which stop on a signal: another
+/// clone can hold the registry for its whole copy, and a signal must still end
+/// the wait.
+fn lock_env_registry_until_cancelled(
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<EnvRegistryLock, String> {
+    let registry_path = env_registry_path(env, cwd)?;
+    super::common::lock_file_until_cancelled(
+        &registry_path.with_extension("lock"),
+        "environment registry",
+    )
+}
+
 fn normalize_environment(mut meta: EnvMeta) -> Result<EnvMeta, String> {
     meta.name = validate_name(&meta.name, "Environment name")?;
     meta.kind = "ocm-env".to_string();
@@ -967,7 +981,7 @@ fn clone_environment_with_policy(
     let sandbox_origin = normalize_new_environment_sandbox_origin(sandbox_origin)?;
     let source_name = validate_name(&options.source_name, "Environment name")?;
     let name = validate_name(&options.name, "Environment name")?;
-    let _lock = lock_env_registry(env, cwd)?;
+    let _lock = lock_env_registry_until_cancelled(env, cwd)?;
     let mut registry = load_env_registry(env, cwd)?;
     let source = find_environment(&registry, &source_name)
         .ok_or_else(|| format!("environment \"{source_name}\" does not exist"))?;
@@ -1211,6 +1225,7 @@ fn clone_environment_with_policy(
             last_used_at: None,
         };
         let (meta, _admission) = upsert_environment(&mut registry, meta, None, env, cwd)?;
+        stop_before_registering_if_cancelled()?;
         write_env_registry(&mut registry, env, cwd)?;
         Ok(CloneEnvironmentResult {
             meta,
@@ -1224,6 +1239,16 @@ fn clone_environment_with_policy(
     }
 
     result
+}
+
+// A signal during the copy, the rewrites or admission must not let the command
+// write the registry: the caller's cleanup then removes the root. Count a
+// signal that reached OCM but is still being dispatched.
+fn stop_before_registering_if_cancelled() -> Result<(), String> {
+    if crate::infra::interrupt::cancellation_settled() {
+        return Err(crate::infra::interrupt::cancelled_error().to_string());
+    }
+    Ok(())
 }
 
 fn clear_simulation_runtime_state_preserving_includes(
@@ -1571,7 +1596,7 @@ pub(crate) fn import_environment_with_sandbox_origin(
         } else {
             validate_name(&source_name, "Environment name")?
         };
-        let _lock = lock_env_registry(env, cwd)?;
+        let _lock = lock_env_registry_until_cancelled(env, cwd)?;
         let mut registry = load_env_registry(env, cwd)?;
         if find_environment(&registry, &name).is_some() {
             return Err(format!("environment \"{name}\" already exists"));
@@ -1769,6 +1794,7 @@ pub(crate) fn import_environment_with_sandbox_origin(
                 last_used_at: None,
             };
             let (meta, _admission) = upsert_environment(&mut registry, meta, None, env, cwd)?;
+            stop_before_registering_if_cancelled()?;
             write_env_registry(&mut registry, env, cwd)?;
             Ok((meta, config_rewrite, state_rewrite))
         })();
@@ -2120,9 +2146,11 @@ impl ImportStaging {
             }
         }
         // Serializes sweeping with creation, so a leaf is locked before any
-        // other import can consider it abandoned.
-        let _creation =
-            super::common::lock_file(&parent.join(IMPORT_STAGING_LOCK), "import staging")?;
+        // other import can consider it abandoned. A signal still ends the wait.
+        let _creation = super::common::lock_file_until_cancelled(
+            &parent.join(IMPORT_STAGING_LOCK),
+            "import staging",
+        )?;
         remove_abandoned_import_staging(&parent);
         let mut builder = tempfile::Builder::new();
         builder.prefix(IMPORT_STAGING_PREFIX);

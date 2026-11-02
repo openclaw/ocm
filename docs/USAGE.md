@@ -1240,6 +1240,8 @@ ocm env clone mira rowan
 
 Automatic Gateway port selection searches upward from the preferred port through 65535, preserving existing environment and dev UI reservations. If no candidate remains, creation, cloning, or archive import fails without registering an environment or creating its destination root; it does not wrap to a lower port.
 
+SIGINT (Ctrl-C), SIGTERM or SIGHUP stops a clone before it registers the new environment, including while it waits for another OCM command to release the environment registry: the copy stops after the file in progress, or the path rewrites under way finish, then the clone removes the incomplete root it populated and exits with status 130, so the same command can be retried. A clone that was already writing the environment registry when the signal arrived stays registered and reports success. A signal that OCM was started with ignored, as under `nohup` or for a background job, is still ignored. A root that already held files is refused before copying and is never removed.
+
 Clone copies the workspace and env config into a new environment, gives the clone its own gateway port, rewrites env-scoped OpenClaw config paths under the new env root, keeps durable agent auth/settings for the same user, clears copied runtime residue like sessions, logs, and backups, and keeps the background service separate. Configured agent directories inside the environment retain their payloads through clone and ordinary export/import, including custom and nested locations.
 Clone, migration and adoption copy regular files, directories and symlinks. Unix sockets, FIFOs and device files in the copied home or workspaces hold no data and are left out, as in environment export; the source keeps them, and their owning processes recreate them when needed.
 Clone recreates an absolute link into the source environment as a relative link to the same location in the clone, so the clone does not keep reading or writing the source; a link to state the clone clears, such as logs, points at the clone's location. Relative links, links outside the environment and links inside saved skill-library and Skill Workshop revisions keep their targets.
@@ -1718,6 +1720,9 @@ Import unpacks the archive in a new private directory under
 `$OCM_HOME/import-staging`, on the OCM home's filesystem rather than the system
 temp directory (`TMPDIR` does not apply), and removes it when the import
 finishes. A later import removes staging left behind by an interrupted one.
+SIGINT (Ctrl-C), SIGTERM or SIGHUP stops an import the same way, while it
+unpacks the archive or copies into the new environment's root: it removes the
+staging and any incomplete root and exits with status 130.
 
 Export writes `<env>.ocm-env.tar` in the current directory unless `--output` is
 specified. The archive can be inside the environment, including through a
