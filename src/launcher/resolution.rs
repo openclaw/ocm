@@ -57,8 +57,8 @@ enum RecipeTail {
 /// expansions. Anything that can hide or move token boundaries (command and
 /// process substitution, backquotes, `$'...'`, here-documents, line
 /// continuations, `((`, `[[`, brackets or parentheses inside a word, `${...}` holding
-/// quotes or nested expansions) and unterminated quotes return `None`, so those
-/// recipes keep the plain append.
+/// quotes or nested expansions, `alias` definitions) and unterminated quotes
+/// return `None`, so those recipes keep the plain append.
 fn posix_recipe_tail(command: &str) -> Option<RecipeTail> {
     let bytes = command.as_bytes();
     let mut index = 0;
@@ -79,6 +79,14 @@ fn posix_recipe_tail(command: &str) -> Option<RecipeTail> {
             b'[' if !word_start || next == Some(&b'[') => return None,
             b'(' | b')' if !word_start && !ends_token(bytes[index - 1]) => return None,
             b'<' if next == Some(&b'<') => return None,
+            // An alias defined in the recipe can supply text, quotes included,
+            // that the scan never sees.
+            b'a' if word_start
+                && bytes[index..].starts_with(b"alias")
+                && bytes.get(index + 5).is_none_or(|&byte| ends_token(byte)) =>
+            {
+                return None;
+            }
             b'\\' if next == Some(&b'\n') => return None,
             b'\\' if next.is_none() => {
                 return (word_end > 0).then_some(RecipeTail::Backslash(word_end));

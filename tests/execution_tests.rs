@@ -138,6 +138,7 @@ fn build_launcher_command_appends_after_recipes_without_a_trailing_comment() {
         r#"declare -A a; printf '%s\n' "$[a[" # marker"]]""#,
         "printf '%s\\n' \"${ : # }\nprintf '%s' \" # marker\"; }\"",
         "openclaw ${| REPLY=x; } # x",
+        "alias q=\"printf '%s\\n' '\"\nq # marker'",
         "openclaw 'unterminated # x",
         "openclaw \"unterminated # x",
     ];
