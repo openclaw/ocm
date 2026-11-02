@@ -490,6 +490,52 @@ impl Cli {
         (args.to_vec(), Vec::new())
     }
 
+    /// Drops a `--` that stands where a command's `<env>` goes, so the word
+    /// after it is the env name even when it spells one of the command's
+    /// subcommands or `help`.
+    fn consume_env_name_separator(mut args: Vec<String>) -> Vec<String> {
+        if args.first().is_some_and(|arg| arg == "--") {
+            args.remove(0);
+        }
+        args
+    }
+
+    /// Adds to a failed `<command> <word> <rest>...` invocation that `word`
+    /// was read as a subcommand or help topic when an env of that name exists
+    /// and `rest` names no existing env, alone, as an `--option=value` or in a
+    /// comma-separated list such as `--envs`, and how to address that env
+    /// instead.
+    fn explain_env_name_collision<T>(
+        &self,
+        result: Result<T, String>,
+        command: &str,
+        word: &str,
+        rest: &[String],
+    ) -> Result<T, String> {
+        result.map_err(|error| {
+            let Ok(envs) = self.environment_service().list() else {
+                return error;
+            };
+            let is_env = |name: &str| envs.iter().any(|env| env.name == name);
+            let rest_names_env = rest
+                .iter()
+                .filter_map(|arg| match arg.strip_prefix('-') {
+                    Some(option) => option.split_once('=').map(|(_, value)| value),
+                    None => Some(arg.as_str()),
+                })
+                .flat_map(|value| value.split(','))
+                .map(str::trim)
+                .any(is_env);
+            if !is_env(word) || rest_names_env {
+                return error;
+            }
+            let cmd = self.command_example();
+            format!(
+                "{error}; \"{word}\" was read as `{cmd} {command} {word}`, not as the env named \"{word}\"; to address that env, put -- before its name: `{cmd} {command} -- {word}`"
+            )
+        })
+    }
+
     fn consume_flag(args: Vec<String>, name: &str) -> (Vec<String>, bool) {
         let mut out = Vec::with_capacity(args.len());
         let mut found = false;

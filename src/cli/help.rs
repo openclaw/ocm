@@ -201,10 +201,17 @@ impl Cli {
             _ => None,
         }?;
 
-        Some(
-            self.render_help_topic(&topic)
-                .and_then(|text| self.print_help_text(text)),
-        )
+        let result = self
+            .render_help_topic(&topic)
+            .and_then(|text| self.print_help_text(text));
+        Some(match args {
+            [command, word, rest @ ..]
+                if word == "help" && matches!(command.as_str(), "upgrade" | "dev" | "logs") =>
+            {
+                self.explain_env_name_collision(result, command, word, rest)
+            }
+            _ => result,
+        })
     }
 
     pub(super) fn dispatch_help_command(&self, args: Vec<String>) -> Result<i32, String> {

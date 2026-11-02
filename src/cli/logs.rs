@@ -109,6 +109,7 @@ impl Cli {
             return Err("logs cannot combine --json with --follow".to_string());
         }
 
+        let args = Self::consume_env_name_separator(args);
         let Some(name) = args.first() else {
             return Err("logs requires <env>".to_string());
         };

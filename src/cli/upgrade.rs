@@ -729,61 +729,28 @@ impl Cli {
 
     pub(super) fn handle_upgrade_command(&self, args: Vec<String>) -> Result<i32, String> {
         if args.first().map(String::as_str) == Some("job") {
-            return self.handle_upgrade_job(args[1..].to_vec());
+            let result = self.handle_upgrade_job(args[1..].to_vec());
+            return self.explain_env_name_collision(result, "upgrade", "job", &args[1..]);
         }
         let (args, json_flag, profile) = self.consume_human_output_flags(args, "upgrade")?;
-        if matches!(args.first().map(String::as_str), Some("batch")) {
-            return self.handle_upgrade_batch(args[1..].to_vec(), json_flag, profile);
-        }
-        if matches!(args.first().map(String::as_str), Some("rollback")) {
-            return self.handle_upgrade_rollback(args[1..].to_vec(), json_flag, profile);
-        }
-        if matches!(args.first().map(String::as_str), Some("history")) {
-            let Some(env_name) = args.get(1) else {
-                return Err("upgrade history requires <env>".to_string());
+        if let Some((subcommand, rest)) = args.split_first() {
+            let result = match subcommand.as_str() {
+                "batch" => Some(self.handle_upgrade_batch(rest.to_vec(), json_flag, profile)),
+                "rollback" => Some(self.handle_upgrade_rollback(rest.to_vec(), json_flag, profile)),
+                "history" => Some(self.handle_upgrade_history(rest, json_flag, profile)),
+                "simulate" => Some(self.handle_upgrade_simulate(rest.to_vec(), json_flag, profile)),
+                _ => None,
             };
-            Self::assert_no_extra_args(&args[2..])?;
-            let history = list_upgrade_history(env_name, &self.env, &self.cwd)?;
-            if json_flag {
-                self.print_json(&history)?;
-            } else {
-                self.stdout_lines(render::upgrade::upgrade_history(
-                    env_name, &history, profile,
-                )?);
+            if let Some(result) = result {
+                return self.explain_env_name_collision(result, "upgrade", subcommand, rest);
             }
-            return Ok(0);
-        }
-        if matches!(args.first().map(String::as_str), Some("simulate")) {
-            let summaries = self.upgrade_simulate(args[1..].to_vec())?;
-            let requires_attention = summaries.iter().any(simulation_requires_attention);
-            if json_flag {
-                if summaries.len() == 1 {
-                    self.print_json(&summaries[0])?;
-                } else {
-                    self.print_json(&build_simulation_batch_summary(summaries))?;
-                }
-                return Ok(if requires_attention { 1 } else { 0 });
-            }
-            if summaries.len() == 1 {
-                self.stdout_lines(render::upgrade::upgrade_simulation(
-                    &summaries[0],
-                    profile,
-                    &self.command_example(),
-                ));
-            } else {
-                self.stdout_lines(render::upgrade::upgrade_simulation_batch(
-                    &build_simulation_batch_summary(summaries),
-                    profile,
-                    &self.command_example(),
-                ));
-            }
-            return Ok(if requires_attention { 1 } else { 0 });
         }
 
         let (args, dry_run) = Self::consume_flag(args, "--dry-run");
         let (args, no_rollback) = Self::consume_flag(args, "--no-rollback");
         let (args, all_flag) = Self::consume_flag(args, "--all");
         let (args, target) = UpgradeTarget::parse(args)?;
+        let args = Self::consume_env_name_separator(args);
         let options = UpgradeOptions {
             dry_run,
             rollback_enabled: !no_rollback,
@@ -864,6 +831,59 @@ impl Cli {
             &self.command_example(),
         ));
         Ok(if failed { 1 } else { 0 })
+    }
+
+    fn handle_upgrade_history(
+        &self,
+        args: &[String],
+        json_flag: bool,
+        profile: render::RenderProfile,
+    ) -> Result<i32, String> {
+        let Some(env_name) = args.first() else {
+            return Err("upgrade history requires <env>".to_string());
+        };
+        Self::assert_no_extra_args(&args[1..])?;
+        let history = list_upgrade_history(env_name, &self.env, &self.cwd)?;
+        if json_flag {
+            self.print_json(&history)?;
+        } else {
+            self.stdout_lines(render::upgrade::upgrade_history(
+                env_name, &history, profile,
+            )?);
+        }
+        Ok(0)
+    }
+
+    fn handle_upgrade_simulate(
+        &self,
+        args: Vec<String>,
+        json_flag: bool,
+        profile: render::RenderProfile,
+    ) -> Result<i32, String> {
+        let summaries = self.upgrade_simulate(args)?;
+        let requires_attention = summaries.iter().any(simulation_requires_attention);
+        if json_flag {
+            if summaries.len() == 1 {
+                self.print_json(&summaries[0])?;
+            } else {
+                self.print_json(&build_simulation_batch_summary(summaries))?;
+            }
+            return Ok(if requires_attention { 1 } else { 0 });
+        }
+        if summaries.len() == 1 {
+            self.stdout_lines(render::upgrade::upgrade_simulation(
+                &summaries[0],
+                profile,
+                &self.command_example(),
+            ));
+        } else {
+            self.stdout_lines(render::upgrade::upgrade_simulation_batch(
+                &build_simulation_batch_summary(summaries),
+                profile,
+                &self.command_example(),
+            ));
+        }
+        Ok(if requires_attention { 1 } else { 0 })
     }
 
     fn handle_upgrade_batch(

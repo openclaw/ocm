@@ -10756,6 +10756,136 @@ fn upgrade_dry_runs_accept_an_environment_named_batch() {
 }
 
 #[test]
+fn upgrade_reaches_envs_named_like_its_commands_after_a_separator() {
+    let root = TestDir::new("upgrade-command-word-names");
+    let env = ocm_env(&root);
+    let runtime = root.child("manual-openclaw");
+    write_executable_script(&runtime, &recording_openclaw_script("2026.8.1"));
+    let add = run_ocm(
+        root.path(),
+        &env,
+        &["runtime", "add", "manual", "--path", &path_string(&runtime)],
+    );
+    assert!(add.status.success(), "{}", stderr(&add));
+    let words = ["history", "rollback", "simulate", "batch", "job", "help"];
+
+    // Before such envs exist, the command words fail without naming an env.
+    let unregistered = run_ocm(root.path(), &env, &["upgrade", "rollback", "--dry-run"]);
+    assert!(!unregistered.status.success());
+    assert!(
+        !stderr(&unregistered).contains("was read as"),
+        "{}",
+        stderr(&unregistered)
+    );
+
+    for name in ["mira", "status"].into_iter().chain(words) {
+        let create = run_ocm(
+            root.path(),
+            &env,
+            &["env", "create", name, "--runtime", "manual"],
+        );
+        assert!(create.status.success(), "{name}: {}", stderr(&create));
+    }
+    let dry_run = |args: &[&str]| -> Value {
+        let output = run_ocm(root.path(), &env, args);
+        assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+        serde_json::from_str(&stdout(&output)).unwrap()
+    };
+
+    for name in words {
+        let separated = dry_run(&["upgrade", "--", name, "--dry-run", "--json"]);
+        assert_eq!(separated["envName"], name);
+        assert_eq!(separated["outcome"], "manual-runtime");
+        let options_first = dry_run(&["upgrade", "--dry-run", "--json", "--", name]);
+        assert_eq!(options_first["envName"], name);
+
+        let bare = run_ocm(root.path(), &env, &["upgrade", name, "--dry-run"]);
+        assert!(!bare.status.success(), "{name}: {}", stdout(&bare));
+        assert!(
+            stderr(&bare).contains(&format!(
+                "\"{name}\" was read as `ocm upgrade {name}`, not as the env named \"{name}\"; to address that env, put -- before its name: `ocm upgrade -- {name}`"
+            )),
+            "{name}: {}",
+            stderr(&bare)
+        );
+    }
+
+    // Names that are not command words keep their plain form, and `--` is
+    // accepted before them too.
+    for name in ["mira", "status"] {
+        assert_eq!(
+            dry_run(&["upgrade", name, "--dry-run", "--json"])["envName"],
+            name
+        );
+        assert_eq!(
+            dry_run(&["upgrade", "--", name, "--dry-run", "--json"])["envName"],
+            name
+        );
+    }
+
+    // Command words keep their meaning, and a failure for an invocation that
+    // names another existing env does not mention the colliding env.
+    let history = run_ocm(root.path(), &env, &["upgrade", "history", "mira", "--json"]);
+    assert!(history.status.success(), "{}", stderr(&history));
+    assert_eq!(
+        serde_json::from_str::<Value>(&stdout(&history)).unwrap(),
+        serde_json::json!([])
+    );
+    let rollback = run_ocm(
+        root.path(),
+        &env,
+        &["upgrade", "rollback", "mira", "--dry-run"],
+    );
+    assert!(!rollback.status.success());
+    assert!(
+        stderr(&rollback).contains("does not have a completed upgrade transaction"),
+        "{}",
+        stderr(&rollback)
+    );
+    assert!(
+        !stderr(&rollback).contains("was read as"),
+        "{}",
+        stderr(&rollback)
+    );
+    for selection in [
+        vec!["--envs", "mira,status"],
+        vec!["--envs", " mira , status "],
+        vec!["--envs=mira,status"],
+    ] {
+        let mut args = vec!["upgrade", "batch", "--runtime", "manual"];
+        args.extend(selection);
+        let fleet = run_ocm(root.path(), &env, &args);
+        assert!(!fleet.status.success(), "{args:?}");
+        assert!(
+            stderr(&fleet).contains("--accept-fleet-outage"),
+            "{args:?}: {}",
+            stderr(&fleet)
+        );
+        assert!(
+            !stderr(&fleet).contains("was read as"),
+            "{args:?}: {}",
+            stderr(&fleet)
+        );
+    }
+    let help = run_ocm(root.path(), &env, &["upgrade", "help"]);
+    assert!(help.status.success(), "{}", stderr(&help));
+    assert!(stdout(&help).starts_with("Upgrade environments"));
+    let all = dry_run(&["upgrade", "--all", "--dry-run", "--json"]);
+    assert_eq!(all["count"], 8);
+    let separated_all = run_ocm(
+        root.path(),
+        &env,
+        &["upgrade", "--all", "--dry-run", "--", "history"],
+    );
+    assert!(!separated_all.status.success());
+    assert!(
+        stderr(&separated_all).contains("unexpected arguments: history"),
+        "{}",
+        stderr(&separated_all)
+    );
+}
+
+#[test]
 fn upgrade_batch_accepts_case_distinct_names_and_preserves_rollback() {
     for policy in ["continue", "rollback"] {
         let root = TestDir::new(&format!("upgrade-case-distinct-{policy}"));
