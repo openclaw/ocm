@@ -3,6 +3,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use semver::Version;
@@ -83,12 +84,37 @@ struct GitHubReleaseAsset {
     digest: Option<String>,
 }
 
+// The temporary directory of the update in progress. A signal does not unwind
+// the update, so the signal owner removes it instead of its Drop.
+static OPEN_TEMP_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+fn open_temp_dir() -> MutexGuard<'static, Option<PathBuf>> {
+    OPEN_TEMP_DIR.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// SIGINT, SIGTERM or SIGHUP while the release archive is downloaded,
+/// extracted or staged removes its temporary directory before OCM exits with
+/// status 130, as other interrupted commands do.
+fn install_self_update_interrupt_handler() -> Result<(), String> {
+    crate::infra::interrupt::set_handler(remove_open_temp_dir)
+        .map_err(|error| format!("failed to install self-update signal handler: {error}"))
+}
+
+fn remove_open_temp_dir() -> bool {
+    if let Some(path) = open_temp_dir().take() {
+        let _ = fs::remove_dir_all(path);
+    }
+    false
+}
+
 struct SelfUpdateTempDir {
     path: PathBuf,
 }
 
 impl SelfUpdateTempDir {
     fn create() -> Result<Self, String> {
+        // Held across creation, so a signal finds the directory once it exists.
+        let mut open = open_temp_dir();
         let unique = time::OffsetDateTime::now_utc().unix_timestamp_nanos();
         for attempt in 0..100 {
             let path = std::env::temp_dir().join(format!(
@@ -103,7 +129,10 @@ impl SelfUpdateTempDir {
                 builder.mode(0o700);
             }
             match builder.create(&path) {
-                Ok(()) => return Ok(Self { path }),
+                Ok(()) => {
+                    *open = Some(path.clone());
+                    return Ok(Self { path });
+                }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(error) => {
                     return Err(format!(
@@ -123,6 +152,10 @@ impl SelfUpdateTempDir {
 
 impl Drop for SelfUpdateTempDir {
     fn drop(&mut self) {
+        let mut open = open_temp_dir();
+        if open.as_ref() == Some(&self.path) {
+            *open = None;
+        }
         let _ = fs::remove_dir_all(&self.path);
     }
 }
@@ -391,6 +424,7 @@ impl Cli {
         })?;
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
 
+        install_self_update_interrupt_handler()?;
         let temp_root = SelfUpdateTempDir::create()?;
         let archive_path = temp_root.path().join(&asset.name);
         download_to_file(&asset.browser_download_url, &archive_path)?;
@@ -618,8 +652,9 @@ fn should_treat_target_as_current(
 #[cfg(test)]
 mod tests {
     use super::{
-        SelfUpdateTempDir, display_version_from_tag, normalize_release_tag, parse_release_version,
-        release_asset_name, self_release_url, should_treat_target_as_current,
+        SelfUpdateTempDir, display_version_from_tag, normalize_release_tag, open_temp_dir,
+        parse_release_version, release_asset_name, remove_open_temp_dir, self_release_url,
+        should_treat_target_as_current,
     };
     use std::collections::BTreeMap;
 
@@ -724,6 +759,17 @@ mod tests {
         std::fs::write(path.join("partial-download"), b"partial").unwrap();
         drop(temp);
         assert!(!path.exists());
+        assert_eq!(*open_temp_dir(), None);
+
+        // The signal owner removes the open directory and requests the
+        // ordinary interrupted exit; the later Drop finds nothing left.
+        let temp = SelfUpdateTempDir::create().unwrap();
+        let path = temp.path().to_path_buf();
+        std::fs::write(path.join("partial-download"), b"partial").unwrap();
+        assert!(!remove_open_temp_dir());
+        assert!(!path.exists());
+        assert_eq!(*open_temp_dir(), None);
+        drop(temp);
     }
 
     #[test]

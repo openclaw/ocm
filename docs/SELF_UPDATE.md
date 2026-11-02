@@ -75,6 +75,10 @@ until that command exits. OCM never kills an unknown PID to reclaim a lock.
 
 ## Boundaries
 
+- SIGINT (Ctrl-C), SIGTERM or SIGHUP while the release archive is still
+  downloading, extracting or staging stops the update with status 130 and
+  removes its temporary download directory. The installed executable and any
+  receipt are unchanged, so the next update starts normally.
 - `--check` and unchanged releases do not restart services. An unchanged
   release creates no journal or lock, so it needs no write access beside the
   executable; an existing unfinished receipt still blocks it.
