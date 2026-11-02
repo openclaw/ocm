@@ -237,7 +237,14 @@ pub(crate) fn rewrite_openclaw_config_for_migration(
     gateway_port: Option<u32>,
     sandbox_origin: Option<&str>,
 ) -> Result<OpenClawConfigRewriteOutcome, String> {
-    let kept = expand_migrated_home_relative_paths(target_paths, source_home)?;
+    let kept = expand_migrated_home_relative_paths(
+        target_paths,
+        &HomeExpansion {
+            home: source_home,
+            source_state_dir: source_state_root,
+            target_state_dir: &target_paths.state_dir,
+        },
+    )?;
     rewrite_migrated_plugin_load_paths(
         target_paths,
         source_state_root,
@@ -263,10 +270,10 @@ pub(crate) fn rewrite_openclaw_config_for_migration(
 /// although they may now resolve elsewhere.
 fn expand_migrated_home_relative_paths(
     target: &EnvPaths,
-    source_home: &Path,
+    expansion: &HomeExpansion<'_>,
 ) -> Result<BTreeSet<KeptHomeRelativeSetting>, String> {
     let mut kept = BTreeSet::new();
-    if !source_home.is_absolute() {
+    if !expansion.home.is_absolute() {
         return Ok(kept);
     }
     let Some(effective) = load_effective_openclaw_config(&target.config_path)? else {
@@ -281,7 +288,7 @@ fn expand_migrated_home_relative_paths(
         let mut rewritten = None;
         for mut scope in scopes {
             let mut candidate = value.clone();
-            expand_home_relative_paths_in_scope(&mut candidate, &mut scope, source_home, &mut kept);
+            expand_home_relative_paths_in_scope(&mut candidate, &mut scope, expansion, &mut kept);
             if rewritten
                 .as_ref()
                 .is_some_and(|previous| previous != &candidate)
@@ -300,15 +307,33 @@ fn expand_migrated_home_relative_paths(
     Ok(kept)
 }
 
+/// The home `~` named in the plain install, and the state directory the
+/// later relocation moves absolute values from and to.
+struct HomeExpansion<'a> {
+    home: &'a Path,
+    source_state_dir: &'a Path,
+    target_state_dir: &'a Path,
+}
+
+impl HomeExpansion<'_> {
+    /// Whether the later relocation of absolute state paths would move this
+    /// spelled-out value into the copied state directory.
+    fn relocates(&self, expanded: &str) -> bool {
+        let mut relocated = expanded.to_string();
+        rewrite_env_root_string(&mut relocated, self.source_state_dir, self.target_state_dir)
+    }
+}
+
 /// Expands the home-relative path settings in a config fragment included at
 /// `scope`, and records the settings it keeps as written although they may
 /// now resolve elsewhere. `$include` directives keep their own relocation.
 fn expand_home_relative_paths_in_scope(
     value: &mut Value,
     scope: &mut Vec<ConfigSegment>,
-    home: &Path,
+    expansion: &HomeExpansion<'_>,
     kept: &mut BTreeSet<KeptHomeRelativeSetting>,
 ) -> bool {
+    let home = expansion.home;
     match value {
         Value::String(raw) => {
             let Some(rule) = home_relative_path_setting(scope) else {
@@ -317,6 +342,15 @@ fn expand_home_relative_paths_in_scope(
             let expanded = match rule {
                 HomePathRule::Lexical { trims } => {
                     match expand_home_relative_path(raw, home, trims) {
+                        // The later relocation of state paths follows links
+                        // and would treat the placeholder as a directory name,
+                        // which OpenClaw substitutes before resolving `..`.
+                        Some(expanded)
+                            if has_home_relative_placeholder(raw, trims)
+                                && expansion.relocates(&expanded) =>
+                        {
+                            Err(KeptHomeRelativeReason::Placeholder)
+                        }
                         Some(expanded) => Ok(expanded),
                         // A placeholder under `~/.openclaw` can still lead outside it.
                         None if has_home_relative_placeholder(raw, trims) => {
@@ -359,7 +393,7 @@ fn expand_home_relative_paths_in_scope(
             let mut changed = false;
             for (index, nested) in values.iter_mut().enumerate() {
                 scope.push(ConfigSegment::Index(index));
-                changed |= expand_home_relative_paths_in_scope(nested, scope, home, kept);
+                changed |= expand_home_relative_paths_in_scope(nested, scope, expansion, kept);
                 scope.pop();
             }
             changed
@@ -368,7 +402,7 @@ fn expand_home_relative_paths_in_scope(
             let mut changed = false;
             for (key, nested) in values.iter_mut().filter(|(key, _)| *key != "$include") {
                 scope.push(ConfigSegment::Key(key.clone()));
-                changed |= expand_home_relative_paths_in_scope(nested, scope, home, kept);
+                changed |= expand_home_relative_paths_in_scope(nested, scope, expansion, kept);
                 scope.pop();
             }
             changed
@@ -540,7 +574,25 @@ fn has_home_relative_placeholder(raw: &str, trims: bool) -> bool {
     } else {
         raw
     };
-    is_home_relative(value) && value.contains("${")
+    is_home_relative(value) && first_placeholder(value).is_some()
+}
+
+/// Where the first `${` that OpenClaw may substitute starts. `$${` is its
+/// escape for the literal text `${`.
+fn first_placeholder(value: &str) -> Option<usize> {
+    let mut search = 0;
+    while let Some(offset) = value[search..].find('$') {
+        let index = search + offset;
+        let rest = &value[index + 1..];
+        if rest.starts_with("${") {
+            search = index + 3;
+        } else if rest.starts_with('{') {
+            return Some(index);
+        } else {
+            search = index + 1;
+        }
+    }
+    None
 }
 
 /// Splits a home-relative value before the separator that precedes its
@@ -548,7 +600,7 @@ fn has_home_relative_placeholder(raw: &str, trims: bool) -> bool {
 /// resolves the path, so a placeholder's value can still add `..` or name
 /// any directory; only the literal directories before it are known here.
 fn split_before_placeholder(value: &str) -> (&str, &str) {
-    let Some(placeholder) = value.find("${") else {
+    let Some(placeholder) = first_placeholder(value) else {
         return (value, "");
     };
     // `~` is followed by a separator, so the split never falls before it.
@@ -3153,6 +3205,15 @@ mod tests {
             Some("/\\${X}")
         );
         assert_eq!(expand("~/.openclaw/${SUB}/x"), None);
+        // `$${` is OpenClaw's escape for a literal `${`.
+        assert_eq!(first_placeholder("a$${b}/${c}"), Some(7));
+        assert_eq!(first_placeholder("~/dev/$${X}"), None);
+        assert!(!has_home_relative_placeholder("~/.openclaw/$${X}", true));
+        assert!(has_home_relative_placeholder(" ~/.openclaw/${X}", true));
+        assert_eq!(
+            expand("~/dev/$${X}/../p").as_deref(),
+            Some("/home/alice/dev/p")
+        );
         assert_eq!(
             expand("~/.openclaw/../${SUB}").as_deref(),
             Some("/home/alice/${SUB}")

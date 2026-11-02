@@ -5733,6 +5733,51 @@ fn migrate_and_adopt_refuse_an_include_shared_by_a_path_list_and_a_trust_root() 
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn migrate_and_adopt_keep_placeholder_paths_that_lead_into_the_state_dir_through_a_link() {
+    for adopt in [false, true] {
+        let root = TestDir::new("migrate-home-relative-placeholder-alias");
+        let env = ocm_env(&root);
+        let home = root.child("home");
+        let source = home.join(".openclaw");
+        fs::create_dir_all(&source).unwrap();
+        // With `SUB=../external`, OpenClaw resolves `~/alias/${SUB}` to
+        // `~/external`; relocating the spelled-out value through the link
+        // would name the environment's `external` instead.
+        std::os::unix::fs::symlink(&source, home.join("alias")).unwrap();
+        let config = serde_json::json!({
+            "skills": {"load": {"extraDirs": ["~/alias/${SUB}", "~/shared/${SUB}"]}}
+        });
+        support::write_text(&source.join("openclaw.json"), &config.to_string());
+
+        let imported = run_ocm(
+            root.path(),
+            &env,
+            &migrate_or_adopt_args(adopt, "copied", &source),
+        );
+        assert!(imported.status.success(), "{}", stderr(&imported));
+
+        let target = root.child("ocm-home/envs/copied/.openclaw");
+        let copied: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(target.join("openclaw.json")).unwrap())
+                .unwrap();
+        let home_path = home.to_str().unwrap();
+        assert_eq!(
+            copied["skills"]["load"]["extraDirs"],
+            serde_json::json!(["~/alias/${SUB}", format!("{home_path}/shared/${{SUB}}")]),
+            "adopt={adopt}"
+        );
+        assert!(
+            stderr(&imported).lines().any(|line| line.starts_with(
+                "warning: env copied keeps the ~/ entries of skills.load.extraDirs[] that contain a ${VAR} placeholder"
+            )),
+            "adopt={adopt}: {}",
+            stderr(&imported)
+        );
+    }
+}
+
 #[test]
 fn migrate_and_adopt_do_not_name_trust_roots_that_keep_their_meaning() {
     for adopt in [false, true] {
