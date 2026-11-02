@@ -192,6 +192,14 @@ fn lock_open_file(file: File, path: &Path, label: &str) -> Result<ExclusiveFileL
     })
 }
 
+/// Whether a failed non-blocking lock attempt means another holder has the
+/// lock. Windows reports a held lock as ERROR_LOCK_VIOLATION, which std does
+/// not map to WouldBlock.
+fn lock_is_contended(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
+        || error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
+}
+
 /// Wait for an exclusive lock like `lock_file`, but stop waiting once a signal
 /// has asked the command to stop, so a command queued behind another holder
 /// can still be interrupted. Without such a request this waits indefinitely.
@@ -208,11 +216,7 @@ pub(crate) fn lock_file_until_cancelled(
                     child_custody: AtomicBool::new(false),
                 });
             }
-            // Windows reports a held lock as ERROR_LOCK_VIOLATION, which std
-            // does not map to WouldBlock.
-            Err(error)
-                if error.kind() == std::io::ErrorKind::WouldBlock
-                    || error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {}
+            Err(error) if lock_is_contended(&error) => {}
             Err(error) => {
                 return Err(format!(
                     "failed to acquire {label} lock at {}: {error}",
@@ -243,7 +247,7 @@ pub(crate) fn try_lock_file(path: &Path, label: &str) -> Result<Option<Exclusive
             file,
             child_custody: AtomicBool::new(false),
         })),
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) if lock_is_contended(&error) => Ok(None),
         Err(error) => Err(format!(
             "failed to acquire {label} lock at {}: {error}",
             path.display()
@@ -293,7 +297,7 @@ pub(crate) fn try_lock_file_shared(
             file,
             child_custody: AtomicBool::new(false),
         })),
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) if lock_is_contended(&error) => Ok(None),
         Err(error) => Err(format!(
             "failed to acquire shared {label} lock at {}: {error}",
             path.display()
@@ -1148,6 +1152,43 @@ mod tests {
         drop(first);
         assert!(super::try_lock_file(&alias, "test").unwrap().is_none());
         drop(second);
+        assert!(super::try_lock_file(&path, "test").unwrap().is_some());
+    }
+
+    #[test]
+    fn try_locks_report_a_held_lock_as_busy() {
+        assert!(super::lock_is_contended(&fs2::lock_contended_error()));
+        assert!(super::lock_is_contended(
+            &std::io::ErrorKind::WouldBlock.into()
+        ));
+        #[cfg(windows)]
+        assert!(super::lock_is_contended(
+            &std::io::Error::from_raw_os_error(
+                windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION as i32
+            )
+        ));
+        assert!(!super::lock_is_contended(
+            &std::io::ErrorKind::PermissionDenied.into()
+        ));
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("lock");
+        let writer = super::lock_file(&path, "test").unwrap();
+        assert!(super::try_lock_file(&path, "test").unwrap().is_none());
+        assert!(
+            super::try_lock_file_shared(&path, "test")
+                .unwrap()
+                .is_none()
+        );
+        drop(writer);
+        let reader = super::lock_file_shared(&path, "test").unwrap();
+        assert!(super::try_lock_file(&path, "test").unwrap().is_none());
+        assert!(
+            super::try_lock_file_shared(&path, "test")
+                .unwrap()
+                .is_some()
+        );
+        drop(reader);
         assert!(super::try_lock_file(&path, "test").unwrap().is_some());
     }
 
