@@ -2160,20 +2160,20 @@ fn open_child_log(
 }
 
 /// The daemon's own executable for its children's `OCM_SELF`. A Homebrew
-/// daemon keeps the stable link it resolved first: once `brew upgrade` removes
+/// daemon keeps the stable link once it finds one: after `brew upgrade` removes
 /// its keg, Linux reports the running file as deleted and no link resolves to it.
 #[cfg(unix)]
 fn supervisor_self_executable() -> Result<PathBuf, String> {
-    static HOMEBREW_LINK: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
-    if let Some(Some(link)) = HOMEBREW_LINK.get() {
+    static HOMEBREW_LINK: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    if let Some(link) = HOMEBREW_LINK.get() {
         return Ok(link.clone());
     }
     let current = std::env::current_exe().map_err(|error| error.to_string())?;
-    let link = HOMEBREW_LINK.get_or_init(|| {
-        let durable = crate::infra::install_owner::durable_executable_path(&current);
-        (durable != current).then_some(durable)
-    });
-    Ok(link.clone().unwrap_or(current))
+    let durable = crate::infra::install_owner::durable_executable_path(&current);
+    if durable == current {
+        return Ok(current);
+    }
+    Ok(HOMEBREW_LINK.get_or_init(|| durable).clone())
 }
 
 fn spawn_supervisor_child(spec: &SupervisorChildSpec) -> Result<Child, String> {
