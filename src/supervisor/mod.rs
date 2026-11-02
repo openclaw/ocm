@@ -1210,9 +1210,12 @@ impl<'a> SupervisorService<'a> {
                 "env \"{name}\" is not present in the persisted supervisor state"
             ));
         }
+        // A request for an earlier Gateway is stale. One for this Gateway may
+        // still be pending from a restart scheduled inside it; keep it, so a
+        // failed retry clearing its own request cannot revoke that one.
         state
             .handoff_restart_requests
-            .retain(|request| request.env_name != name);
+            .retain(|request| request.env_name != name || request.pid == pid);
         state
             .handoff_restart_requests
             .push(SupervisorHandoffRestartRequest {
@@ -2490,10 +2493,9 @@ fn preserve_handoff_restart_requests(
 ) {
     for request in requests {
         if active_child_spec(state, &request.env_name).is_none()
-            || state
-                .handoff_restart_requests
-                .iter()
-                .any(|existing| existing.env_name == request.env_name)
+            || state.handoff_restart_requests.iter().any(|existing| {
+                existing.env_name == request.env_name && existing.request_id == request.request_id
+            })
         {
             continue;
         }
@@ -2502,22 +2504,20 @@ fn preserve_handoff_restart_requests(
 }
 
 /// Take the handoff `ocm service restart` requested from the Gateway with
-/// `pid`, if any. A failure to read or update the plan takes nothing, which
-/// leaves the exit to the clean-exit loop guard.
+/// `pid`, if any. A plan that cannot be read takes nothing, which leaves the
+/// exit to the clean-exit loop guard.
 fn take_handoff_restart_request(state_path: &Path, env_name: &str, pid: u32) -> bool {
-    let _lock = match lock_supervisor_state(state_path) {
-        Ok(lock) => lock,
-        Err(error) => {
-            eprintln!(
-                "ocm service: failed locking state to read requested restart handoff {}: {}",
-                display_path(state_path),
-                error
-            );
-            return false;
-        }
+    let requested = |state: &SupervisorState| {
+        state
+            .handoff_restart_requests
+            .iter()
+            .any(|request| request.env_name == env_name && request.pid == pid)
     };
-    let mut state = match read_json::<SupervisorState>(state_path) {
-        Ok(state) => state,
+    // Decide without the state lock, like plan refreshes: service preparation
+    // can hold it for long, and the daemon loop must never wait for it.
+    match read_json::<SupervisorState>(state_path) {
+        Ok(state) if requested(&state) => {}
+        Ok(_) => return false,
         Err(error) => {
             eprintln!(
                 "ocm service: failed reading state for requested restart handoff {}: {}",
@@ -2526,20 +2526,23 @@ fn take_handoff_restart_request(state_path: &Path, env_name: &str, pid: u32) -> 
             );
             return false;
         }
-    };
-    let previous_len = state.handoff_restart_requests.len();
-    state
-        .handoff_restart_requests
-        .retain(|request| !(request.env_name == env_name && request.pid == pid));
-    if state.handoff_restart_requests.len() == previous_len {
-        return false;
     }
-    if let Err(error) = write_json(state_path, &state) {
-        eprintln!(
-            "ocm service: failed clearing requested restart handoff {}: {}",
-            display_path(state_path),
-            error
-        );
+    // Remove it only when the lock is free. Otherwise the requesting command
+    // clears it, and its PID keeps it from matching any later Gateway.
+    if let Ok(Some(_lock)) = try_lock_supervisor_state(state_path)
+        && let Ok(mut state) = read_json::<SupervisorState>(state_path)
+        && requested(&state)
+    {
+        state
+            .handoff_restart_requests
+            .retain(|request| !(request.env_name == env_name && request.pid == pid));
+        if let Err(error) = write_json(state_path, &state) {
+            eprintln!(
+                "ocm service: failed clearing requested restart handoff {}: {}",
+                display_path(state_path),
+                error
+            );
+        }
     }
     true
 }
@@ -5378,6 +5381,48 @@ mod tests {
         let saved: SupervisorState = read_json(&state_path).unwrap();
         assert_eq!(saved.handoff_restart_requests, vec![request("other", 42)]);
         assert_eq!(saved.children, state.children);
+
+        // The exit path never waits for a held state lock: it still sees the
+        // request and leaves its removal to the requesting command.
+        let lock = lock_supervisor_state(&state_path).unwrap();
+        assert!(take_handoff_restart_request(&state_path, "other", 42));
+        drop(lock);
+        let saved: SupervisorState = read_json(&state_path).unwrap();
+        assert_eq!(saved.handoff_restart_requests, vec![request("other", 42)]);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn plan_rewrites_keep_pending_handoff_restart_requests() {
+        let root = unique_test_root("handoff-restart-request-rewrite");
+        fs::create_dir_all(&root).unwrap();
+        let state_path = root.join("state.json");
+        let request = |env_name: &str, request_id: &str| SupervisorHandoffRestartRequest {
+            env_name: env_name.to_string(),
+            request_id: request_id.to_string(),
+            pid: 41,
+        };
+        let mut persisted = supervisor_state(Vec::new());
+        persisted.handoff_restart_requests = vec![
+            request("demo", "scheduled"),
+            request("demo", "retry"),
+            request("removed", "gone"),
+        ];
+        write_json(&state_path, &persisted).unwrap();
+
+        let mut synced = supervisor_state(Vec::new());
+        preserve_persisted_restart_requests(&state_path, &mut synced);
+        let mut targeted = supervisor_state(Vec::new());
+        merge_targeted_supervisor_state(
+            &mut targeted,
+            persisted,
+            &BTreeSet::from(["demo".to_string()]),
+        );
+
+        let expected = vec![request("demo", "scheduled"), request("demo", "retry")];
+        assert_eq!(synced.handoff_restart_requests, expected);
+        assert_eq!(targeted.handoff_restart_requests, expected);
 
         fs::remove_dir_all(root).unwrap();
     }
