@@ -664,6 +664,99 @@ fn env_export_json_reports_the_custom_archive_path() {
 
 #[cfg(unix)]
 #[test]
+fn env_import_relocates_absolute_links_into_the_source_environment_in_both_modes() {
+    use std::os::unix::fs::symlink;
+    let root = TestDir::new("import-absolute-internal-links");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    let create = run_ocm(&cwd, &env, &["env", "create", "source"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let source_root = root.child("ocm-home/envs/source");
+    let state = source_root.join(".openclaw");
+    let workspace = state.join("workspace");
+    let external = root.child("external");
+    write_text(&workspace.join("shared/data.txt"), "original\n");
+    write_text(&state.join("logs/gateway.log"), "source log\n");
+    write_text(&external.join("data.txt"), "external\n");
+    fs::create_dir_all(workspace.join("skills")).unwrap();
+    symlink(workspace.join("shared"), workspace.join("abs-dir")).unwrap();
+    symlink(
+        workspace.join("shared/data.txt"),
+        workspace.join("abs-file"),
+    )
+    .unwrap();
+    symlink(workspace.join("shared"), workspace.join("skills/team")).unwrap();
+    // Default archives omit logs; the link names the copy's location instead
+    // of reading the source.
+    symlink(state.join("logs"), workspace.join("logs-link")).unwrap();
+    symlink("shared", workspace.join("rel-dir")).unwrap();
+    symlink(&external, workspace.join("ext-dir")).unwrap();
+
+    let mut imported = Vec::new();
+    for include_state in [false, true] {
+        let name = if include_state {
+            "with-state"
+        } else {
+            "default"
+        };
+        let archive = root.child(&format!("{name}.tar"));
+        let archive = archive.to_str().unwrap();
+        let mut args = vec!["env", "export", "source", "--output", archive];
+        if include_state {
+            args.push("--include-state");
+        }
+        let export = run_ocm(&cwd, &env, &args);
+        assert!(export.status.success(), "{}", stderr(&export));
+        let import = run_ocm(&cwd, &env, &["env", "import", archive, "--name", name]);
+        assert!(import.status.success(), "{}", stderr(&import));
+
+        let copied = root.child(&format!("ocm-home/envs/{name}/.openclaw/workspace"));
+        for (link, expected) in [
+            ("abs-dir", "shared"),
+            ("abs-file", "shared/data.txt"),
+            ("skills/team", "../shared"),
+            ("logs-link", "../logs"),
+            ("rel-dir", "shared"),
+        ] {
+            assert_eq!(
+                fs::read_link(copied.join(link)).unwrap(),
+                std::path::Path::new(expected),
+                "{name}: {link}"
+            );
+        }
+        assert_eq!(fs::read_link(copied.join("ext-dir")).unwrap(), external);
+        if !include_state {
+            assert!(!copied.join("logs-link/gateway.log").exists());
+        }
+
+        for path in [copied.join("abs-dir/data.txt"), copied.join("abs-file")] {
+            let mut writes = fs::OpenOptions::new().append(true).open(path).unwrap();
+            std::io::Write::write_all(&mut writes, format!("{name}\n").as_bytes()).unwrap();
+        }
+        assert_eq!(
+            fs::read_to_string(workspace.join("shared/data.txt")).unwrap(),
+            "original\n"
+        );
+        assert_eq!(
+            fs::read_to_string(copied.join("shared/data.txt")).unwrap(),
+            format!("original\n{name}\n{name}\n")
+        );
+        imported.push(copied);
+    }
+
+    let remove = run_ocm(&cwd, &env, &["env", "remove", "source", "--force"]);
+    assert!(remove.status.success(), "{}", stderr(&remove));
+    assert!(!source_root.exists());
+    for copied in imported {
+        for link in ["abs-dir", "abs-file", "skills/team", "rel-dir"] {
+            assert!(copied.join(link).exists(), "{}: {link}", copied.display());
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn env_export_preserves_sqlite_links_and_snapshots_regular_databases() {
     use std::collections::BTreeSet;
     use std::io::Read;

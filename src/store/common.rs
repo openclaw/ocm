@@ -361,12 +361,15 @@ pub(crate) fn remove_owned_tree(path: &Path) -> Result<(), String> {
 
 // Clone and migration opt in; package, archive restore, and checkpoint callers
 // retain the raw copy contract. Protected historical payloads remain byte copies.
+// A clone must not keep reading or writing its source through absolute links.
 pub(crate) fn copy_dir_with_sqlite_snapshots(
     source: &Path,
     destination: &Path,
     state_root: &Path,
 ) -> Result<(), String> {
-    OpenClawDirectoryCopy::new(state_root, source)?.copy(source, destination)
+    let mut copying = OpenClawDirectoryCopy::new(state_root, source)?;
+    copying.relocate_internal_links(source, destination)?;
+    copying.copy(source, destination)
 }
 
 // One operation retains destination ownership through every migration overlay.
@@ -385,6 +388,9 @@ pub(crate) struct OpenClawDirectoryCopy<'a> {
 struct InternalLinkRoots {
     source: PathBuf,
     destination: PathBuf,
+    // Resolved state root, which protected history is measured from. It is
+    // the copied root for migration and inside it for clone.
+    state: PathBuf,
 }
 
 impl InternalLinkRoots {
@@ -470,6 +476,9 @@ impl<'a> OpenClawDirectoryCopy<'a> {
         self.internal_links = Some(InternalLinkRoots {
             source: fs::canonicalize(source_root).map_err(|error| error.to_string())?,
             destination: destination_root.to_path_buf(),
+            // A missing state root holds no history to exempt.
+            state: fs::canonicalize(self.selection.state_root())
+                .unwrap_or_else(|_| self.selection.state_root().to_path_buf()),
         });
         Ok(())
     }
@@ -505,7 +514,7 @@ impl<'a> OpenClawDirectoryCopy<'a> {
             .map_err(|error| error.to_string())?
             .join(source_link.file_name().ok_or("copied link has no name")?);
         if link_location
-            .strip_prefix(&roots.source)
+            .strip_prefix(&roots.state)
             .is_ok_and(|relative| self.selection.preserves_history(relative))
         {
             return Ok(None);

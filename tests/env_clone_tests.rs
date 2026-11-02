@@ -744,7 +744,7 @@ fn env_clone_rejects_unowned_plugin_paths_without_changing_source() {
 fn env_clone_rejects_plugin_links_outside_the_copied_state() {
     use std::os::unix::fs::symlink;
     for folded in [false, true] {
-        for case in ["source-link", "dangling", "missing-child"] {
+        for case in ["dangling", "missing-child"] {
             let root = TestDir::new("clone-plugin-link");
             let cwd = root.child("workspace");
             fs::create_dir_all(&cwd).unwrap();
@@ -753,7 +753,6 @@ fn env_clone_rejects_plugin_links_outside_the_copied_state() {
             assert!(create.status.success(), "{}", stderr(&create));
             let source = root.child("ocm-home/envs/source/.openclaw");
             let payload = match case {
-                "source-link" => source.join("extensions/actual"),
                 "dangling" => root.child("outside/absent"),
                 "missing-child" => root.child("outside"),
                 _ => unreachable!(),
@@ -762,8 +761,8 @@ fn env_clone_rejects_plugin_links_outside_the_copied_state() {
                 write_text(&payload.join("index.js"), "source original");
             }
             fs::create_dir_all(source.join("extensions")).unwrap();
-            // Existing absolute in-source links escape after copying; dangling
-            // outside links must not become trusted merely because the leaf is absent.
+            // Dangling outside links must not become trusted merely because
+            // the leaf is absent.
             symlink(&payload, source.join("extensions/link")).unwrap();
             let recorded = if case == "missing-child" {
                 source.join("extensions/link/absent")
@@ -793,6 +792,49 @@ fn env_clone_rejects_plugin_links_outside_the_copied_state() {
             }
             assert!(!root.child("ocm-home/envs/target").exists());
         }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn env_clone_relocates_absolute_plugin_links_into_the_copied_state() {
+    use std::os::unix::fs::symlink;
+    for folded in [false, true] {
+        let root = TestDir::new("clone-absolute-plugin-link");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let env = ocm_env(&root);
+        let create = run_ocm(&cwd, &env, &["env", "create", "source"]);
+        assert!(create.status.success(), "{}", stderr(&create));
+        let source = root.child("ocm-home/envs/source/.openclaw");
+        let target = root.child("ocm-home/envs/target/.openclaw");
+        let payload = source.join("extensions/actual");
+        write_text(&payload.join("index.js"), "source original");
+        symlink(&payload, source.join("extensions/link")).unwrap();
+        let db = source.join("state/openclaw.sqlite");
+        seed_plugin_registry(
+            &db,
+            folded,
+            serde_json::json!({"demo":{"source":"npm","installPath":source.join("extensions/link")}}),
+        );
+        let before = fs::read(&db).unwrap();
+        let clone = run_ocm(&cwd, &env, &["env", "clone", "source", "target"]);
+        assert!(clone.status.success(), "{}", stderr(&clone));
+        assert_eq!(
+            fs::read_link(target.join("extensions/link")).unwrap(),
+            Path::new("actual")
+        );
+        let records = read_plugin_registry(&target.join("state/openclaw.sqlite"), folded);
+        assert_eq!(
+            records["demo"]["installPath"],
+            target.join("extensions/link").to_str().unwrap()
+        );
+        write_text(&target.join("extensions/link/index.js"), "clone update");
+        assert_eq!(
+            fs::read_to_string(payload.join("index.js")).unwrap(),
+            "source original"
+        );
+        assert_eq!(fs::read(&db).unwrap(), before);
     }
 }
 
@@ -974,6 +1016,94 @@ fn env_clone_rejects_database_links_without_writing_source() {
             assert!(!root.child("ocm-home/envs/target").exists());
         }
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn env_clone_relocates_absolute_links_into_the_source_environment() {
+    use std::os::unix::fs::symlink;
+    let root = TestDir::new("clone-absolute-internal-links");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    let create = run_ocm(&cwd, &env, &["env", "create", "source"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let source_root = root.child("ocm-home/envs/source");
+    let state = source_root.join(".openclaw");
+    let workspace = state.join("workspace");
+    let external = root.child("external");
+    write_text(&workspace.join("shared/data.txt"), "original\n");
+    write_text(&state.join("logs/gateway.log"), "source log\n");
+    write_text(&external.join("data.txt"), "external\n");
+    fs::create_dir_all(workspace.join("skills")).unwrap();
+    symlink(workspace.join("shared"), workspace.join("abs-dir")).unwrap();
+    symlink(
+        workspace.join("shared/data.txt"),
+        workspace.join("abs-file"),
+    )
+    .unwrap();
+    symlink(workspace.join("shared"), workspace.join("skills/team")).unwrap();
+    // Cleared or omitted state is not read through the source.
+    symlink(state.join("logs"), workspace.join("logs-link")).unwrap();
+    // A link outside the state directory is mapped from the environment root.
+    symlink(workspace.join("shared"), source_root.join("root-link")).unwrap();
+    symlink("shared", workspace.join("rel-dir")).unwrap();
+    symlink(&external, workspace.join("ext-dir")).unwrap();
+
+    let clone = run_ocm(&cwd, &env, &["env", "clone", "source", "target"]);
+    assert!(clone.status.success(), "{}", stderr(&clone));
+
+    let target_root = root.child("ocm-home/envs/target");
+    let copied = target_root.join(".openclaw/workspace");
+    for (link, expected) in [
+        (copied.join("abs-dir"), "shared"),
+        (copied.join("abs-file"), "shared/data.txt"),
+        (copied.join("skills/team"), "../shared"),
+        (copied.join("logs-link"), "../logs"),
+        (target_root.join("root-link"), ".openclaw/workspace/shared"),
+        (copied.join("rel-dir"), "shared"),
+    ] {
+        assert_eq!(
+            fs::read_link(&link).unwrap(),
+            Path::new(expected),
+            "{}",
+            link.display()
+        );
+    }
+    assert_eq!(fs::read_link(copied.join("ext-dir")).unwrap(), external);
+    assert!(
+        !fs::read_to_string(copied.join("logs-link/gateway.log"))
+            .is_ok_and(|log| log.contains("source log"))
+    );
+
+    let mut writes = fs::OpenOptions::new()
+        .append(true)
+        .open(copied.join("abs-dir/data.txt"))
+        .unwrap();
+    std::io::Write::write_all(&mut writes, b"clone dir\n").unwrap();
+    drop(writes);
+    let mut writes = fs::OpenOptions::new()
+        .append(true)
+        .open(copied.join("abs-file"))
+        .unwrap();
+    std::io::Write::write_all(&mut writes, b"clone file\n").unwrap();
+    drop(writes);
+    assert_eq!(
+        fs::read_to_string(workspace.join("shared/data.txt")).unwrap(),
+        "original\n"
+    );
+    assert_eq!(
+        fs::read_to_string(copied.join("shared/data.txt")).unwrap(),
+        "original\nclone dir\nclone file\n"
+    );
+
+    let remove = run_ocm(&cwd, &env, &["env", "remove", "source", "--force"]);
+    assert!(remove.status.success(), "{}", stderr(&remove));
+    assert!(!source_root.exists());
+    for link in ["abs-dir", "abs-file", "skills/team", "rel-dir"] {
+        assert!(copied.join(link).exists(), "{link}");
+    }
+    assert!(target_root.join("root-link").exists());
 }
 
 #[test]
@@ -2673,8 +2803,13 @@ fn env_clone_copied_git_config_preserves_complete_managed_graph_after_cleanup() 
         if layout.starts_with("worktrees/") {
             #[cfg(unix)]
             {
+                // Copying relocates the absolute link into the clone's store.
                 assert_eq!(
                     fs::read_link(target_repo.join(".git/objects")).unwrap(),
+                    Path::new("../../../object-store")
+                );
+                assert_eq!(
+                    fs::canonicalize(target_repo.join(".git/objects")).unwrap(),
                     target.join(".openclaw/object-store")
                 );
                 assert_eq!(

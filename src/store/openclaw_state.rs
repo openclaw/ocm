@@ -222,6 +222,9 @@ pub(crate) fn openclaw_env_archive_options(
         included_path_roots,
         excluded_path_roots,
         snapshot_sqlite_files: true,
+        // An import must not keep reading or writing the source through
+        // absolute links, as with state-inclusive archives.
+        relocate_internal_symlinks: true,
         ..EnvArchiveOptions::default()
     };
     let git_paths = archived_git_paths_in_import_removed_roots(paths, &options)?;
@@ -3381,6 +3384,10 @@ impl<'a> OpenClawSqliteCopy<'a> {
             }
         }
         Ok(())
+    }
+
+    pub(super) fn state_root(&self) -> &Path {
+        self.state_root
     }
 
     // Takes a path relative to the copied state root.
