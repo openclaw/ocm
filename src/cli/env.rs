@@ -712,10 +712,8 @@ impl Cli {
         if let Err(error) = &summary
             && crate::infra::interrupt::cancellation_settled()
         {
-            // Keep a failure that came before the signal visible.
-            if !error.contains(&crate::infra::interrupt::cancelled_error().to_string()) {
-                self.stderr_line(format!("ocm: {error}"));
-            }
+            // The error itself may be a failure that came before the signal.
+            self.stderr_line(format!("ocm: {error}"));
             self.stderr_line(format!("ocm: env export {name} interrupted by a signal"));
             return Ok(130);
         }
