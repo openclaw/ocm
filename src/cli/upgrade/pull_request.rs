@@ -5,6 +5,7 @@ use std::process::{Command, Stdio};
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
+use super::{UPGRADE_SIMULATION_INTERRUPTED_ERROR, UpgradeInterruptFence};
 use crate::openclaw_repo::{detect_openclaw_checkout, git_command};
 
 #[derive(Clone, Debug, Serialize)]
@@ -30,15 +31,30 @@ struct PullRequestMetadata {
 }
 
 impl PreparedPullRequest {
+    /// Resolve a GitHub PR target into a pinned staging checkout. The run's
+    /// interrupt fence is entered into `interrupt_fence` before anything is
+    /// staged, so a signal stops resolution at the next gh or Git step and the
+    /// checkout is removed on return instead of being left in the temp dir.
     pub fn resolve(
         input: &str,
         env: &BTreeMap<String, String>,
         cwd: &Path,
+        interrupt_fence: &mut Option<UpgradeInterruptFence>,
     ) -> Result<Option<Self>, String> {
         let Some((repository, number)) = parse_reference(input)? else {
             return Ok(None);
         };
-        let head_sha = query_head(&repository, number, env, cwd)?;
+        let fence = &*interrupt_fence.insert(UpgradeInterruptFence::enter()?);
+        // A Ctrl-C that reached gh or Git also fails that command; report the
+        // interruption rather than the command's failure.
+        let step = |result: Result<String, String>| {
+            if fence.requested() {
+                Err(UPGRADE_SIMULATION_INTERRUPTED_ERROR.to_string())
+            } else {
+                result
+            }
+        };
+        let head_sha = step(query_head(&repository, number, env, cwd))?;
         let identity = PullRequestIdentity {
             url: format!("https://github.com/{repository}/pull/{number}"),
             repository,
@@ -50,15 +66,17 @@ impl PreparedPullRequest {
             .tempdir()
             .map_err(|error| format!("failed to prepare GitHub PR checkout: {error}"))?;
         let root = checkout.path();
-        checked_git(git_command().arg("-C").arg(root).args(["init", "--quiet"]))?;
+        step(checked_git(
+            git_command().arg("-C").arg(root).args(["init", "--quiet"]),
+        ))?;
         let remote = format!("https://github.com/{}.git", identity.repository);
-        checked_git(
+        step(checked_git(
             git_command()
                 .arg("-C")
                 .arg(root)
                 .args(["remote", "add", "origin", &remote]),
-        )?;
-        checked_git(
+        ))?;
+        step(checked_git(
             git_command()
                 .args(["-c", "gc.auto=0", "-c", "maintenance.auto=false", "-C"])
                 .arg(root)
@@ -70,28 +88,29 @@ impl PreparedPullRequest {
                     "origin",
                 ])
                 .arg(format!("refs/pull/{}/head", identity.number)),
-        )?;
-        let fetched = checked_git(
+        ))?;
+        let fetched = step(checked_git(
             git_command()
                 .arg("-C")
                 .arg(root)
                 .args(["rev-parse", "FETCH_HEAD"]),
-        )?;
+        ))?;
         if fetched.trim() != identity.head_sha
-            || query_head(&identity.repository, identity.number, env, cwd)? != identity.head_sha
+            || step(query_head(&identity.repository, identity.number, env, cwd))?
+                != identity.head_sha
         {
             return Err(format!(
                 "GitHub PR {}#{} changed while resolving; rerun the simulation to select its current head",
                 identity.repository, identity.number
             ));
         }
-        checked_git(
+        step(checked_git(
             git_command()
                 .arg("-C")
                 .arg(root)
                 .args(["checkout", "--quiet", "--detach", "--no-recurse-submodules"])
                 .arg(&identity.head_sha),
-        )?;
+        ))?;
         if detect_openclaw_checkout(root).is_none() {
             return Err("GitHub PR target is not an OpenClaw checkout".to_string());
         }

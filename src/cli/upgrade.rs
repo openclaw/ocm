@@ -1981,13 +1981,19 @@ impl Cli {
         Self::assert_no_extra_args(&args[1..])?;
         self.environment_service().get(source_name)?;
 
-        let target = self.resolve_simulation_target(&to)?;
+        // A GitHub PR target enters the fence before its checkout is staged, so
+        // a signal during resolution stops the run and removes the checkout.
+        let mut interrupt_fence = None;
+        let target = self.resolve_simulation_target(&to, &mut interrupt_fence)?;
         self.validate_simulation_target(&target)?;
         let mut staged_runtime = self.prepare_shared_simulation_runtime(source_name, &target)?;
         // Downloads and staging stay interruptible. From registering the target
         // runtime until cleanup, SIGINT and SIGTERM stop the run at the next
         // check instead of ending OCM.
-        let interrupt_fence = UpgradeInterruptFence::enter()?;
+        let interrupt_fence = match interrupt_fence {
+            Some(fence) => fence,
+            None => UpgradeInterruptFence::enter()?,
+        };
         let mut prepared_runtime = None;
         let mut summaries = Vec::with_capacity(scenarios.len());
         for scenario in scenarios {
@@ -2208,7 +2214,11 @@ impl Cli {
         self.run_simulation_check(simulation, "openclaw update plan", &refs)
     }
 
-    fn resolve_simulation_target(&self, to: &str) -> Result<UpgradeSimulationTarget, String> {
+    fn resolve_simulation_target(
+        &self,
+        to: &str,
+        interrupt_fence: &mut Option<UpgradeInterruptFence>,
+    ) -> Result<UpgradeSimulationTarget, String> {
         let path = resolve_absolute_path(to, &self.env, &self.cwd)?;
         if let Some(repo_root) = detect_openclaw_checkout(&path) {
             return Ok(UpgradeSimulationTarget::LocalRepo {
@@ -2216,7 +2226,9 @@ impl Cli {
                 repo_root,
             });
         }
-        if let Some(target) = PreparedPullRequest::resolve(to, &self.env, &self.cwd)? {
+        if let Some(target) =
+            PreparedPullRequest::resolve(to, &self.env, &self.cwd, interrupt_fence)?
+        {
             return Ok(UpgradeSimulationTarget::PullRequest(target));
         }
 

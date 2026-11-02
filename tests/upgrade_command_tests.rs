@@ -4730,6 +4730,127 @@ fn upgrade_simulate_refuses_changed_or_unavailable_pull_requests_before_cloning(
     }
 }
 
+#[test]
+#[cfg(unix)]
+fn interrupted_pull_request_resolution_removes_its_checkout() {
+    use std::os::unix::process::CommandExt;
+
+    struct SimulationChild(std::process::Child);
+    impl Drop for SimulationChild {
+        fn drop(&mut self) {
+            if matches!(self.0.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            unsafe { libc::kill(-(self.0.id() as i32), libc::SIGKILL) };
+            let _ = self.0.wait();
+        }
+    }
+
+    let real_git = Command::new("/bin/sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .unwrap();
+    assert!(real_git.status.success());
+    let real_git = stdout(&real_git).trim().to_string();
+    // A terminal delivers Ctrl-C or a hangup to the whole foreground group,
+    // including the running fetch; `kill` or a service manager may signal
+    // only OCM, whose fetch then finishes before the run stops.
+    for (signal, signal_process_group) in [
+        (libc::SIGINT, true),
+        (libc::SIGTERM, false),
+        (libc::SIGHUP, false),
+    ] {
+        let root = TestDir::new("upgrade-simulate-pr-interrupted");
+        let repo = init_openclaw_repo(&root);
+        let head = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(head.status.success());
+        let head = stdout(&head).trim().to_string();
+        let mut env = simulation_pull_request_fixture(&root, &repo, &head);
+        let temp = root.child("tmp");
+        fs::create_dir_all(&temp).unwrap();
+        env.insert("TMPDIR".into(), path_string(&temp));
+        let created = run_ocm(root.path(), &env, &["env", "create", "demo"]);
+        assert!(created.status.success(), "{}", stderr(&created));
+
+        let started = root.child("fetch.started");
+        let release = root.child("fetch.release");
+        write_executable_script(
+            &root.child("fake-sim-bin/git"),
+            &format!(
+                "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = fetch ]; then\n    : > '{}'\n    while [ ! -e '{}' ]; do sleep 0.01; done\n    break\n  fi\ndone\nexec '{}' \"$@\"\n",
+                path_string(&started),
+                path_string(&release),
+                real_git
+            ),
+        );
+        let output_path = root.child("simulation.out");
+        let error_path = root.child("simulation.err");
+        let mut simulation = SimulationChild(
+            Command::new(support::ocm_test_binary_path())
+                .args([
+                    "upgrade",
+                    "simulate",
+                    "demo",
+                    "--to",
+                    "example/openclaw#123",
+                    "--json",
+                ])
+                .current_dir(root.path())
+                .env_clear()
+                .envs(&env)
+                .stdin(Stdio::null())
+                .stdout(fs::File::create(&output_path).unwrap())
+                .stderr(fs::File::create(&error_path).unwrap())
+                .process_group(0)
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !started.exists() {
+            assert!(
+                simulation.0.try_wait().unwrap().is_none() && Instant::now() < deadline,
+                "simulation did not reach the PR fetch: {:?}; {:?}",
+                fs::read_to_string(&output_path),
+                fs::read_to_string(&error_path)
+            );
+            sleep(Duration::from_millis(25));
+        }
+        let staged = || {
+            fs::read_dir(&temp)
+                .unwrap()
+                .filter_map(|entry| entry.unwrap().file_name().into_string().ok())
+                .filter(|name| name.starts_with("ocm-pr-"))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(staged().len(), 1, "the PR checkout is staged before fetch");
+
+        let target = if signal_process_group {
+            -(simulation.0.id() as i32)
+        } else {
+            simulation.0.id() as i32
+        };
+        assert_eq!(unsafe { libc::kill(target, signal) }, 0);
+        fs::write(&release, "").unwrap();
+        let status = simulation.0.wait().unwrap();
+        let errors = fs::read_to_string(&error_path).unwrap();
+        assert_eq!(status.code(), Some(1), "signal {signal}: {errors}");
+        assert!(
+            errors.contains("upgrade simulation interrupted"),
+            "signal {signal}: {errors}"
+        );
+        assert!(staged().is_empty(), "signal {signal}: {:?}", staged());
+        let envs = run_ocm(root.path(), &env, &["env", "list", "--json"]);
+        let envs: Value = serde_json::from_str(&stdout(&envs)).unwrap();
+        assert_eq!(envs.as_array().unwrap().len(), 1, "{envs:#?}");
+        assert_eq!(envs[0]["name"], "demo");
+    }
+}
+
 #[cfg(unix)]
 fn simulation_pull_request_fixture(
     root: &TestDir,
