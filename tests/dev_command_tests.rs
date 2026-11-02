@@ -10255,3 +10255,89 @@ fn case_distinct_environments_run_independent_active_dev_sessions() {
     );
     assert_eq!(source_watch_session_owner(&shared), ("alpha".into(), true));
 }
+
+#[test]
+fn dev_reaches_envs_named_like_its_commands_after_a_separator() {
+    let root = TestDir::new("dev-command-word-names");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    let launcher = run_ocm(
+        &cwd,
+        &env,
+        &["launcher", "add", "stable", "--command", "openclaw"],
+    );
+    assert!(launcher.status.success(), "{}", stderr(&launcher));
+    for name in ["mira", "status", "stop", "help"] {
+        let create = run_ocm(&cwd, &env, &["env", "create", name, "--launcher", "stable"]);
+        assert!(create.status.success(), "{name}: {}", stderr(&create));
+    }
+    let missing = path_string(&root.child("missing-checkout"));
+    let missing = missing.as_str();
+    let not_a_dev_env = |name: &str| {
+        format!("environment \"{name}\" is not a dev env; use a new env name for `ocm dev`")
+    };
+
+    // `--` before the name reaches the env through `dev <env>`, like an
+    // ordinary name without it.
+    for args in [
+        vec!["dev", "mira", "--repo", missing],
+        vec!["dev", "--", "mira", "--repo", missing],
+        vec!["dev", "--", "status", "--repo", missing],
+        vec!["dev", "--", "stop", "--repo", missing],
+        vec!["dev", "--", "help", "--repo", missing],
+        vec!["dev", "--repo", missing, "--", "status"],
+    ] {
+        let name = *args
+            .iter()
+            .find(|arg| ["mira", "status", "stop", "help"].contains(arg))
+            .unwrap();
+        let output = run_ocm(&cwd, &env, &args);
+        assert!(!output.status.success(), "{args:?}");
+        assert!(
+            stderr(&output).contains(&not_a_dev_env(name)),
+            "{args:?}: {}",
+            stderr(&output)
+        );
+    }
+
+    // Without `--`, the words keep their command meaning and a failure names
+    // the env that was not addressed.
+    for (args, word) in [
+        (vec!["dev", "status", "--repo", missing], "status"),
+        (vec!["dev", "stop", "--repo", missing], "stop"),
+        (vec!["dev", "stop"], "stop"),
+        (vec!["dev", "help", "--repo", missing], "help"),
+    ] {
+        let output = run_ocm(&cwd, &env, &args);
+        assert!(!output.status.success(), "{args:?}");
+        assert!(
+            stderr(&output).contains(&format!(
+                "\"{word}\" was read as `ocm dev {word}`, not as the env named \"{word}\"; to address that env, put -- before its name: `ocm dev -- {word}`"
+            )),
+            "{args:?}: {}",
+            stderr(&output)
+        );
+    }
+    let listed = run_ocm(&cwd, &env, &["dev", "status", "--json"]);
+    assert!(listed.status.success(), "{}", stderr(&listed));
+    assert_eq!(
+        serde_json::from_str::<Value>(&stdout(&listed)).unwrap(),
+        serde_json::json!([])
+    );
+    let help = run_ocm(&cwd, &env, &["dev", "help"]);
+    assert!(help.status.success(), "{}", stderr(&help));
+    assert!(stdout(&help).starts_with("Development envs"));
+    let named = run_ocm(&cwd, &env, &["dev", "status", "stop"]);
+    assert!(!named.status.success());
+    assert!(
+        stderr(&named).contains("environment \"stop\" is not a dev env"),
+        "{}",
+        stderr(&named)
+    );
+    assert!(
+        !stderr(&named).contains("was read as"),
+        "{}",
+        stderr(&named)
+    );
+}

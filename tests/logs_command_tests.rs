@@ -1641,3 +1641,55 @@ fn logs_follow_header_reports_a_pending_source_before_any_log_exists() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+#[test]
+fn logs_reaches_an_env_named_help_after_a_separator() {
+    let root = TestDir::new("logs-help-name");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    let launcher = run_ocm(
+        &cwd,
+        &env,
+        &["launcher", "add", "stable", "--command", "openclaw"],
+    );
+    assert!(launcher.status.success(), "{}", stderr(&launcher));
+    let unregistered = run_ocm(&cwd, &env, &["logs", "help", "--tail", "5"]);
+    assert!(!unregistered.status.success());
+    assert!(
+        !stderr(&unregistered).contains("was read as"),
+        "{}",
+        stderr(&unregistered)
+    );
+    let create = run_ocm(
+        &cwd,
+        &env,
+        &["env", "create", "help", "--launcher", "stable"],
+    );
+    assert!(create.status.success(), "{}", stderr(&create));
+    let log = root.child("ocm-home/envs/help/.openclaw/logs/gateway.log");
+    fs::create_dir_all(log.parent().unwrap()).unwrap();
+    fs::write(&log, "hello from the help env\n").unwrap();
+
+    for args in [
+        vec!["logs", "--", "help", "--raw"],
+        vec!["logs", "--raw", "--tail", "5", "--", "help"],
+    ] {
+        let output = run_ocm(&cwd, &env, &args);
+        assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+        assert_eq!(stdout(&output), "hello from the help env\n", "{args:?}");
+    }
+
+    let help = run_ocm(&cwd, &env, &["logs", "help"]);
+    assert!(help.status.success(), "{}", stderr(&help));
+    assert!(stdout(&help).starts_with("Read env logs"));
+    let bare = run_ocm(&cwd, &env, &["logs", "help", "--tail", "5"]);
+    assert!(!bare.status.success());
+    assert!(
+        stderr(&bare).contains(
+            "\"help\" was read as `ocm logs help`, not as the env named \"help\"; to address that env, put -- before its name: `ocm logs -- help`"
+        ),
+        "{}",
+        stderr(&bare)
+    );
+}

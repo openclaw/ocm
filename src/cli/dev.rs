@@ -274,8 +274,18 @@ impl Cli {
     pub(super) fn handle_dev_command(&self, args: Vec<String>) -> Result<i32, String> {
         match args.first().map(String::as_str).unwrap_or("") {
             "" | "help" | "--help" | "-h" => self.dispatch_help_command(vec!["dev".to_string()]),
-            "status" => self.handle_dev_status(args[1..].to_vec()),
-            "stop" => self.handle_dev_stop(args[1..].to_vec()),
+            "status" => self.explain_env_name_collision(
+                self.handle_dev_status(args[1..].to_vec()),
+                "dev",
+                "status",
+                &args[1..],
+            ),
+            "stop" => self.explain_env_name_collision(
+                self.handle_dev_stop(args[1..].to_vec()),
+                "dev",
+                "stop",
+                &args[1..],
+            ),
             "rebind" if args.get(1).is_some_and(|arg| !arg.starts_with('-')) => {
                 self.handle_dev_rebind(args[1..].to_vec())
             }
@@ -672,6 +682,7 @@ impl Cli {
             Some(raw) => Some(Self::parse_gateway_port(raw)?),
             None => None,
         };
+        let args = Self::consume_env_name_separator(args);
         let Some(name) = args.first() else {
             return Err("environment name is required".to_string());
         };

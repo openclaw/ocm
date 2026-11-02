@@ -2228,6 +2228,29 @@ ocm env status mira --raw
 ocm --color always runtime list
 ```
 
+## Environment names that match command words
+
+Environment names such as `history`, `status` and `help` are valid. A few
+commands take `<env>` in the same position as their own subcommands or `help`,
+and there the bare word keeps its command meaning:
+
+- `ocm upgrade`: `history`, `rollback`, `simulate`, `batch`, `job`, `help`
+- `ocm dev`: `status`, `stop`, `help`
+- `ocm logs`: `help`
+
+Put `--` before the name to address such an environment:
+
+```bash
+ocm upgrade -- history --dry-run
+ocm upgrade --dry-run -- history
+ocm dev -- status --repo ./openclaw
+ocm logs -- help --tail 20
+```
+
+When an invocation such as `ocm upgrade history --dry-run` fails while an
+environment with that name exists, the error says that the word was read as
+the command and shows the `--` form.
+
 ## Command map
 
 ### Top-level commands
