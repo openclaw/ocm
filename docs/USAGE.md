@@ -1261,15 +1261,19 @@ root instead. Every setting OpenClaw expands `~` in that names a location outsid
 `~/.openclaw`, such as a local plugin in `plugins.load.paths`, a
 `skills.load.extraDirs` entry, an agent directory or a session or cron store, is
 therefore rewritten in `openclaw.json` and its copied includes to the absolute
-path it named in the source home. These are the keys ending in `dir`, `path`,
-`paths`, `file`, `root` or `workspace`, the entries of `paths` and `pathPrepend`
-lists, `skills.load.extraDirs` and `skills.load.allowSymlinkTargets`, and
-`session.store` and `cron.store`, expanded with the same whitespace handling
-and lexical `.` and `..` resolution as OpenClaw. Other strings, such as message
+path it named in the source home. These are the settings OpenClaw's runtime
+config treats as paths (keys ending in `dir`, `path`, `paths`, `file`, `root` or
+`workspace`, the keys `paths` and `pathPrepend`, and the entries of `paths` and
+`pathPrepend` lists) and the settings whose own OpenClaw consumers expand `~`,
+including `skills.load.extraDirs`, `hooks.internal.load.extraDirs`, agent `cwd`,
+`memory.search.extraPaths`, `nodeHost.workerRuns.folders` and `session.store`
+and `cron.store`. Each is expanded with the same whitespace handling and lexical
+`.` and `..` resolution as its OpenClaw consumer. Other strings, such as message
 text, stay as written. The source home is your home directory when the migrated
 directory is your own `~/.openclaw`, through any path that leads to it;
-otherwise it is the directory that contains the migrated `.openclaw`, or your
-home directory for a state directory with another name. Values under
+otherwise it is the directory that contains the migrated `.openclaw` as you
+spelled it, or as it is stored when only that path is named `.openclaw`, or
+your home directory for a state directory with another name. Values under
 `~/.openclaw` already name the environment's copied state and stay as written.
 Clone and archive import keep `~/...` values unchanged, because their source
 already expands `~` against an environment root.

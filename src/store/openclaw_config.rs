@@ -251,7 +251,9 @@ fn expand_migrated_home_relative_paths(
             continue;
         };
         let mut rewritten = None;
-        for mut scope in scopes {
+        for scope in scopes {
+            // Include scopes name object keys; an include is never a list entry.
+            let mut scope = scope.into_iter().map(ConfigSegment::Key).collect();
             let mut candidate = value.clone();
             expand_home_relative_paths_in_scope(&mut candidate, &mut scope, source_home);
             if rewritten
@@ -272,11 +274,18 @@ fn expand_migrated_home_relative_paths(
     Ok(())
 }
 
+/// One step from the config root to a value: an object key or a list entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ConfigSegment {
+    Key(String),
+    Entry,
+}
+
 /// Expands the home-relative path settings in a config fragment included at
 /// `scope`. `$include` directives keep their own relocation.
 fn expand_home_relative_paths_in_scope(
     value: &mut Value,
-    scope: &mut Vec<String>,
+    scope: &mut Vec<ConfigSegment>,
     home: &Path,
 ) -> bool {
     match value {
@@ -292,8 +301,8 @@ fn expand_home_relative_paths_in_scope(
         }
         Value::Array(values) => {
             let mut changed = false;
-            for (index, nested) in values.iter_mut().enumerate() {
-                scope.push(index.to_string());
+            for nested in values {
+                scope.push(ConfigSegment::Entry);
                 changed |= expand_home_relative_paths_in_scope(nested, scope, home);
                 scope.pop();
             }
@@ -302,7 +311,7 @@ fn expand_home_relative_paths_in_scope(
         Value::Object(values) => {
             let mut changed = false;
             for (key, nested) in values.iter_mut().filter(|(key, _)| *key != "$include") {
-                scope.push(key.clone());
+                scope.push(ConfigSegment::Key(key.clone()));
                 changed |= expand_home_relative_paths_in_scope(nested, scope, home);
                 scope.pop();
             }
@@ -312,36 +321,151 @@ fn expand_home_relative_paths_in_scope(
     }
 }
 
+/// Settings whose own OpenClaw consumers expand `~` against `OPENCLAW_HOME`
+/// although OpenClaw's runtime config rule does not, with whether the
+/// consumer trims the value first. `*` stands for any one object key and `[]`
+/// for a list entry. Derived from the consumers at OpenClaw a7fe06b17a9;
+/// settings expanded against the OS home (`messages.usageTemplate`, Feishu
+/// dynamic agent templates) keep their meaning, because `HOME` is unchanged
+/// in the environment.
+const CONSUMER_HOME_PATH_SETTINGS: &[(&[&str], bool)] = &[
+    // src/skills/loading/workspace-skill-sources.ts, symlink-targets.ts
+    (&["skills", "load", "extraDirs", "[]"], true),
+    (&["skills", "load", "allowSymlinkTargets", "[]"], true),
+    // src/hooks/workspace.ts
+    (&["hooks", "internal", "load", "extraDirs", "[]"], true),
+    // src/config/sessions/paths.ts expands `~` without trimming first.
+    (&["session", "store"], false),
+    // src/cron/store/paths.ts
+    (&["cron", "store"], true),
+    // src/agents/agent-scope-config.ts
+    (&["agents", "defaults", "cwd"], true),
+    (&["agents", "entries", "*", "cwd"], true),
+    (&["agents", "list", "[]", "cwd"], true),
+    // packages/memory-host-sdk/src/host/internal.ts (string entries)
+    (&["memory", "search", "extraPaths", "[]"], true),
+    (
+        &[
+            "agents",
+            "entries",
+            "*",
+            "memory",
+            "search",
+            "extraPaths",
+            "[]",
+        ],
+        true,
+    ),
+    (
+        &[
+            "agents",
+            "list",
+            "[]",
+            "memory",
+            "search",
+            "extraPaths",
+            "[]",
+        ],
+        true,
+    ),
+    // src/node-host/node-worker-device-folder.ts
+    (&["nodeHost", "workerRuns", "folders", "[]"], false),
+    // src/security/install-policy.ts
+    (
+        &["security", "installPolicy", "exec", "trustedDirs", "[]"],
+        true,
+    ),
+    // extensions/voice-call/src/store-path.ts
+    (
+        &["plugins", "entries", "voice-call", "config", "store"],
+        true,
+    ),
+    // extensions/file-transfer/src/shared/policy.ts
+    (
+        &[
+            "plugins",
+            "entries",
+            "file-transfer",
+            "config",
+            "nodes",
+            "*",
+            "denyPaths",
+            "[]",
+        ],
+        true,
+    ),
+    (
+        &[
+            "plugins",
+            "entries",
+            "file-transfer",
+            "config",
+            "nodes",
+            "*",
+            "allowReadPaths",
+            "[]",
+        ],
+        true,
+    ),
+    (
+        &[
+            "plugins",
+            "entries",
+            "file-transfer",
+            "config",
+            "nodes",
+            "*",
+            "allowWritePaths",
+            "[]",
+        ],
+        true,
+    ),
+];
+
 /// Whether OpenClaw expands a leading `~` in the string setting at `scope`,
-/// and whether it trims the value first. OpenClaw's runtime config expands
-/// keys ending in `dir`, `path`, `paths`, `file`, `root` or `workspace`, and
-/// the direct entries of `paths` and `pathPrepend` lists; a few settings
-/// expand `~` in their own consumers. Other strings, such as message text,
-/// stay as written.
-fn home_relative_path_setting(scope: &[String]) -> Option<bool> {
+/// and whether it trims the value first. OpenClaw's runtime config
+/// (`materializeRuntimeConfig` in `src/config/materialize.ts`) expands keys
+/// ending in `dir`, `path`, `paths`, `file`, `root` or `workspace`, the keys
+/// `paths` and `pathPrepend`, and the direct entries of `paths` and
+/// `pathPrepend` lists; [`CONSUMER_HOME_PATH_SETTINGS`] lists the settings
+/// that are expanded by their own consumers. Other strings, such as message
+/// text, stay as written.
+fn home_relative_path_setting(scope: &[ConfigSegment]) -> Option<bool> {
+    if let Some((_, trims)) = CONSUMER_HOME_PATH_SETTINGS
+        .iter()
+        .find(|(pattern, _)| config_scope_matches(scope, pattern))
+    {
+        return Some(*trims);
+    }
     const PATH_LISTS: [&str; 2] = ["paths", "pathPrepend"];
     const PATH_KEY_SUFFIXES: [&str; 6] = ["dir", "path", "paths", "file", "root", "workspace"];
-    let is_index =
-        |segment: &str| !segment.is_empty() && segment.bytes().all(|b| b.is_ascii_digit());
     match scope {
-        [.., list, index] if is_index(index) => (PATH_LISTS.contains(&list.as_str())
-            || matches!(scope, [skills, load, list, _]
-                if skills == "skills"
-                    && load == "load"
-                    && (list == "extraDirs" || list == "allowSymlinkTargets")))
-        .then_some(true),
-        // The session store resolver expands `~` without trimming first.
-        [session, store] if session == "session" && store == "store" => Some(false),
-        [cron, store] if cron == "cron" && store == "store" => Some(true),
-        [.., key] => {
-            let key = key.to_ascii_lowercase();
-            PATH_KEY_SUFFIXES
-                .iter()
-                .any(|suffix| key.ends_with(suffix))
-                .then_some(true)
+        [.., ConfigSegment::Key(list), ConfigSegment::Entry] => {
+            PATH_LISTS.contains(&list.as_str()).then_some(true)
         }
-        [] => None,
+        [.., ConfigSegment::Key(key)] => {
+            let lower = key.to_ascii_lowercase();
+            (PATH_LISTS.contains(&key.as_str())
+                || PATH_KEY_SUFFIXES
+                    .iter()
+                    .any(|suffix| lower.ends_with(suffix)))
+            .then_some(true)
+        }
+        _ => None,
     }
+}
+
+fn config_scope_matches(scope: &[ConfigSegment], pattern: &[&str]) -> bool {
+    scope.len() == pattern.len()
+        && scope
+            .iter()
+            .zip(pattern)
+            .all(|(segment, expected)| match (segment, *expected) {
+                (ConfigSegment::Entry, "[]") => true,
+                (ConfigSegment::Key(_), "*") => true,
+                (ConfigSegment::Key(key), expected) => key == expected,
+                _ => false,
+            })
 }
 
 fn expand_home_relative_path(raw: &str, home: &Path, trims: bool) -> Option<String> {
@@ -2866,14 +2990,40 @@ mod tests {
     #[test]
     fn migration_home_expansion_selects_the_settings_openclaw_expands() {
         let setting = |scope: &[&str]| {
-            home_relative_path_setting(&scope.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+            let scope = scope
+                .iter()
+                .map(|segment| match *segment {
+                    "[]" => ConfigSegment::Entry,
+                    key => ConfigSegment::Key(key.to_string()),
+                })
+                .collect::<Vec<_>>();
+            home_relative_path_setting(&scope)
         };
         for path in [
-            &["plugins", "load", "paths", "0"][..],
-            &["tools", "exec", "pathPrepend", "1"],
-            &["skills", "load", "extraDirs", "0"],
-            &["skills", "load", "allowSymlinkTargets", "2"],
-            &["agents", "list", "0", "agentDir"],
+            &["plugins", "load", "paths", "[]"][..],
+            &["plugins", "load", "paths"],
+            &["tools", "exec", "pathPrepend", "[]"],
+            &["plugins", "entries", "demo", "config", "pathPrepend"],
+            &["skills", "load", "extraDirs", "[]"],
+            &["skills", "load", "allowSymlinkTargets", "[]"],
+            &["hooks", "internal", "load", "extraDirs", "[]"],
+            &["agents", "list", "[]", "agentDir"],
+            &["agents", "defaults", "cwd"],
+            &["agents", "entries", "main", "cwd"],
+            &["agents", "list", "[]", "cwd"],
+            &["memory", "search", "extraPaths", "[]"],
+            &["security", "installPolicy", "exec", "trustedDirs", "[]"],
+            &["plugins", "entries", "voice-call", "config", "store"],
+            &[
+                "plugins",
+                "entries",
+                "file-transfer",
+                "config",
+                "nodes",
+                "n1",
+                "allowReadPaths",
+                "[]",
+            ],
             &["gateway", "tls", "caPath"],
             &["logging", "file"],
             &["plugins", "entries", "demo", "config", "rootDir"],
@@ -2883,11 +3033,19 @@ mod tests {
             assert_eq!(setting(path), Some(true), "{path:?}");
         }
         assert_eq!(setting(&["session", "store"]), Some(false));
+        assert_eq!(
+            setting(&["nodeHost", "workerRuns", "folders", "[]"]),
+            Some(false)
+        );
         for text in [
             &["messages", "responsePrefix"][..],
-            &["agents", "list", "0", "identity", "name"],
-            &["plugins", "entries", "demo", "config", "dirs", "0"],
+            &["messages", "usageTemplate"],
+            &["agents", "list", "[]", "identity", "name"],
+            &["plugins", "entries", "demo", "config", "dirs", "[]"],
+            // A digit-only key is an object key, not a list entry.
+            &["plugins", "entries", "demo", "config", "paths", "0"],
             &["memory", "store"],
+            &["agents", "defaults", "cwd", "[]"],
             &[],
         ] {
             assert_eq!(setting(text), None, "{text:?}");

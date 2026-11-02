@@ -5062,7 +5062,11 @@ fn migrate_and_adopt_keep_home_relative_paths_outside_the_state_dir_pointing_at_
         let home_path = home.to_str().unwrap();
         let config = serde_json::json!({
             "gateway": {"port": 18789},
-            "agents": {"list": [{"id": "main", "agentDir": "~/ext-agent/agent"}]},
+            "agents": {
+                "list": [{"id": "main", "agentDir": "~/ext-agent/agent", "cwd": "~/dev/repo"}]
+            },
+            "hooks": {"internal": {"load": {"extraDirs": ["~/hooks"]}}},
+            "nodeHost": {"workerRuns": {"folders": ["~/work"]}},
             "session": {"store": "~/ext-state/{agentId}/sessions.json"},
             "cron": {"store": "~/ext-state/cron.json"},
             "logging": {"file": "~/logs/openclaw.log"},
@@ -5135,6 +5139,18 @@ fn migrate_and_adopt_keep_home_relative_paths_outside_the_state_dir_pointing_at_
             format!("{home_path}/ext-state/cron.json")
         );
         assert_eq!(copied["messages"]["responsePrefix"], "~/ready");
+        assert_eq!(
+            copied["agents"]["list"][0]["cwd"],
+            format!("{home_path}/dev/repo")
+        );
+        assert_eq!(
+            copied["hooks"]["internal"]["load"]["extraDirs"],
+            serde_json::json!([format!("{home_path}/hooks")])
+        );
+        assert_eq!(
+            copied["nodeHost"]["workerRuns"]["folders"],
+            serde_json::json!([format!("{home_path}/work")])
+        );
         assert_eq!(
             copied["logging"]["file"],
             format!("{home_path}/logs/openclaw.log")
@@ -5272,6 +5288,46 @@ fn migrate_and_adopt_expand_home_relative_paths_against_the_physical_home_of_an_
                 .join("dev/my-plugin")
                 .to_str()
                 .unwrap()]),
+            "adopt={adopt}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn migrate_and_adopt_resolve_parent_traversal_from_the_supplied_home_spelling() {
+    for adopt in [false, true] {
+        let root = TestDir::new("migrate-home-relative-spelling");
+        let env = ocm_env(&root);
+        // Bob's home is spelled through a link at a different depth than its
+        // physical directory, so `~/..` names different places.
+        let physical = root.child("srv/bob");
+        let spelled = root.child("aliases/bob");
+        fs::create_dir_all(physical.join(".openclaw")).unwrap();
+        fs::create_dir_all(spelled.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&physical, &spelled).unwrap();
+        let config = serde_json::json!({"skills": {"load": {"extraDirs": ["~/../shared"]}}});
+        support::write_text(
+            &physical.join(".openclaw/openclaw.json"),
+            &config.to_string(),
+        );
+
+        let source = spelled.join(".openclaw");
+        let imported = run_ocm(
+            root.path(),
+            &env,
+            &migrate_or_adopt_args(adopt, "copied", &source),
+        );
+        assert!(imported.status.success(), "{}", stderr(&imported));
+
+        let target = root.child("ocm-home/envs/copied/.openclaw");
+        let copied: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(target.join("openclaw.json")).unwrap())
+                .unwrap();
+        // OpenClaw resolves `..` lexically from the home as it was spelled.
+        assert_eq!(
+            copied["skills"]["load"]["extraDirs"],
+            serde_json::json!([root.child("aliases/shared").to_str().unwrap()]),
             "adopt={adopt}"
         );
     }

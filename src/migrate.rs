@@ -547,9 +547,9 @@ pub(crate) fn with_rollback_error(
 
 /// The home a plain install expands `~` against. The user's own
 /// `~/.openclaw`, through any spelling, expands against the user's home.
-/// Otherwise OpenClaw keeps its state in `<home>/.openclaw`: the physical
-/// directory's parent is that home, or the supplied spelling's parent when only
-/// it has that name. A state directory with any other name was selected
+/// Otherwise OpenClaw keeps its state in `<home>/.openclaw`: the supplied
+/// spelling's parent is that home, or the physical directory's parent when
+/// only it has that name. A state directory with any other name was selected
 /// separately, so `~` still names the user's home.
 fn plain_install_home(source_state_dir: &Path, env: &BTreeMap<String, String>) -> PathBuf {
     let user_home = clean_path(&resolve_user_home(env));
@@ -571,10 +571,10 @@ fn plain_install_home(source_state_dir: &Path, env: &BTreeMap<String, String>) -
             .then(|| state_dir.parent().map(Path::to_path_buf))
             .flatten()
     };
-    canonical
-        .as_deref()
-        .and_then(state_home)
-        .or_else(|| state_home(&clean_path(source_state_dir)))
+    // Prefer the supplied spelling: OpenClaw resolves `~/..` lexically from
+    // the home as it was spelled.
+    state_home(&clean_path(source_state_dir))
+        .or_else(|| canonical.as_deref().and_then(state_home))
         .unwrap_or(user_home)
 }
 
