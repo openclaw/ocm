@@ -130,6 +130,9 @@ fn build_launcher_command_appends_after_recipes_without_a_trailing_comment() {
         "openclaw ${x:-${y}} # x",
         "pnpm openclaw \\\n# x",
         "printf '%s\\n' \"$\\\n(printf \"%s\" \") # x\")\"",
+        "[[ '#' =~ (#) ]] && openclaw",
+        "printf '%s\\n' @(foo|#bar)",
+        "f() { openclaw; } # x",
         "openclaw 'unterminated # x",
         "openclaw \"unterminated # x",
     ];
