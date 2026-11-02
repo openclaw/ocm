@@ -1667,18 +1667,38 @@ fn check_snapshot_residue_preserves_source(root_link: bool, borrowed: bool) {
     } else {
         linked.join(".openclaw")
     };
+    // New snapshots refuse a state directory linked outside the root, so
+    // capture before linking it.
+    let state_snapshot =
+        (!root_link).then(|| fixture.run_ok(&["env", "snapshot", "create", "linked", "--json"]));
     fs::remove_dir_all(&link).unwrap();
     symlink(&source, &link).unwrap();
     let residue = if root_link {
         source.join(".openclaw")
     } else {
-        source
+        source.clone()
     };
     write_text(&residue.join("Cargo.lock"), "authored source lock\n");
     write_text(&residue.join("run/keep"), "authored source data\n");
     let child_before = fixture.child_witness();
-    let snapshot = fixture.run_ok(&["env", "snapshot", "create", "linked", "--json"]);
+    let snapshot = state_snapshot
+        .unwrap_or_else(|| fixture.run_ok(&["env", "snapshot", "create", "linked", "--json"]));
     let snapshot: Value = serde_json::from_str(&stdout(&snapshot)).unwrap();
+    if !root_link {
+        // Older checkpoints captured this link itself. Rebuild that artifact
+        // so restore's residue cleanup still meets the captured link.
+        let artifact = ocm::store::get_env_snapshot(
+            "linked",
+            snapshot["id"].as_str().unwrap(),
+            &fixture.env,
+            fixture.root.path(),
+        )
+        .unwrap()
+        .archive_path;
+        let captured_state = PathBuf::from(artifact).join(".openclaw");
+        fs::remove_dir_all(&captured_state).unwrap();
+        symlink(&source, &captured_state).unwrap();
+    }
     fixture.run_ok(&[
         "env",
         "snapshot",
@@ -1722,10 +1742,12 @@ fn legacy_snapshot_restore_preserves_linked_registered_source() {
     let source = fixture.project.join(".worktrees/child");
     let linked = fixture.root.child("ocm-home/envs/linked");
     let state_link = linked.join(".openclaw");
-    fs::remove_dir_all(&state_link).unwrap();
-    symlink(&source, &state_link).unwrap();
+    // New snapshots refuse this link, so record the snapshot first and
+    // replace its artifact with the historical archive shape below.
     let captured = fixture.run_ok(&["env", "snapshot", "create", "linked", "--json"]);
     let captured: Value = serde_json::from_str(&stdout(&captured)).unwrap();
+    fs::remove_dir_all(&state_link).unwrap();
+    symlink(&source, &state_link).unwrap();
     let id = captured["id"].as_str().unwrap();
     let cwd = fixture.root.path();
     let meta = get_environment("linked", &fixture.env, cwd).unwrap();

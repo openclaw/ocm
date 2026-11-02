@@ -38,7 +38,7 @@ use super::openclaw_config::{
 use super::{
     OpenClawWorkspaceRuntime, audit_openclaw_state, clear_nonportable_runtime_state,
     get_environment, list_environments, now_utc, remove_upgrade_recovery_for_snapshot,
-    rewrite_openclaw_config_for_target,
+    rewrite_openclaw_config_for_target, validate_runtime_state_inside_root,
 };
 
 const UPGRADE_CHECKPOINT_KIND: &str = "ocm-env-upgrade-checkpoint-v1";
@@ -349,6 +349,7 @@ fn prepare_snapshot_capture(
             display_path(&env_paths.root)
         ));
     }
+    validate_runtime_state_inside_root(&env_paths)?;
     let upgrade_scope = if upgrade {
         validate_upgrade_independent_paths(&meta, &meta.upgrade_independent_paths, env)?;
         Some(UpgradeCheckpointScope {
@@ -405,6 +406,7 @@ pub(crate) fn create_env_snapshot_from_preparation(
             display_path(&env_paths.root)
         ));
     }
+    validate_runtime_state_inside_root(&env_paths)?;
 
     if let Some(scope) = &prepared.upgrade_scope {
         if scope.independent_paths != meta.upgrade_independent_paths {

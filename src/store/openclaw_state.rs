@@ -18,6 +18,7 @@ use crate::env::EnvMeta;
 use crate::infra::archive::{EnvArchiveEntryKind, EnvArchiveOptions, SymlinkRelocation};
 
 use super::common::path_exists;
+use super::dev_sources::path_identity;
 use super::layout::{EnvPaths, clean_path, derive_env_paths, display_path};
 use super::openclaw_config::{matching_foreign_env_root, normalize_path_allow_missing};
 use super::openclaw_workspaces::{
@@ -560,6 +561,7 @@ fn export_git_selection_error(repository: &Path, error: String) -> String {
 pub(crate) fn openclaw_env_state_archive_options(
     paths: &EnvPaths,
 ) -> Result<EnvArchiveOptions, String> {
+    validate_runtime_state_inside_root(paths)?;
     // This mode archives files without interpreting OpenClaw configuration.
     // Do not follow linked directories while discovering rebuildable debris.
     let excluded_path_roots = if fs::symlink_metadata(&paths.state_dir)
@@ -1443,14 +1445,20 @@ fn rewrite_session_location_fields(
     Ok(output)
 }
 
-pub(crate) fn validate_nonportable_runtime_state_paths(paths: &EnvPaths) -> Result<(), String> {
-    // Check parents before descendants, including dangling links. These are the
-    // directories cleanup opens directly rather than reaching via typed entries.
-    for path in [
+/// State directories that copies and checkpoints treat as OpenClaw's own,
+/// parents before descendants.
+fn runtime_state_directories(paths: &EnvPaths) -> [PathBuf; 3] {
+    [
         paths.state_dir.clone(),
         paths.state_dir.join("agents"),
         paths.state_dir.join("extensions"),
-    ] {
+    ]
+}
+
+pub(crate) fn validate_nonportable_runtime_state_paths(paths: &EnvPaths) -> Result<(), String> {
+    // Check parents before descendants, including dangling links. These are the
+    // directories cleanup opens directly rather than reaching via typed entries.
+    for path in runtime_state_directories(paths) {
         match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.is_dir() => {}
             Ok(_) => {
@@ -1464,6 +1472,104 @@ pub(crate) fn validate_nonportable_runtime_state_paths(paths: &EnvPaths) -> Resu
         }
     }
     Ok(())
+}
+
+/// Checkpoints and state archives keep links inside the root as links, so a
+/// state directory linked outside the root would leave its contents behind.
+/// Links that stay inside the root are accepted; their targets are captured
+/// like any other directory in the root.
+pub(crate) fn validate_runtime_state_inside_root(paths: &EnvPaths) -> Result<(), String> {
+    let root = fs::canonicalize(&paths.root).map_err(|error| error.to_string())?;
+    for path in runtime_state_directories(paths) {
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {}
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.to_string()),
+        }
+        let resolved = resolve_link_destination(&path)?;
+        if !resolves_strictly_inside(&root, &resolved)? {
+            return Err(format!(
+                "cannot safely preserve OpenClaw state through a symlink that resolves outside the environment root: {} (resolved: {}; environment root resolves to: {}); replace the link with a real directory inside the environment root",
+                display_path(&path),
+                display_path(&resolved),
+                display_path(&root)
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Where a link leads, following every link on the way, including dangling
+/// ones, so a chain through a missing target cannot hide its destination.
+fn resolve_link_destination(path: &Path) -> Result<PathBuf, String> {
+    if let Ok(resolved) = fs::canonicalize(path) {
+        return Ok(resolved);
+    }
+    let mut pending: Vec<PathBuf> = path
+        .components()
+        .rev()
+        .map(|component| PathBuf::from(component.as_os_str()))
+        .collect();
+    let mut resolved = PathBuf::new();
+    let mut links = 0;
+    while let Some(next) = pending.pop() {
+        match next.components().next() {
+            Some(Component::CurDir) | None => {}
+            Some(Component::ParentDir) => {
+                resolved.pop();
+            }
+            Some(Component::Normal(name)) => {
+                let candidate = resolved.join(name);
+                match fs::symlink_metadata(&candidate) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        links += 1;
+                        if links > 40 {
+                            return Err(format!(
+                                "too many levels of symbolic links: {}",
+                                display_path(path)
+                            ));
+                        }
+                        let target =
+                            fs::read_link(&candidate).map_err(|error| error.to_string())?;
+                        if target.is_absolute() {
+                            resolved = PathBuf::new();
+                        }
+                        pending.extend(
+                            target
+                                .components()
+                                .rev()
+                                .map(|component| PathBuf::from(component.as_os_str())),
+                        );
+                    }
+                    Ok(_) => resolved = candidate,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        resolved = candidate;
+                    }
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+            Some(_) => resolved.push(&next),
+        }
+    }
+    canonicalize_path_allow_missing(&resolved)
+}
+
+fn resolves_strictly_inside(root: &Path, resolved: &Path) -> Result<bool, String> {
+    if resolved.starts_with(root) {
+        return Ok(resolved != root);
+    }
+    // Another spelling of a directory in the root, such as a macOS firmlink.
+    let root_identity = path_identity(root)?;
+    for (depth, ancestor) in resolved.ancestors().enumerate() {
+        match fs::symlink_metadata(ancestor) {
+            Ok(_) if path_identity(ancestor)? == root_identity => return Ok(depth > 0),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(false)
 }
 
 pub(crate) fn clear_nonportable_runtime_state(
