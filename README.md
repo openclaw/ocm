@@ -573,6 +573,8 @@ New environment roots must be separate: a root cannot equal, contain, or sit
 inside another registered environment root, including through path aliases.
 Creation, cloning, import, and other commands that create an environment reject
 overlap before writing environment state, regardless of protection flags.
+A new root also cannot be `OCM_HOME`, contain it, or overlap the store
+directories OCM keeps there, such as `runtimes` or `snapshots`.
 Default sibling roots and disjoint custom roots remain valid.
 
 These operations also reject roots that overlap registered dev sources,

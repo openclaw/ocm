@@ -91,6 +91,23 @@ pub(crate) fn projected_path_contains(root: &Path, path: &Path) -> Result<bool, 
 }
 
 pub(crate) fn projected_path_relative(root: &Path, path: &Path) -> Result<Option<PathBuf>, String> {
+    projected_relative(root, path, true)
+}
+
+/// Like `projected_path_relative`, but reserves a missing name that may be a
+/// Windows short-name alias instead of refusing every ambiguous pair.
+pub(crate) fn projected_path_relative_reserving_short_names(
+    root: &Path,
+    path: &Path,
+) -> Result<Option<PathBuf>, String> {
+    projected_relative(root, path, false)
+}
+
+fn projected_relative(
+    root: &Path,
+    path: &Path,
+    refuse_short_names: bool,
+) -> Result<Option<PathBuf>, String> {
     fn split(path: &Path) -> Result<(&Path, &Path), String> {
         let mut existing = path;
         loop {
@@ -149,33 +166,78 @@ pub(crate) fn projected_path_relative(root: &Path, path: &Path) -> Result<Option
         let (Some(component), Some(expected)) = (component, expected) else {
             return Err("cannot distinguish differently encoded missing source names; restore the source before retrying".to_string());
         };
-        #[cfg(windows)]
-        let (component, expected) = (
-            component.trim_end_matches(&['.', ' '][..]),
-            expected.trim_end_matches(&['.', ' '][..]),
-        );
-        // Missing names lack filesystem identity. Reserve possible Unicode
-        // aliases without changing comparisons between existing entries.
-        if component.eq_ignore_ascii_case(expected)
-            || ((!component.is_ascii() || !expected.is_ascii())
-                && missing_name_characters(component)
-                    .compatibility_caseless_match(missing_name_characters(expected)))
-        {
+        if missing_names_may_alias(component, expected)? {
             continue;
         }
         #[cfg(windows)]
-        if windows_case_alias(component, expected)? {
+        if refuse_short_names {
+            let (component, expected) = (
+                component.trim_end_matches(&['.', ' '][..]),
+                expected.trim_end_matches(&['.', ' '][..]),
+            );
+            if (possible_short_name(component) || possible_short_name(expected))
+                && !(plain_short_name(component) && plain_short_name(expected))
+            {
+                return Err("cannot distinguish missing Windows short-name aliases; restore the source before retrying".to_string());
+            }
+        } else if missing_names_may_be_short_alias(component, expected) {
             continue;
         }
-        #[cfg(windows)]
-        if (possible_short_name(component) || possible_short_name(expected))
-            && !(plain_short_name(component) && plain_short_name(expected))
-        {
-            return Err("cannot distinguish missing Windows short-name aliases; restore the source before retrying".to_string());
-        }
+        #[cfg(not(windows))]
+        let _ = refuse_short_names;
         return Ok(None);
     }
     Ok(Some(actual.collect()))
+}
+
+/// Whether a missing name could later be a Windows short-name alias of the
+/// other. Generated short names are 8.3-shaped with `~` and keep at least the
+/// first two characters of the long name, or `_` in place of one.
+#[cfg(windows)]
+pub(crate) fn missing_names_may_be_short_alias(component: &str, expected: &str) -> bool {
+    let (component, expected) = (
+        component.trim_end_matches(&['.', ' '][..]),
+        expected.trim_end_matches(&['.', ' '][..]),
+    );
+    [(component, expected), (expected, component)]
+        .into_iter()
+        .any(|(short, long)| {
+            let Some((stem, _)) = short.split_once('~') else {
+                return false;
+            };
+            let mut long_chars = long
+                .chars()
+                .filter(|character| !matches!(character, '.' | ' '));
+            short != long
+                && possible_short_name(short)
+                && stem.chars().take(2).all(|character| {
+                    long_chars.next().is_some_and(|long_character| {
+                        character == '_' || character.eq_ignore_ascii_case(&long_character)
+                    })
+                })
+        })
+}
+
+/// Missing names lack filesystem identity. Reserve possible case and Unicode
+/// aliases without changing comparisons between existing entries.
+pub(crate) fn missing_names_may_alias(component: &str, expected: &str) -> Result<bool, String> {
+    #[cfg(windows)]
+    let (component, expected) = (
+        component.trim_end_matches(&['.', ' '][..]),
+        expected.trim_end_matches(&['.', ' '][..]),
+    );
+    if component.eq_ignore_ascii_case(expected)
+        || ((!component.is_ascii() || !expected.is_ascii())
+            && missing_name_characters(component)
+                .compatibility_caseless_match(missing_name_characters(expected)))
+    {
+        return Ok(true);
+    }
+    #[cfg(windows)]
+    if windows_case_alias(component, expected)? {
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 fn missing_name_characters(name: &str) -> impl Iterator<Item = char> + '_ {
