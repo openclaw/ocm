@@ -191,7 +191,8 @@ fn projected_relative(
 }
 
 /// Whether a missing name could later be a Windows short-name alias of the
-/// other: only an 8.3-shaped name with `~` can be generated for a long name.
+/// other. Generated short names are 8.3-shaped with `~` and keep at least the
+/// first two characters of the long name, or `_` in place of one.
 #[cfg(windows)]
 pub(crate) fn missing_names_may_be_short_alias(component: &str, expected: &str) -> bool {
     let (component, expected) = (
@@ -200,7 +201,21 @@ pub(crate) fn missing_names_may_be_short_alias(component: &str, expected: &str) 
     );
     [(component, expected), (expected, component)]
         .into_iter()
-        .any(|(short, long)| short.contains('~') && possible_short_name(short) && short != long)
+        .any(|(short, long)| {
+            let Some((stem, _)) = short.split_once('~') else {
+                return false;
+            };
+            let mut long_chars = long
+                .chars()
+                .filter(|character| !matches!(character, '.' | ' '));
+            short != long
+                && possible_short_name(short)
+                && stem.chars().take(2).all(|character| {
+                    long_chars.next().is_some_and(|long_character| {
+                        character == '_' || character.eq_ignore_ascii_case(&long_character)
+                    })
+                })
+        })
 }
 
 /// Missing names lack filesystem identity. Reserve possible case and Unicode

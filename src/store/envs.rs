@@ -596,20 +596,34 @@ fn resolve_root_entries(root: &Path) -> Result<(PathBuf, BTreeSet<PathBuf>), Str
     Ok((location, entries))
 }
 
+/// A new root must stay clear of OCM's own store and of every registered
+/// environment root.
+fn ensure_new_root_separate(
+    name: &str,
+    root: &Path,
+    envs: &[EnvMeta],
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<(), String> {
+    let resolved = resolve_root_entries(root)?;
+    ensure_root_outside_store(name, root, &resolved, env, cwd)?;
+    ensure_root_outside_environments(name, root, &resolved, envs)
+}
+
 /// Removing an environment deletes its root, so a new root must not be the
 /// OCM home, contain it, or overlap one of its store entries. Roots inside
 /// `envs` remain valid; the environment check keeps them apart.
 fn ensure_root_outside_store(
     name: &str,
     root: &Path,
+    (target, target_entries): &(PathBuf, BTreeSet<PathBuf>),
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<(), String> {
     let home = resolve_store_paths(env, cwd)?.home;
-    let (target, target_entries) = resolve_root_entries(root)?;
     let (home_location, home_entries) = resolve_root_entries(&home)?;
     for entry in &home_entries {
-        if super::dev_sources::projected_path_contains(&target, entry)? {
+        if super::dev_sources::projected_path_contains(target, entry)? {
             return Err(format!(
                 "environment {name} root {} overlaps the OCM home {}; choose a separate environment root",
                 display_path(root),
@@ -620,9 +634,9 @@ fn ensure_root_outside_store(
     for store in OCM_HOME_ENTRIES {
         let store_path = home.join(store);
         let overlaps = match fs::symlink_metadata(&store_path) {
-            Ok(_) => existing_store_overlaps(store, &store_path, &target, &target_entries)?,
+            Ok(_) => existing_store_overlaps(store, &store_path, target, target_entries)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                missing_store_overlaps(store, &home_location, &target, &target_entries)?
+                missing_store_overlaps(store, &home_location, target, target_entries)?
             }
             Err(error) => {
                 return Err(format!(
@@ -713,20 +727,17 @@ fn missing_store_overlaps(
 fn ensure_root_outside_environments(
     name: &str,
     root: &Path,
+    (target, target_entries): &(PathBuf, BTreeSet<PathBuf>),
     envs: &[EnvMeta],
 ) -> Result<(), String> {
     if envs.is_empty() {
         return Ok(());
     }
-    let (target, target_entries) = resolve_root_entries(root)?;
     for current in envs {
         let (registered, registered_entries) = resolve_root_entries(Path::new(&current.root))?;
         // Compare both the resolved roots and the links that keep them reachable.
         // A disjoint target reached through a link inside another root is unsafe too.
-        for (container, entries) in [
-            (&registered, &target_entries),
-            (&target, &registered_entries),
-        ] {
+        for (container, entries) in [(&registered, target_entries), (target, &registered_entries)] {
             for entry in entries {
                 if super::dev_sources::projected_path_contains(container, entry)? {
                     return Err(format!(
@@ -828,8 +839,7 @@ fn create_environment_with_runtime_validation(
             Path::new(source),
         )?;
     }
-    ensure_root_outside_store(&name, &root, env, cwd)?;
-    ensure_root_outside_environments(&name, &root, &registry.envs)?;
+    ensure_new_root_separate(&name, &root, &registry.envs, env, cwd)?;
     let paths = derive_env_paths(&root);
     if path_exists(&paths.root) {
         let mut entries = fs::read_dir(&paths.root).map_err(|error| error.to_string())?;
@@ -979,8 +989,7 @@ fn clone_environment_with_policy(
         default_env_root(&name, env, cwd)?
     };
     ensure_root_outside_dev_sources(&name, &root, &registry.envs)?;
-    ensure_root_outside_store(&name, &root, env, cwd)?;
-    ensure_root_outside_environments(&name, &root, &registry.envs)?;
+    ensure_new_root_separate(&name, &root, &registry.envs, env, cwd)?;
     let target_paths = derive_env_paths(&root);
     if path_exists(&target_paths.root) {
         let mut entries = fs::read_dir(&target_paths.root).map_err(|error| error.to_string())?;
@@ -1579,8 +1588,7 @@ pub(crate) fn import_environment_with_sandbox_origin(
             default_env_root(&name, env, cwd)?
         };
         ensure_root_outside_dev_sources(&name, &root, &registry.envs)?;
-        ensure_root_outside_store(&name, &root, env, cwd)?;
-        ensure_root_outside_environments(&name, &root, &registry.envs)?;
+        ensure_new_root_separate(&name, &root, &registry.envs, env, cwd)?;
         let target_paths = derive_env_paths(&root);
         if path_exists(&target_paths.root) {
             let mut entries =
