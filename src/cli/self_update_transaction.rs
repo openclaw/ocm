@@ -289,10 +289,10 @@ fn read_receipt(root: &Path) -> Result<Receipt, String> {
 }
 
 /// Another spelling of the install directory, such as a symlinked directory,
-/// a second PATH entry or a case variant, reaches the same journal. The final
-/// component is not followed, so a journal linked to another executable's
-/// journal stays foreign, and a moved directory leaves the recorded path
-/// reaching nothing.
+/// a second PATH entry or a case variant, reaches the same journal directory.
+/// The final component is not followed and must be a directory, so a journal
+/// that is a symlink (or a hard link to one) stays foreign, and a moved
+/// directory leaves the recorded path reaching nothing.
 fn same_journal(recorded: &Path, found: &Path) -> bool {
     if recorded == found {
         return true;
@@ -303,7 +303,8 @@ fn same_journal(recorded: &Path, found: &Path) -> bool {
         matches!(
             (fs::symlink_metadata(recorded), fs::symlink_metadata(found)),
             (Ok(recorded), Ok(found))
-                if (recorded.dev(), recorded.ino()) == (found.dev(), found.ino())
+                if found.is_dir()
+                    && (recorded.dev(), recorded.ino()) == (found.dev(), found.ino())
         )
     }
     #[cfg(not(unix))]

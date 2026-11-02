@@ -776,6 +776,18 @@ fn self_update_refuses_a_receipt_for_another_or_moved_install_dir() {
         linked.with_file_name(".ocm.self-update"),
     )
     .unwrap();
+    // Two journal paths that are one symlink inode: a hard link to the
+    // symlink at another binary's journal.
+    let parked = base.join("parked");
+    write_updated_receipt(&root, &parked, &base.join("hard/bin/ocm"));
+    let hard = install("hard/bin");
+    let hard_linked = install("hard-linked/bin");
+    std::os::unix::fs::symlink(&parked, hard.with_file_name(".ocm.self-update")).unwrap();
+    fs::hard_link(
+        hard.with_file_name(".ocm.self-update"),
+        hard_linked.with_file_name(".ocm.self-update"),
+    )
+    .unwrap();
     // An install directory moved after its update: the recorded path is gone.
     let moved = install("moved/bin");
     write_updated_receipt(
@@ -785,7 +797,7 @@ fn self_update_refuses_a_receipt_for_another_or_moved_install_dir() {
     );
     let env = release_env(&root, "http://127.0.0.1:9/unused");
 
-    for binary in [&copied, &linked, &moved] {
+    for binary in [&copied, &linked, &hard_linked, &moved] {
         for args in [
             ["self", "update", "--status"],
             ["self", "update", "--recover"],

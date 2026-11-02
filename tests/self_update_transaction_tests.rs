@@ -748,7 +748,7 @@ fn local_transaction_survives_gateway_teardown_and_recovers_failures() {
     assert!(status.status.success(), "{}", stderr(&status));
     let shown: Value = serde_json::from_slice(&status.stdout).unwrap();
     assert_eq!(shown["phase"], "applying");
-    assert_eq!(shown["binaryPath"], json!(crash.binary));
+    assert_eq!(shown["id"], id);
     assert_eq!(
         fs::read(crash.root.child("manager.log")).unwrap(),
         before_recovery
