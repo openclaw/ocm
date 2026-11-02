@@ -496,6 +496,29 @@ fn installer_without_home_or_a_destination_asks_for_one_before_downloading() {
 }
 
 #[test]
+fn installer_refuses_an_empty_option_value_before_downloading() {
+    for option in ["--prefix", "--bin-dir", "--version"] {
+        let root = TestDir::new("install-empty-option-value");
+        let (fake_bin, archive) = standalone_release(&root);
+        let home = root.child("home");
+        let output = installer_command(&root, &fake_bin, &archive)
+            .env("HOME", &home)
+            .args([option, ""])
+            .output()
+            .unwrap();
+
+        assert!(!output.status.success(), "{option}");
+        assert_eq!(
+            stderr(&output),
+            format!("error: {option} requires a value\n"),
+            "{option}"
+        );
+        assert!(!stdout(&output).contains("Downloading"), "{option}");
+        assert!(!home.exists(), "{option}");
+    }
+}
+
+#[test]
 fn installer_with_home_still_defaults_to_its_local_prefix() {
     let root = TestDir::new("install-home-default-prefix");
     let (fake_bin, archive) = standalone_release(&root);
