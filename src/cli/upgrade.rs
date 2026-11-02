@@ -1983,17 +1983,21 @@ impl Cli {
 
         // A GitHub PR target enters the fence before its checkout is staged, so
         // a signal during resolution stops the run and removes the checkout.
-        let mut interrupt_fence = None;
-        let target = self.resolve_simulation_target(&to, &mut interrupt_fence)?;
+        // Declared before the target, the fence is dropped after it, so a
+        // signal while the checkout is being removed cannot end OCM midway.
+        let mut fence = None;
+        let target = self.resolve_simulation_target(&to, &mut fence)?;
         self.validate_simulation_target(&target)?;
         let mut staged_runtime = self.prepare_shared_simulation_runtime(source_name, &target)?;
         // Downloads and staging stay interruptible. From registering the target
         // runtime until cleanup, SIGINT and SIGTERM stop the run at the next
         // check instead of ending OCM.
-        let interrupt_fence = match interrupt_fence {
-            Some(fence) => fence,
-            None => UpgradeInterruptFence::enter()?,
-        };
+        if fence.is_none() {
+            fence = Some(UpgradeInterruptFence::enter()?);
+        }
+        let interrupt_fence = fence
+            .as_ref()
+            .expect("the simulation interrupt fence was just entered");
         let mut prepared_runtime = None;
         let mut summaries = Vec::with_capacity(scenarios.len());
         for scenario in scenarios {
@@ -2011,7 +2015,7 @@ impl Cli {
                 prepared_runtime.as_ref(),
                 scenario,
                 options,
-                &interrupt_fence,
+                interrupt_fence,
             ) {
                 Ok(summary) => summaries.push(summary),
                 Err(error) => {

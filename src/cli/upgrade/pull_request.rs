@@ -45,16 +45,7 @@ impl PreparedPullRequest {
             return Ok(None);
         };
         let fence = &*interrupt_fence.insert(UpgradeInterruptFence::enter()?);
-        // A Ctrl-C that reached gh or Git also fails that command; report the
-        // interruption rather than the command's failure.
-        let step = |result: Result<String, String>| {
-            if fence.requested() {
-                Err(UPGRADE_SIMULATION_INTERRUPTED_ERROR.to_string())
-            } else {
-                result
-            }
-        };
-        let head_sha = step(query_head(&repository, number, env, cwd))?;
+        let head_sha = step(fence, query_head(&repository, number, env, cwd))?;
         let identity = PullRequestIdentity {
             url: format!("https://github.com/{repository}/pull/{number}"),
             repository,
@@ -66,54 +57,71 @@ impl PreparedPullRequest {
             .tempdir()
             .map_err(|error| format!("failed to prepare GitHub PR checkout: {error}"))?;
         let root = checkout.path();
-        step(checked_git(
-            git_command().arg("-C").arg(root).args(["init", "--quiet"]),
-        ))?;
+        step(
+            fence,
+            checked_git(git_command().arg("-C").arg(root).args(["init", "--quiet"])),
+        )?;
         let remote = format!("https://github.com/{}.git", identity.repository);
-        step(checked_git(
-            git_command()
-                .arg("-C")
-                .arg(root)
-                .args(["remote", "add", "origin", &remote]),
-        ))?;
-        step(checked_git(
-            git_command()
-                .args(["-c", "gc.auto=0", "-c", "maintenance.auto=false", "-C"])
-                .arg(root)
-                .args([
-                    "fetch",
-                    "--no-tags",
-                    "--depth=1",
-                    "--no-recurse-submodules",
-                    "origin",
-                ])
-                .arg(format!("refs/pull/{}/head", identity.number)),
-        ))?;
-        let fetched = step(checked_git(
-            git_command()
-                .arg("-C")
-                .arg(root)
-                .args(["rev-parse", "FETCH_HEAD"]),
-        ))?;
+        step(
+            fence,
+            checked_git(
+                git_command()
+                    .arg("-C")
+                    .arg(root)
+                    .args(["remote", "add", "origin", &remote]),
+            ),
+        )?;
+        step(
+            fence,
+            checked_git(
+                git_command()
+                    .args(["-c", "gc.auto=0", "-c", "maintenance.auto=false", "-C"])
+                    .arg(root)
+                    .args([
+                        "fetch",
+                        "--no-tags",
+                        "--depth=1",
+                        "--no-recurse-submodules",
+                        "origin",
+                    ])
+                    .arg(format!("refs/pull/{}/head", identity.number)),
+            ),
+        )?;
+        let fetched = step(
+            fence,
+            checked_git(
+                git_command()
+                    .arg("-C")
+                    .arg(root)
+                    .args(["rev-parse", "FETCH_HEAD"]),
+            ),
+        )?;
         if fetched.trim() != identity.head_sha
-            || step(query_head(&identity.repository, identity.number, env, cwd))?
-                != identity.head_sha
+            || step(
+                fence,
+                query_head(&identity.repository, identity.number, env, cwd),
+            )? != identity.head_sha
         {
             return Err(format!(
                 "GitHub PR {}#{} changed while resolving; rerun the simulation to select its current head",
                 identity.repository, identity.number
             ));
         }
-        step(checked_git(
-            git_command()
-                .arg("-C")
-                .arg(root)
-                .args(["checkout", "--quiet", "--detach", "--no-recurse-submodules"])
-                .arg(&identity.head_sha),
-        ))?;
-        if detect_openclaw_checkout(root).is_none() {
-            return Err("GitHub PR target is not an OpenClaw checkout".to_string());
-        }
+        step(
+            fence,
+            checked_git(
+                git_command()
+                    .arg("-C")
+                    .arg(root)
+                    .args(["checkout", "--quiet", "--detach", "--no-recurse-submodules"])
+                    .arg(&identity.head_sha),
+            ),
+        )?;
+        step(
+            fence,
+            detect_openclaw_checkout(root)
+                .ok_or_else(|| "GitHub PR target is not an OpenClaw checkout".to_string()),
+        )?;
         Ok(Some(Self { identity, checkout }))
     }
 
@@ -152,6 +160,17 @@ impl PreparedPullRequest {
         // The existing simulation environment owner now controls cleanup.
         let root = owned.keep();
         Ok(root.join("source"))
+    }
+}
+
+/// Stop PR resolution once the run's fence has recorded a signal. A Ctrl-C
+/// that reached gh or Git also fails that command, and a signal during
+/// validation can end in a validation error; both report the interruption.
+fn step<T>(fence: &UpgradeInterruptFence, result: Result<T, String>) -> Result<T, String> {
+    if fence.requested() {
+        Err(UPGRADE_SIMULATION_INTERRUPTED_ERROR.to_string())
+    } else {
+        result
     }
 }
 
