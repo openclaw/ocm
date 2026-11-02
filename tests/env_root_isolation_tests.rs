@@ -591,7 +591,13 @@ fn dangling_store_links_reserve_their_target_without_refusing_disjoint_roots() {
     let _ = fs::remove_dir_all(home.join("toolchains"));
     std::os::unix::fs::symlink(&storage, home.join("toolchains")).unwrap();
 
-    for destination in [storage.clone(), storage.join("nested"), external.clone()] {
+    // Possible aliases of the missing storage are reserved too.
+    for destination in [
+        storage.clone(),
+        storage.join("nested"),
+        external.join("MISSING-TOOLCHAINS"),
+        external.clone(),
+    ] {
         let rejected = admit(&fixture, &env, "create", "blocked", &destination);
         assert!(!rejected.status.success(), "{destination:?}");
         assert!(

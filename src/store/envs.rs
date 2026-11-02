@@ -624,7 +624,12 @@ fn ensure_root_outside_store(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 missing_store_overlaps(store, &home_location, &target, &target_entries)?
             }
-            Err(error) => return Err(error.to_string()),
+            Err(error) => {
+                return Err(format!(
+                    "failed to inspect OCM store {}: {error}",
+                    display_path(&store_path)
+                ));
+            }
         };
         if overlaps {
             return Err(format!(
@@ -649,15 +654,10 @@ fn existing_store_overlaps(
     target: &Path,
     target_entries: &BTreeSet<PathBuf>,
 ) -> Result<bool, String> {
-    // A store can be a link, possibly to storage that does not exist yet. Two
-    // missing locations compare by path, not by the missing-source alias
-    // rules, which refuse unrelated names on Windows.
-    let relate = |container: &Path, path: &Path| {
-        if fs::symlink_metadata(container).is_err() && fs::symlink_metadata(path).is_err() {
-            return Ok(path.strip_prefix(container).ok().map(Path::to_path_buf));
-        }
-        super::dev_sources::projected_path_relative(container, path)
-    };
+    // A store can be a link, possibly to storage that does not exist yet.
+    // Possible aliases of missing names are reserved; unrelated names that
+    // merely look like Windows short names are not refused.
+    let relate = super::dev_sources::projected_path_relative_reserving_short_names;
     let (location, store_entries) = resolve_root_entries(store_path)?;
     for entry in &store_entries {
         if relate(target, entry)?.is_some() {
@@ -697,7 +697,11 @@ fn missing_store_overlaps(
             continue;
         };
         let rest = components.as_path();
-        if super::dev_sources::missing_names_may_alias(first, store)?
+        #[cfg(windows)]
+        let short_alias = super::dev_sources::missing_names_may_be_short_alias(first, store);
+        #[cfg(not(windows))]
+        let short_alias = false;
+        if (short_alias || super::dev_sources::missing_names_may_alias(first, store)?)
             && store_overlap_counts(store, entry, target, rest)
         {
             return Ok(true);

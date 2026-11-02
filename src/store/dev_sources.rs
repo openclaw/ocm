@@ -91,6 +91,23 @@ pub(crate) fn projected_path_contains(root: &Path, path: &Path) -> Result<bool, 
 }
 
 pub(crate) fn projected_path_relative(root: &Path, path: &Path) -> Result<Option<PathBuf>, String> {
+    projected_relative(root, path, true)
+}
+
+/// Like `projected_path_relative`, but reserves a missing name that may be a
+/// Windows short-name alias instead of refusing every ambiguous pair.
+pub(crate) fn projected_path_relative_reserving_short_names(
+    root: &Path,
+    path: &Path,
+) -> Result<Option<PathBuf>, String> {
+    projected_relative(root, path, false)
+}
+
+fn projected_relative(
+    root: &Path,
+    path: &Path,
+    refuse_short_names: bool,
+) -> Result<Option<PathBuf>, String> {
     fn split(path: &Path) -> Result<(&Path, &Path), String> {
         let mut existing = path;
         loop {
@@ -153,19 +170,37 @@ pub(crate) fn projected_path_relative(root: &Path, path: &Path) -> Result<Option
             continue;
         }
         #[cfg(windows)]
-        let (component, expected) = (
-            component.trim_end_matches(&['.', ' '][..]),
-            expected.trim_end_matches(&['.', ' '][..]),
-        );
-        #[cfg(windows)]
-        if (possible_short_name(component) || possible_short_name(expected))
-            && !(plain_short_name(component) && plain_short_name(expected))
-        {
-            return Err("cannot distinguish missing Windows short-name aliases; restore the source before retrying".to_string());
+        if refuse_short_names {
+            let (component, expected) = (
+                component.trim_end_matches(&['.', ' '][..]),
+                expected.trim_end_matches(&['.', ' '][..]),
+            );
+            if (possible_short_name(component) || possible_short_name(expected))
+                && !(plain_short_name(component) && plain_short_name(expected))
+            {
+                return Err("cannot distinguish missing Windows short-name aliases; restore the source before retrying".to_string());
+            }
+        } else if missing_names_may_be_short_alias(component, expected) {
+            continue;
         }
+        #[cfg(not(windows))]
+        let _ = refuse_short_names;
         return Ok(None);
     }
     Ok(Some(actual.collect()))
+}
+
+/// Whether a missing name could later be a Windows short-name alias of the
+/// other: only an 8.3-shaped name with `~` can be generated for a long name.
+#[cfg(windows)]
+pub(crate) fn missing_names_may_be_short_alias(component: &str, expected: &str) -> bool {
+    let (component, expected) = (
+        component.trim_end_matches(&['.', ' '][..]),
+        expected.trim_end_matches(&['.', ' '][..]),
+    );
+    [(component, expected), (expected, component)]
+        .into_iter()
+        .any(|(short, long)| short.contains('~') && possible_short_name(short) && short != long)
 }
 
 /// Missing names lack filesystem identity. Reserve possible case and Unicode
