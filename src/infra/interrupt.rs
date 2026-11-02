@@ -180,6 +180,29 @@ pub(crate) fn set_handler(
     Ok(())
 }
 
+/// Register the owner like `set_handler`, keeping each of SIGINT, SIGTERM and
+/// SIGHUP that the process inherited as ignored, as `nohup` leaves SIGHUP. The
+/// owner then sees only the signals the caller allowed to stop OCM.
+pub(crate) fn set_handler_keeping_ignored(
+    handler: impl Fn() -> bool + Send + Sync + 'static,
+) -> Result<(), String> {
+    #[cfg(unix)]
+    let mut ignored = Vec::new();
+    #[cfg(unix)]
+    for (signal, _) in &FORWARD_HANDLERS {
+        let action = signal_action(*signal)?;
+        if action.sa_sigaction == libc::SIG_IGN {
+            ignored.push((*signal, action));
+        }
+    }
+    set_handler(handler)?;
+    #[cfg(unix)]
+    for (signal, action) in &ignored {
+        set_signal_action(*signal, action)?;
+    }
+    Ok(())
+}
+
 fn dispatch() {
     let handler = {
         let mut state = STATE.lock().unwrap();
@@ -278,6 +301,43 @@ impl Drop for CaptureInterrupt {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owner_keeping_ignored_signals_leaves_them_ignored() {
+        const CHILD: &str = "OCM_TEST_SIGNAL_KEEP_IGNORED_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // Signal registration is process-wide; isolate it from other tests.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "infra::interrupt::tests::owner_keeping_ignored_signals_leaves_them_ignored",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        unsafe {
+            libc::signal(libc::SIGHUP, libc::SIG_IGN);
+        }
+        set_handler_keeping_ignored(|| true).unwrap();
+        assert_eq!(
+            signal_action(libc::SIGHUP).unwrap().sa_sigaction,
+            libc::SIG_IGN
+        );
+        for signal in [libc::SIGINT, libc::SIGTERM] {
+            assert!(!matches!(
+                signal_action(signal).unwrap().sa_sigaction,
+                libc::SIG_DFL | libc::SIG_IGN
+            ));
+        }
+    }
 
     #[test]
     fn private_capture_preserves_owner_adoption_and_recovery_generations() {

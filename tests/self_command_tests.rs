@@ -875,7 +875,11 @@ fn self_update_rejects_a_binary_reporting_the_wrong_version() {
 }
 
 #[cfg(unix)]
-fn assert_interrupted_download_removes_its_temporary_directory(label: &str, signal: libc::c_int) {
+fn assert_interrupted_download_removes_its_temporary_directory(
+    label: &str,
+    signal: libc::c_int,
+    inherited_ignored: Option<libc::c_int>,
+) {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::os::unix::process::ExitStatusExt;
@@ -947,18 +951,34 @@ fn assert_interrupted_download_removes_its_temporary_directory(label: &str, sign
 
     let output_path = root.child("update.out");
     let output = fs::File::create(&output_path).unwrap();
-    let mut update = UpdateChild(
-        Command::new(&copied_binary)
-            .args(["self", "update", "--version", "9.9.9", "--raw"])
-            .current_dir(&cwd)
-            .env_clear()
-            .envs(&env)
-            .stdin(Stdio::null())
-            .stdout(output.try_clone().unwrap())
-            .stderr(output)
-            .spawn()
-            .unwrap(),
-    );
+    let update_args = ["self", "update", "--version", "9.9.9", "--raw"];
+    let mut command = match inherited_ignored {
+        // As `nohup` starts it: the shell's ignored disposition survives exec.
+        Some(ignored) => {
+            // An absolute shell keeps std on posix_spawn; a forked child would
+            // hold other tests' freshly copied binaries open (ETXTBSY).
+            let mut command = Command::new("/bin/sh");
+            command
+                .arg("-c")
+                .arg(format!("trap '' {ignored}; exec \"$0\" \"$@\""))
+                .arg(&copied_binary)
+                .args(update_args);
+            command
+        }
+        None => {
+            let mut command = Command::new(&copied_binary);
+            command.args(update_args);
+            command
+        }
+    };
+    command
+        .current_dir(&cwd)
+        .env_clear()
+        .envs(&env)
+        .stdin(Stdio::null())
+        .stdout(output.try_clone().unwrap())
+        .stderr(output);
+    let mut update = UpdateChild(command.spawn().unwrap());
     stalled
         .recv_timeout(Duration::from_secs(30))
         .expect("the update did not start downloading the release asset");
@@ -980,6 +1000,19 @@ fn assert_interrupted_download_removes_its_temporary_directory(label: &str, sign
         std::thread::sleep(Duration::from_millis(20));
     }
 
+    if let Some(ignored) = inherited_ignored {
+        assert_eq!(
+            unsafe { libc::kill(update.0.id() as libc::pid_t, ignored) },
+            0
+        );
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            update.0.try_wait().unwrap().is_none(),
+            "a signal the caller ignored stopped the update: {:?}",
+            fs::read_to_string(&output_path)
+        );
+        assert_eq!(update_dirs().len(), 1);
+    }
     assert_eq!(
         unsafe { libc::kill(update.0.id() as libc::pid_t, signal) },
         0
@@ -1023,6 +1056,7 @@ fn interrupted_self_update_download_removes_its_temporary_directory_on_sigint() 
     assert_interrupted_download_removes_its_temporary_directory(
         "self-update-interrupt-sigint",
         libc::SIGINT,
+        None,
     );
 }
 
@@ -1032,6 +1066,7 @@ fn interrupted_self_update_download_removes_its_temporary_directory_on_sigterm()
     assert_interrupted_download_removes_its_temporary_directory(
         "self-update-interrupt-sigterm",
         libc::SIGTERM,
+        None,
     );
 }
 
@@ -1041,5 +1076,16 @@ fn interrupted_self_update_download_removes_its_temporary_directory_on_sighup() 
     assert_interrupted_download_removes_its_temporary_directory(
         "self-update-interrupt-sighup",
         libc::SIGHUP,
+        None,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn interrupted_self_update_download_keeps_an_inherited_ignored_sighup() {
+    assert_interrupted_download_removes_its_temporary_directory(
+        "self-update-interrupt-nohup",
+        libc::SIGTERM,
+        Some(libc::SIGHUP),
     );
 }

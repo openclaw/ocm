@@ -95,9 +95,10 @@ fn open_temp_dir() -> MutexGuard<'static, Option<PathBuf>> {
 
 /// SIGINT, SIGTERM or SIGHUP while the release archive is downloaded,
 /// extracted or staged removes its temporary directory before OCM exits with
-/// status 130, as other interrupted commands do.
+/// status 130, as other interrupted commands do. A signal the caller ignores,
+/// such as SIGHUP under `nohup`, stays ignored.
 fn install_self_update_interrupt_handler() -> Result<(), String> {
-    crate::infra::interrupt::set_handler(remove_open_temp_dir)
+    crate::infra::interrupt::set_handler_keeping_ignored(remove_open_temp_dir)
         .map_err(|error| format!("failed to install self-update signal handler: {error}"))
 }
 
