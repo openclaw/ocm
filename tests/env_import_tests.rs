@@ -953,9 +953,12 @@ fn env_import_moves_an_included_gateway_port_with_the_sandbox_values_that_follow
             serde_json::json!({"port": imported, "bind": "loopback"})
         );
         let config = read("openclaw.json");
+        let gateway = config["gateway"].as_object().unwrap();
+        assert_eq!(gateway.len(), 1, "{config}");
+        // Compare paths by component: Windows writes either separator.
         assert_eq!(
-            config["gateway"],
-            serde_json::json!({"$include": directive(&target)})
+            Path::new(gateway["$include"].as_str().unwrap()),
+            Path::new(&directive(&target))
         );
         assert_eq!(
             config["mcp"]["apps"],
@@ -1058,8 +1061,8 @@ fn env_import_moves_an_included_gateway_port_into_a_root_inside_the_source_confi
     assert_eq!(read("gateway.json"), serde_json::json!({"port": imported}));
     let config = read("openclaw.json");
     assert_eq!(
-        config["gateway"]["$include"].as_str(),
-        Some(target.join("gateway.json").to_str().unwrap())
+        Path::new(config["gateway"]["$include"].as_str().unwrap()),
+        target.join("gateway.json")
     );
     assert_eq!(config["mcp"]["apps"]["sandboxPort"], imported + 1);
 }
