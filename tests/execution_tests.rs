@@ -98,6 +98,14 @@ fn build_launcher_command_joins_the_last_command_before_a_trailing_comment_or_ba
             "openclaw # one\n  # two",
             "openclaw 'gateway' 'two words' # one\n  # two",
         ),
+        (
+            "pnpm openclaw \\\n# my checkout",
+            "pnpm openclaw 'gateway' 'two words' \\\n# my checkout",
+        ),
+        (
+            "node gw.mjs $((1<<2)) # dev",
+            "node gw.mjs $((1<<2)) 'gateway' 'two words' # dev",
+        ),
         // Operators still separate the arguments into a failing command.
         ("openclaw;# dev", "openclaw; 'gateway' 'two words' # dev"),
         ("openclaw \\", "openclaw 'gateway' 'two words'"),
@@ -132,6 +140,12 @@ fn build_launcher_command_appends_after_recipes_without_a_trailing_comment() {
     if cfg!(windows) {
         recipes.push("openclaw # dev");
     }
+    let deeply_nested = format!(
+        "openclaw {}x{} # dev",
+        "\"$(echo ".repeat(40),
+        ")\"".repeat(40)
+    );
+    recipes.push(&deeply_nested);
     for recipe in recipes {
         assert_eq!(
             launcher_command(recipe),

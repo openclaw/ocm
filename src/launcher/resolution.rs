@@ -53,25 +53,63 @@ enum RecipeTail {
 /// Finds a trailing comment or dangling backslash after the last word of a
 /// POSIX shell recipe. A `#` starts a comment only at the start of a token
 /// outside quotes, expansions and substitutions. Constructs this scan does not
-/// model (here-documents, `$'...'`, `case` inside a command substitution) and
-/// unterminated quotes return `None`, so those recipes keep the plain append.
+/// model (here-documents, `$'...'`, `case` inside a command substitution,
+/// nesting deeper than `MAX_SPAN_NESTING`) and unterminated quotes return
+/// `None`, so those recipes keep the plain append.
 fn posix_recipe_tail(command: &str) -> Option<RecipeTail> {
-    let bytes = command.as_bytes();
-    let mut index = 0;
-    let mut word_end = 0;
+    match scan_tokens(command.as_bytes(), 0, false, 0)? {
+        (_, 0) => None,
+        (ScanEnd::Comment, word_end) => Some(RecipeTail::Comment(word_end)),
+        (ScanEnd::Backslash, word_end) => Some(RecipeTail::Backslash(word_end)),
+        _ => None,
+    }
+}
+
+const MAX_SPAN_NESTING: usize = 32;
+
+#[derive(Debug, PartialEq, Eq)]
+enum ScanEnd {
+    /// The text ended after a word or blanks.
+    Text,
+    /// The text ended in a `#` comment.
+    Comment,
+    /// The text ended in an unquoted backslash.
+    Backslash,
+    /// The `)` closing a command substitution; the offset is just past it.
+    Closed(usize),
+}
+
+/// Scans shell tokens from `start` to the end of the text or, inside a `$(`
+/// substitution, to its closing `)`. Returns how the scan ended and the offset
+/// just past the last word.
+fn scan_tokens(
+    bytes: &[u8],
+    start: usize,
+    in_substitution: bool,
+    nesting: usize,
+) -> Option<(ScanEnd, usize)> {
+    let mut index = start;
+    let mut word_end = start;
     let mut word_start = true;
+    let mut open_parens = 0usize;
     while let Some(&byte) = bytes.get(index) {
         if opens_span(bytes, index) {
-            index = skip_span(bytes, index)?;
+            index = skip_span(bytes, index, nesting + 1)?;
             word_end = index;
             word_start = false;
             continue;
         }
+        let next = bytes.get(index + 1);
         match byte {
-            b'$' if bytes.get(index + 1) == Some(&b'\'') => return None,
-            b'<' if bytes.get(index + 1) == Some(&b'<') => return None,
-            b'\\' if index + 1 == bytes.len() => {
-                return (word_end > 0).then_some(RecipeTail::Backslash(word_end));
+            b'$' if next == Some(&b'\'') => return None,
+            b'<' if next == Some(&b'<') => return None,
+            // A line continuation joins the lines without ending the token.
+            b'\\' if next == Some(&b'\n') => {
+                index += 2;
+                continue;
+            }
+            b'\\' if next.is_none() => {
+                return (!in_substitution).then_some((ScanEnd::Backslash, word_end));
             }
             b'\\' => {
                 index += 2;
@@ -85,15 +123,30 @@ fn posix_recipe_tail(command: &str) -> Option<RecipeTail> {
                     index += offset;
                     continue;
                 }
-                None => return (word_end > 0).then_some(RecipeTail::Comment(word_end)),
+                None => return (!in_substitution).then_some((ScanEnd::Comment, word_end)),
             },
-            b' ' | b'\t' | b'\n' => {}
-            _ => word_end = index + 1,
+            // `case` patterns would unbalance the parentheses.
+            b'c' if in_substitution
+                && word_start
+                && bytes[index..].starts_with(b"case")
+                && bytes.get(index + 4).is_none_or(|&next| ends_token(next)) =>
+            {
+                return None;
+            }
+            b'(' if in_substitution => open_parens += 1,
+            b')' if in_substitution => match open_parens.checked_sub(1) {
+                Some(remaining) => open_parens = remaining,
+                None => return Some((ScanEnd::Closed(index + 1), word_end)),
+            },
+            _ => {}
+        }
+        if !matches!(byte, b' ' | b'\t' | b'\n') {
+            word_end = index + 1;
         }
         word_start = ends_token(byte);
         index += 1;
     }
-    None
+    (!in_substitution).then_some((ScanEnd::Text, word_end))
 }
 
 /// Blanks and operator characters end a shell token.
@@ -115,14 +168,36 @@ fn opens_span(bytes: &[u8], index: usize) -> bool {
 }
 
 /// The offset just past the span that `opens_span` found at `start`, or `None`
-/// when it is unterminated or holds a construct the scan does not model.
-fn skip_span(bytes: &[u8], start: usize) -> Option<usize> {
+/// when it is unterminated, nested too deeply or holds a construct the scan
+/// does not model.
+fn skip_span(bytes: &[u8], start: usize, nesting: usize) -> Option<usize> {
+    if nesting > MAX_SPAN_NESTING {
+        return None;
+    }
     let (close, mut index) = match (bytes[start], bytes.get(start + 1)) {
         (b'\'', _) => {
             let end = bytes[start + 1..].iter().position(|&byte| byte == b'\'')?;
             return Some(start + end + 2);
         }
-        (b'$', Some(b'(')) => return skip_substitution(bytes, start + 2),
+        // Arithmetic expansion: only its parentheses matter here.
+        (b'$', Some(b'(')) if bytes.get(start + 2) == Some(&b'(') => {
+            let mut depth = 0usize;
+            for (offset, &byte) in bytes[start + 1..].iter().enumerate() {
+                match byte {
+                    b'(' => depth += 1,
+                    b')' if depth == 1 => return Some(start + offset + 2),
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+            }
+            return None;
+        }
+        (b'$', Some(b'(')) => {
+            return match scan_tokens(bytes, start + 2, true, nesting)? {
+                (ScanEnd::Closed(end), _) => Some(end),
+                _ => None,
+            };
+        }
         (b'$', _) => (b'}', start + 2),
         (delimiter, _) => (delimiter, start + 1),
     };
@@ -135,56 +210,10 @@ fn skip_span(bytes: &[u8], start: usize) -> Option<usize> {
         if byte == b'\\' {
             index += 2;
         } else if close != b'`' && opens_span(bytes, index) && (close == b'}' || byte != b'\'') {
-            index = skip_span(bytes, index)?;
+            index = skip_span(bytes, index, nesting + 1)?;
         } else {
             index += 1;
         }
-    }
-}
-
-/// The offset just past the `)` that closes a `$(` whose body starts at
-/// `start`. Comments inside it end at a newline; `case` patterns would
-/// unbalance the parentheses, so a substitution with `case` is not modelled.
-fn skip_substitution(bytes: &[u8], start: usize) -> Option<usize> {
-    let mut index = start;
-    let mut depth = 1usize;
-    let mut word_start = true;
-    loop {
-        let byte = *bytes.get(index)?;
-        if opens_span(bytes, index) {
-            index = skip_span(bytes, index)?;
-            word_start = false;
-            continue;
-        }
-        match byte {
-            b'$' if bytes.get(index + 1) == Some(&b'\'') => return None,
-            b'<' if bytes.get(index + 1) == Some(&b'<') => return None,
-            b'\\' => {
-                index += 2;
-                word_start = false;
-                continue;
-            }
-            b'#' if word_start => {
-                index += bytes[index..].iter().position(|&byte| byte == b'\n')?;
-                continue;
-            }
-            b'c' if word_start
-                && bytes[index..].starts_with(b"case")
-                && bytes.get(index + 4).is_none_or(|&next| ends_token(next)) =>
-            {
-                return None;
-            }
-            b'(' => depth += 1,
-            b')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(index + 1);
-                }
-            }
-            _ => {}
-        }
-        word_start = ends_token(byte);
-        index += 1;
     }
 }
 
