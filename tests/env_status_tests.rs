@@ -735,6 +735,12 @@ fn env_status_and_execution_resolve_the_effective_config_gateway_port() {
         std::os::unix::fs::symlink("../outside.json5", state_dir.join("linked.json5")).unwrap();
         fs::write(&config_path, "{$include: './linked.json5'}").unwrap();
         assert_port("demo", automatic_port, "computed");
+        // OpenClaw refuses an include file with more than one hard link.
+        let alias = state_dir.join("gateway-alias.json5");
+        fs::hard_link(state_dir.join("gateway.json5"), &alias).unwrap();
+        fs::write(&config_path, "{$include: './gateway.json5'}").unwrap();
+        assert_port("demo", automatic_port, "computed");
+        fs::remove_file(alias).unwrap();
     }
     fs::remove_file(&config_path).unwrap();
     assert_port("demo", automatic_port, "computed");
