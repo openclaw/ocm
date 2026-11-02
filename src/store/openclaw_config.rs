@@ -419,13 +419,35 @@ fn config_scope_matches(scope: &[ConfigSegment], pattern: &[&str]) -> bool {
             })
 }
 
+/// The characters JavaScript's `String.prototype.trim` removes: its white
+/// space (tab, vertical tab, form feed, BOM and the `Zs` space separators)
+/// and line terminators. Rust's `str::trim` differs, for example on U+0085.
+fn is_ecmascript_whitespace(c: char) -> bool {
+    matches!(
+        c,
+        '\t' | '\n' | '\u{b}' | '\u{c}' | '\r' | ' ' | '\u{a0}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200a}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202f}'
+                | '\u{205f}'
+                | '\u{3000}'
+                | '\u{feff}'
+    )
+}
+
 fn expand_home_relative_path(raw: &str, home: &Path, trims: bool) -> Option<String> {
-    let value = if trims { raw.trim() } else { raw };
+    let value = if trims {
+        raw.trim_matches(is_ecmascript_whitespace)
+    } else {
+        raw
+    };
     if value != "~" && !value.starts_with("~/") && !value.starts_with("~\\") {
         return None;
     }
-    // OpenClaw substitutes `${VAR}` before resolving `..`, so a placeholder
-    // has no fixed location to spell out here; leave it as written.
+    // OpenClaw substitutes `${VAR}` before resolving `..`, which the lexical
+    // expansion here cannot reproduce; leave such values as written for now
+    // (openclaw/ocm#972).
     if value.contains("${") {
         return None;
     }
@@ -2914,6 +2936,12 @@ mod tests {
         let expand = |raw| expand_home_relative_path(raw, home, true);
         assert_eq!(expand("~/dev/p").as_deref(), Some("/home/alice/dev/p"));
         assert_eq!(expand(" ~/dev/p ").as_deref(), Some("/home/alice/dev/p"));
+        // Trimmed as JavaScript trims: BOM yes, U+0085 no.
+        assert_eq!(
+            expand("\u{feff}~/dev/p").as_deref(),
+            Some("/home/alice/dev/p")
+        );
+        assert_eq!(expand("\u{85}~/ready"), None);
         assert_eq!(expand("~").as_deref(), Some("/home/alice"));
         assert_eq!(
             expand("~/a/./../dev/p").as_deref(),
