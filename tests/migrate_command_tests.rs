@@ -5505,6 +5505,7 @@ fn migrate_and_adopt_expand_worker_folders_without_resolving_parent_traversal() 
                 "~/work",
                 "~/hop/../work",
                 "~/.openclaw/wf",
+                "~/.openclaw/../work",
                 " ~/work",
             ]}}
         });
@@ -5530,6 +5531,9 @@ fn migrate_and_adopt_expand_worker_folders_without_resolving_parent_traversal() 
                 format!("{home_path}/hop/../work"),
                 // Already names the environment's copy.
                 "~/.openclaw/wf",
+                // Leaves the state directory, so the relocation of copied
+                // state paths keeps it.
+                format!("{home_path}/.openclaw/../work"),
                 // OpenClaw does not trim, so this is not home-relative.
                 " ~/work",
             ]),
