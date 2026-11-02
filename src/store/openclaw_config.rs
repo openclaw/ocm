@@ -232,7 +232,14 @@ pub(crate) fn rewrite_openclaw_config_for_migration(
     gateway_port: Option<u32>,
     sandbox_origin: Option<&str>,
 ) -> Result<OpenClawConfigRewriteOutcome, String> {
-    let kept = expand_migrated_home_relative_paths(target_paths, source_home)?;
+    let kept = expand_migrated_home_relative_paths(
+        target_paths,
+        &HomeExpansion {
+            home: source_home,
+            source_state_dir: source_state_root,
+            target_state_dir: &target_paths.state_dir,
+        },
+    )?;
     rewrite_migrated_plugin_load_paths(
         target_paths,
         source_state_root,
@@ -258,10 +265,10 @@ pub(crate) fn rewrite_openclaw_config_for_migration(
 /// although they may now resolve elsewhere.
 fn expand_migrated_home_relative_paths(
     target: &EnvPaths,
-    source_home: &Path,
+    expansion: &HomeExpansion<'_>,
 ) -> Result<BTreeSet<KeptHomeRelativeSetting>, String> {
     let mut kept = BTreeSet::new();
-    if !source_home.is_absolute() {
+    if !expansion.home.is_absolute() {
         return Ok(kept);
     }
     let Some(effective) = load_effective_openclaw_config(&target.config_path)? else {
@@ -276,7 +283,7 @@ fn expand_migrated_home_relative_paths(
         let mut rewritten = None;
         for mut scope in scopes {
             let mut candidate = value.clone();
-            expand_home_relative_paths_in_scope(&mut candidate, &mut scope, source_home, &mut kept);
+            expand_home_relative_paths_in_scope(&mut candidate, &mut scope, expansion, &mut kept);
             if rewritten
                 .as_ref()
                 .is_some_and(|previous| previous != &candidate)
@@ -295,15 +302,24 @@ fn expand_migrated_home_relative_paths(
     Ok(kept)
 }
 
+/// The home `~` named in the plain install, and the state directory the
+/// later relocation moves absolute values from and to.
+struct HomeExpansion<'a> {
+    home: &'a Path,
+    source_state_dir: &'a Path,
+    target_state_dir: &'a Path,
+}
+
 /// Expands the home-relative path settings in a config fragment included at
 /// `scope`, and records the settings it keeps as written although they may
 /// now resolve elsewhere. `$include` directives keep their own relocation.
 fn expand_home_relative_paths_in_scope(
     value: &mut Value,
     scope: &mut Vec<ConfigSegment>,
-    home: &Path,
+    expansion: &HomeExpansion<'_>,
     kept: &mut BTreeSet<KeptHomeRelativeSetting>,
 ) -> bool {
+    let home = expansion.home;
     match value {
         Value::String(raw) => {
             let Some(rule) = home_relative_path_setting(scope) else {
@@ -313,7 +329,9 @@ fn expand_home_relative_paths_in_scope(
                 HomePathRule::Lexical { trims } => {
                     (expand_home_relative_path(raw, home, trims), trims)
                 }
-                HomePathRule::Physical => (expand_physical_home_relative_path(raw, home), false),
+                HomePathRule::Physical => {
+                    (expand_physical_home_relative_path(raw, expansion), false)
+                }
                 HomePathRule::TrustRoot => {
                     let moves = expand_home_relative_path(raw, home, true).is_some()
                         || has_home_relative_placeholder(raw, true);
@@ -343,7 +361,7 @@ fn expand_home_relative_paths_in_scope(
             let mut changed = false;
             for (index, nested) in values.iter_mut().enumerate() {
                 scope.push(ConfigSegment::Index(index));
-                changed |= expand_home_relative_paths_in_scope(nested, scope, home, kept);
+                changed |= expand_home_relative_paths_in_scope(nested, scope, expansion, kept);
                 scope.pop();
             }
             changed
@@ -352,7 +370,7 @@ fn expand_home_relative_paths_in_scope(
             let mut changed = false;
             for (key, nested) in values.iter_mut().filter(|(key, _)| *key != "$include") {
                 scope.push(ConfigSegment::Key(key.clone()));
-                changed |= expand_home_relative_paths_in_scope(nested, scope, home, kept);
+                changed |= expand_home_relative_paths_in_scope(nested, scope, expansion, kept);
                 scope.pop();
             }
             changed
@@ -572,12 +590,15 @@ fn expand_home_relative_path(raw: &str, home: &Path, trims: bool) -> Option<Stri
 
 /// Expands a setting OpenClaw resolves through links. Only the leading `~`
 /// is replaced: the consumer follows each link before the `..` after it,
-/// which removing `..` here would change. A value under `~/.openclaw`
-/// already names the copied state directory and stays as written, unless
-/// its `..` leads to an existing directory: the later relocation of state
-/// paths then follows links as the consumer does, but it would also step
-/// over a missing directory that makes the consumer reject the entry.
-fn expand_physical_home_relative_path(raw: &str, home: &Path) -> Option<String> {
+/// which removing `..` here would change. A value under `~/.openclaw` with
+/// no `..` already names the copied state directory and stays as written.
+/// The later relocation of absolute state paths follows existing links as
+/// the consumer does, but it steps over a missing directory the consumer
+/// would reject. An entry it would move into the copied state although the
+/// source path does not resolve stays as written, so it keeps resolving
+/// through the copy of that missing directory.
+fn expand_physical_home_relative_path(raw: &str, expansion: &HomeExpansion<'_>) -> Option<String> {
+    let home = expansion.home;
     if !is_home_relative(raw) {
         return None;
     }
@@ -585,13 +606,21 @@ fn expand_physical_home_relative_path(raw: &str, home: &Path) -> Option<String> 
     let mut literal_path = home.as_os_str().to_os_string();
     literal_path.push(&literal[1..]);
     let literal_path = Path::new(&literal_path);
-    let expanded = format!("{}{}", home.to_str()?, &raw[1..]);
     if literal_path.starts_with(home.join(".openclaw"))
         && (!rest.is_empty()
             || !literal_path
                 .components()
-                .any(|component| component == std::path::Component::ParentDir)
-            || fs::canonicalize(&expanded).is_err())
+                .any(|component| component == std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    let expanded = format!("{}{}", home.to_str()?, &raw[1..]);
+    let mut relocated = expanded.clone();
+    if rewrite_env_root_string(
+        &mut relocated,
+        expansion.source_state_dir,
+        expansion.target_state_dir,
+    ) && fs::canonicalize(&expanded).is_err()
     {
         return None;
     }
@@ -3259,8 +3288,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn migration_home_expansion_keeps_link_traversal_for_physical_settings() {
-        let home = Path::new("/home/alice");
-        let expand = |raw| expand_physical_home_relative_path(raw, home);
+        let expansion = HomeExpansion {
+            home: Path::new("/home/alice"),
+            source_state_dir: Path::new("/home/alice/.openclaw"),
+            target_state_dir: Path::new("/envs/copied/.openclaw"),
+        };
+        let expand = |raw| expand_physical_home_relative_path(raw, &expansion);
         assert_eq!(expand("~/work").as_deref(), Some("/home/alice/work"));
         assert_eq!(expand("~").as_deref(), Some("/home/alice"));
         // `..` stays for the consumer to resolve after following `hop`.
@@ -3268,9 +3301,17 @@ mod tests {
             expand("~/hop/../work").as_deref(),
             Some("/home/alice/hop/../work")
         );
-        // Under `~/.openclaw`, `..` is spelled out only when it leads to an
-        // existing directory; this home does not exist.
-        assert_eq!(expand("~/.openclaw/../work"), None);
+        // `..` that leaves the state directory is not moved into the copy.
+        assert_eq!(
+            expand("~/.openclaw/../work").as_deref(),
+            Some("/home/alice/.openclaw/../work")
+        );
+        assert_eq!(
+            expand("~/.openclaw/../../shared").as_deref(),
+            Some("/home/alice/.openclaw/../../shared")
+        );
+        // The relocation would step over `missing`, which does not resolve.
+        assert_eq!(expand("~/.openclaw/missing/../wf"), None);
         assert_eq!(
             expand("~/${SUB}/work").as_deref(),
             Some("/home/alice/${SUB}/work")

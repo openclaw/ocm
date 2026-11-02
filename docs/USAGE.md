@@ -1298,20 +1298,22 @@ value spelled from your home, so a placeholder that itself leads into
 setting, because its placeholder may still lead outside `~/.openclaw`.
 `nodeHost.workerRuns.folders` entries, which OpenClaw resolves through
 symlinks, only have their leading `~` replaced, so a link before `..` still
-decides where they lead; an entry under `~/.openclaw` whose `..` does not lead
-to an existing directory stays as written, so OpenClaw keeps rejecting it. The
-trust roots `skills.load.allowSymlinkTargets` and
-`security.installPolicy.exec.trustedDirs` are not rewritten, because that would
-change what the new environment trusts: their `~/...` entries outside
-`~/.openclaw` now resolve under the environment root, and migration prints a
-warning naming each such setting. Replace those entries with absolute paths to
-keep trusting the original directories. The source home is your home
-directory when the migrated directory is your own `~/.openclaw`, through any
-path that leads to it; otherwise it is the directory that contains the
-migrated `.openclaw` as you spelled it, or as it is stored when only that path
-is named `.openclaw`, or your home directory for a state directory with another
-name. Values under
-`~/.openclaw` already name the environment's copied state and stay as written.
+decides where they lead; an entry that then names a directory inside
+`~/.openclaw` moves to the environment's copy like any other state path, and
+one that would only reach the copy by stepping over a directory missing from
+`~/.openclaw` stays as written, so OpenClaw keeps rejecting it. The trust roots
+`skills.load.allowSymlinkTargets` and `security.installPolicy.exec.trustedDirs`
+are not rewritten, because that would change what the new environment trusts:
+their `~/...` entries outside `~/.openclaw` now resolve under the environment
+root, and migration prints a warning naming each such setting. Replace those
+entries with absolute paths to keep trusting the original directories. In
+these warnings, `[]` in a setting name stands for a list entry. The source home
+is your home directory when the migrated directory is your own `~/.openclaw`,
+through any path that leads to it; otherwise it is the directory that contains
+the migrated `.openclaw` as you spelled it, or as it is stored when only that
+path is named `.openclaw`, or your home directory for a state directory with
+another name. Values under `~/.openclaw` already name the environment's copied
+state and stay as written.
 Clone and archive import keep `~/...` values unchanged, because their source
 already expands `~` against an environment root.
 

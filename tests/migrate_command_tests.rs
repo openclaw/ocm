@@ -5514,6 +5514,9 @@ fn migrate_and_adopt_expand_worker_folders_without_resolving_parent_traversal() 
         // OpenClaw resolves `hop` before `..`, so `~/hop/../work` names
         // `~/data/work`, not `~/work`.
         std::os::unix::fs::symlink(home.join("data/deep"), home.join("hop")).unwrap();
+        // `~/.openclaw/../../shared` names the missing `<root>/shared` in the
+        // plain install; kept as written it would name this directory.
+        fs::create_dir_all(root.child("ocm-home/envs/shared")).unwrap();
         let config = serde_json::json!({
             "nodeHost": {"workerRuns": {"enabled": true, "folders": [
                 "~/work",
@@ -5522,6 +5525,7 @@ fn migrate_and_adopt_expand_worker_folders_without_resolving_parent_traversal() 
                 "~/.openclaw/../work",
                 // `missing` does not exist, so OpenClaw rejects this entry.
                 "~/.openclaw/missing/../wf",
+                "~/.openclaw/../../shared",
                 " ~/work",
             ]}}
         });
@@ -5553,6 +5557,7 @@ fn migrate_and_adopt_expand_worker_folders_without_resolving_parent_traversal() 
                 // Kept, so it still names a missing directory in the copy
                 // instead of being resolved to the copied `wf`.
                 "~/.openclaw/missing/../wf",
+                format!("{home_path}/.openclaw/../../shared"),
                 // OpenClaw does not trim, so this is not home-relative.
                 " ~/work",
             ]),
@@ -5620,6 +5625,96 @@ fn migrate_and_adopt_keep_home_relative_trust_roots_and_name_them() {
                 "adopt={adopt}: {warnings}"
             );
         }
+    }
+}
+
+#[test]
+fn migrate_and_adopt_name_trust_roots_with_placeholders_under_the_state_dir() {
+    for adopt in [false, true] {
+        let root = TestDir::new("migrate-home-relative-trust-root-placeholders");
+        let env = ocm_env(&root);
+        let home = root.child("home");
+        let source = home.join(".openclaw");
+        fs::create_dir_all(&source).unwrap();
+        let config = serde_json::json!({
+            "skills": {"load": {"allowSymlinkTargets": ["~/.openclaw/${SUB}/skills"]}},
+            "security": {"installPolicy": {"exec": {"trustedDirs": [
+                {"$include": "./trusted-dir.json"}
+            ]}}}
+        });
+        support::write_text(&source.join("openclaw.json"), &config.to_string());
+        support::write_text(&source.join("trusted-dir.json"), r#""~/.openclaw/${BIN}""#);
+
+        let imported = run_ocm(
+            root.path(),
+            &env,
+            &migrate_or_adopt_args(adopt, "copied", &source),
+        );
+        assert!(imported.status.success(), "{}", stderr(&imported));
+
+        let target = root.child("ocm-home/envs/copied/.openclaw");
+        let copied: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(target.join("openclaw.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            copied["skills"]["load"]["allowSymlinkTargets"],
+            serde_json::json!(["~/.openclaw/${SUB}/skills"]),
+            "adopt={adopt}"
+        );
+        assert_eq!(
+            fs::read_to_string(target.join("trusted-dir.json")).unwrap(),
+            r#""~/.openclaw/${BIN}""#
+        );
+        let warnings = stderr(&imported);
+        for setting in [
+            "skills.load.allowSymlinkTargets",
+            "security.installPolicy.exec.trustedDirs",
+        ] {
+            assert!(
+                warnings.lines().any(|line| line.starts_with(&format!(
+                    "warning: env copied keeps the ~/ entries of trust root {setting}[] as written"
+                ))),
+                "adopt={adopt}: {warnings}"
+            );
+        }
+    }
+}
+
+#[test]
+fn migrate_and_adopt_refuse_an_include_shared_by_a_path_list_and_a_trust_root() {
+    for adopt in [false, true] {
+        let root = TestDir::new("migrate-home-relative-shared-list-include");
+        let env = ocm_env(&root);
+        let home = root.child("home");
+        let source = home.join(".openclaw");
+        fs::create_dir_all(&source).unwrap();
+        // One file cannot be spelled out for `extraDirs` and kept for the
+        // trust root, so migration refuses instead of moving either silently.
+        let config = serde_json::json!({
+            "skills": {"load": {
+                "extraDirs": [{"$include": "./shared-dir.json"}],
+                "allowSymlinkTargets": [{"$include": "./shared-dir.json"}]
+            }}
+        });
+        support::write_text(&source.join("openclaw.json"), &config.to_string());
+        support::write_text(&source.join("shared-dir.json"), r#""~/shared""#);
+
+        let imported = run_ocm(
+            root.path(),
+            &env,
+            &migrate_or_adopt_args(adopt, "copied", &source),
+        );
+        assert!(!imported.status.success(), "adopt={adopt}");
+        assert!(
+            stderr(&imported)
+                .contains("cannot safely expand home-relative paths in shared OpenClaw include"),
+            "adopt={adopt}: {}",
+            stderr(&imported)
+        );
+        assert_eq!(
+            fs::read_to_string(source.join("shared-dir.json")).unwrap(),
+            r#""~/shared""#
+        );
     }
 }
 

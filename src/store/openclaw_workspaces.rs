@@ -54,7 +54,12 @@ impl ConfigSegment {
     pub(crate) fn is(&self, name: &str) -> bool {
         match self {
             Self::Key(key) => key == name,
-            Self::Index(index) => index.to_string() == name,
+            // The decimal spelling of the index, without allocating one.
+            Self::Index(index) => {
+                name.bytes().all(|byte| byte.is_ascii_digit())
+                    && (name.len() == 1 || !name.starts_with('0'))
+                    && name.parse() == Ok(*index)
+            }
         }
     }
 }
