@@ -752,6 +752,65 @@ fn development_locations_require_explicit_safe_directory_boundaries() {
 }
 
 #[test]
+fn option_shaped_arguments_never_replace_declared_paths() {
+    let declared = ".openclaw/workspace/projects";
+    let mut fixture = Fixture::new();
+    let declared_paths = |fixture: &Fixture| {
+        let show = fixture.run(&["env", "show", "demo", "--json"]);
+        assert!(show.status.success(), "{}", stderr(&show));
+        serde_json::from_str::<Value>(&stdout(&show)).unwrap()["upgradeIndependentPaths"].clone()
+    };
+    for tokens in [
+        &["--help"][..],
+        &["-h"],
+        &["--bogus"],
+        &["--yes"],
+        &["--"],
+        &["--", "--help"],
+        &[declared, "--help"],
+        &["--bogus", declared],
+        &["--json", "-h"],
+    ] {
+        let mut args = vec!["env", "set-independent-paths", "demo"];
+        args.extend_from_slice(tokens);
+        let result = fixture.run(&args);
+        assert!(!result.status.success(), "{tokens:?} was accepted");
+        assert!(
+            stderr(&result).contains("env set-independent-paths does not accept option"),
+            "{tokens:?}: {}",
+            stderr(&result)
+        );
+        assert_eq!(declared_paths(&fixture), serde_json::json!([declared]));
+    }
+    // The declaration that survived still scopes the next upgrade checkpoint.
+    let snapshot = fixture.upgrade_checkpoint();
+    assert_eq!(
+        snapshot["upgradeScope"]["independentPaths"],
+        serde_json::json!([declared])
+    );
+
+    // A directory whose name begins with - remains declarable as ./<name>,
+    // and a leading ./ on any path is dropped before it is stored.
+    fs::create_dir_all(fixture.state.parent().unwrap().join("-odd")).unwrap();
+    let bare = fixture.run(&["env", "set-independent-paths", "demo", "-odd"]);
+    assert!(!bare.status.success(), "bare -odd was accepted");
+    assert_eq!(declared_paths(&fixture), serde_json::json!([declared]));
+    let dotted_declared = format!("./{declared}");
+    let dotted = fixture.run(&[
+        "env",
+        "set-independent-paths",
+        "demo",
+        "./-odd",
+        &dotted_declared,
+    ]);
+    assert!(dotted.status.success(), "{}", stderr(&dotted));
+    assert_eq!(
+        declared_paths(&fixture),
+        serde_json::json!(["-odd", declared])
+    );
+}
+
+#[test]
 fn scope_refuses_configuration_workspace_and_path_escape_exclusions() {
     let fixture = Fixture::new();
     write_text(&fixture.state.join("workspace/projects/include.json"), "{}");

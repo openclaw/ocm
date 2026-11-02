@@ -1583,6 +1583,7 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
             )],
             &[
                 "Paths name directories relative to the environment root. Configuration, config includes and entire configured workspaces cannot be declared independent.",
+                "Other than --json, --raw and --color, arguments that begin with - are refused and leave the list unchanged. A leading ./ is dropped, so write a directory whose name begins with - as ./<name>.",
                 "Eligible locations are beneath configured workspaces, in .openclaw/worktrees, or in non-hidden environment-home directories. Other hidden home/state namespaces remain protected.",
                 "Declare only content that core and plugin migrations do not own. OCM does not sandbox runtime writes into declared paths.",
                 "Full snapshots still include these paths. Existing checkpoints keep the scope recorded when they were captured.",

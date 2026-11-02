@@ -1759,16 +1759,29 @@ impl Cli {
         &self,
         args: Vec<String>,
     ) -> Result<i32, String> {
+        const USAGE: &str = "usage: ocm env set-independent-paths <env> <relative-path>... | none";
         let (args, json, _) = self.consume_human_output_flags(args, "env set-independent-paths")?;
+        // Every leftover token becomes a stored path, so an option such as a
+        // trailing --help must be refused rather than declared. A directory
+        // whose name begins with - is written as ./<name>.
+        if let Some(option) = args.iter().find(|arg| arg.starts_with('-')) {
+            return Err(format!(
+                "env set-independent-paths does not accept option {option}; write a path that begins with - as ./<path>"
+            ));
+        }
         if args.len() < 2 {
-            return Err(
-                "usage: ocm env set-independent-paths <env> <relative-path>... | none".to_string(),
-            );
+            return Err(USAGE.to_string());
         }
         let paths = if args.len() == 2 && args[1] == "none" {
             Vec::new()
         } else {
-            args[1..].iter().map(std::path::PathBuf::from).collect()
+            args[1..]
+                .iter()
+                .map(|arg| {
+                    let path = std::path::Path::new(arg);
+                    path.strip_prefix(".").unwrap_or(path).to_path_buf()
+                })
+                .collect()
         };
         let meta = self
             .environment_service()

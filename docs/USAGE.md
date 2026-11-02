@@ -1442,8 +1442,12 @@ ocm env show mira --json
 ocm env set-independent-paths mira none
 ```
 
-The command replaces the list. Paths are relative to the environment root and
-must name directories in one of these locations:
+The command replaces the list. Apart from the output options `--json`, `--raw`
+and `--color`, it refuses any argument that begins with `-`, such as a trailing
+`--help` or an unknown option, and leaves the list unchanged. A leading `./` is
+accepted and dropped, so write a directory whose name begins with `-` as
+`./<name>`. Paths are relative to the environment root and must name directories
+in one of these locations:
 
 - strictly beneath a configured workspace;
 - the managed-worktree content directory `.openclaw/worktrees`, or beneath it;
