@@ -959,6 +959,9 @@ impl<'a> SupervisorService<'a> {
     }
 
     pub fn run(&self, once: bool) -> Result<SupervisorRunSummary, String> {
+        // Resolve the Homebrew link before any upgrade can remove this keg.
+        #[cfg(unix)]
+        let _ = supervisor_self_executable();
         let (state_path, state) = self.read_persisted_state()?;
         if once {
             return self.run_once(&state_path, state);
@@ -2156,6 +2159,20 @@ fn open_child_log(
     Ok(file)
 }
 
+/// The daemon's own executable for its children's `OCM_SELF`. A Homebrew
+/// daemon keeps the stable link it resolved first: once `brew upgrade` removes
+/// its keg, Linux reports the running file as deleted and no link resolves to it.
+#[cfg(unix)]
+fn supervisor_self_executable() -> Result<PathBuf, String> {
+    static HOMEBREW_LINK: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    let current = std::env::current_exe().map_err(|error| error.to_string())?;
+    let link = HOMEBREW_LINK.get_or_init(|| {
+        let durable = crate::infra::install_owner::durable_executable_path(&current);
+        (durable != current).then_some(durable)
+    });
+    Ok(link.clone().unwrap_or(current))
+}
+
 fn spawn_supervisor_child(spec: &SupervisorChildSpec) -> Result<Child, String> {
     let program_arguments = supervisor_program_arguments(spec);
     let Some(program) = program_arguments.first() else {
@@ -2197,9 +2214,7 @@ fn spawn_supervisor_child(spec: &SupervisorChildSpec) -> Result<Child, String> {
     // regenerated the desired spec (which must not restart a running Gateway).
     #[cfg(unix)]
     {
-        let executable = crate::infra::install_owner::durable_executable_path(
-            &std::env::current_exe().map_err(|error| error.to_string())?,
-        );
+        let executable = supervisor_self_executable()?;
         process_env.insert("OCM_SELF".into(), display_path(&executable));
     }
 
