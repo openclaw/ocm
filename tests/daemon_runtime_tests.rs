@@ -3785,6 +3785,191 @@ fn daemon_child_inspects_the_spawning_daemons_xdg_service() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn homebrew_daemon_children_keep_the_link_across_brew_upgrade() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("daemon-homebrew-keg");
+    let mut env = ocm_env(&root);
+    install_fake_service_manager(&root, &mut env);
+    let prefix = fs::canonicalize(root.path()).unwrap().join("linuxbrew");
+    let keg = prefix.join("Cellar/ocm/0.3.8");
+    let binary = keg.join("bin/ocm");
+    fs::create_dir_all(binary.parent().unwrap()).unwrap();
+    fs::copy(ocm_test_binary_path(), &binary).unwrap();
+    fs::write(keg.join("INSTALL_RECEIPT.json"), "{}").unwrap();
+    fs::create_dir_all(prefix.join("bin")).unwrap();
+    std::os::unix::fs::symlink("../Cellar/ocm/0.3.8/bin/ocm", prefix.join("bin/ocm")).unwrap();
+
+    // The first child to run simulates `brew upgrade`: a new keg, the link
+    // repointed, the daemon's own keg removed. Every child records OCM_SELF.
+    let upgraded = root.child("upgraded");
+    let script = root.child("bin/openclaw");
+    write_legacy_openclaw_script(
+        &script,
+        &format!(
+            "#!/bin/sh\nprintf '%s' \"$OCM_SELF\" > '{root}/self-'$$\nif [ ! -e '{upgraded}' ]; then\n  mkdir -p '{prefix}/Cellar/ocm/0.3.9/bin' && : > '{prefix}/Cellar/ocm/0.3.9/bin/ocm'\n  ln -sfn ../Cellar/ocm/0.3.9/bin/ocm '{prefix}/bin/ocm' && rm -rf '{keg}' && : > '{upgraded}'\nfi\n",
+            root = root.path().display(),
+            upgraded = upgraded.display(),
+            prefix = prefix.display(),
+            keg = keg.display(),
+        ),
+    );
+    let launcher = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "launcher",
+            "add",
+            "stable",
+            "--command",
+            script.to_str().unwrap(),
+        ],
+    );
+    assert!(launcher.status.success(), "{}", stderr(&launcher));
+    for name in ["first", "second"] {
+        let created = run_ocm(
+            root.path(),
+            &env,
+            &["env", "create", name, "--launcher", "stable"],
+        );
+        assert!(created.status.success(), "{}", stderr(&created));
+        set_service_enabled(root.path(), &env, name, true);
+    }
+    SupervisorService::new(&env, root.path()).sync().unwrap();
+
+    let mut run = Command::new(&binary);
+    run.current_dir(root.path())
+        .args(["__daemon", "run", "--once", "--json"])
+        .env_clear()
+        .envs(&env);
+    let output = (0..5)
+        .find_map(|_| match run.output() {
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                sleep(Duration::from_millis(20));
+                None
+            }
+            result => Some(result.unwrap()),
+        })
+        .expect("copied ocm stayed busy");
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(upgraded.exists(), "no child simulated the upgrade");
+    let link = path_string(&prefix.join("bin/ocm"));
+    let recorded: Vec<String> = fs::read_dir(root.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("self-"))
+        })
+        .map(|path| fs::read_to_string(path).unwrap())
+        .collect();
+    assert_eq!(recorded, vec![link.clone(), link]);
+}
+
+#[cfg(unix)]
+#[test]
+fn homebrew_daemon_started_before_brew_upgrade_gives_new_gateways_the_link() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("daemon-homebrew-idle");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    env.insert(
+        "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
+        "launchd".to_string(),
+    );
+    install_fake_launchctl(&root, &mut env);
+    let prefix = fs::canonicalize(root.path()).unwrap().join("linuxbrew");
+    let keg = prefix.join("Cellar/ocm/0.3.8");
+    let binary = keg.join("bin/ocm");
+    fs::create_dir_all(binary.parent().unwrap()).unwrap();
+    fs::copy(ocm_test_binary_path(), &binary).unwrap();
+    fs::write(keg.join("INSTALL_RECEIPT.json"), "{}").unwrap();
+    fs::create_dir_all(prefix.join("bin")).unwrap();
+    std::os::unix::fs::symlink("../Cellar/ocm/0.3.8/bin/ocm", prefix.join("bin/ocm")).unwrap();
+
+    let marker = root.child("child-ocm-self");
+    let runtime = root.child("bin/openclaw-runtime");
+    write_legacy_openclaw_script(
+        &runtime,
+        &format!(
+            "#!/bin/sh\nprintf '%s' \"$OCM_SELF\" > '{}'\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
+            marker.display()
+        ),
+    );
+    let add = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "runtime",
+            "add",
+            "fixture",
+            "--path",
+            &path_string(&runtime),
+        ],
+    );
+    assert!(add.status.success(), "{}", stderr(&add));
+    let create = run_ocm(
+        &cwd,
+        &env,
+        &["env", "create", "demo", "--runtime", "fixture"],
+    );
+    assert!(create.status.success(), "{}", stderr(&create));
+    let service = SupervisorService::new(&env, &cwd);
+    service.sync().unwrap();
+    service.install_daemon().unwrap();
+
+    // The daemon starts with no Gateway, so nothing but its startup resolves
+    // the link before the upgrade below removes its keg.
+    let runtime_path = root.child("ocm-home/supervisor/runtime.json");
+    let mut command = Command::new("/bin/sh");
+    command
+        .args([
+            "-c",
+            "printf '%s\\n' \"$$\" > \"$OCM_TEST_NATIVE_DAEMON_PID_FILE\" || exit 1; exec \"$@\"",
+            "ocm-daemon-fixture",
+        ])
+        .arg(&binary)
+        .args(["__daemon", "run"])
+        .current_dir(&cwd)
+        .env_clear()
+        .envs(&env)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut daemon = (0..5)
+        .find_map(|_| match command.spawn() {
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                sleep(Duration::from_millis(20));
+                None
+            }
+            result => Some(result.unwrap()),
+        })
+        .expect("copied ocm stayed busy");
+    let started = wait_for_runtime_children(&runtime_path, 0, None, Duration::from_secs(5));
+    if started.is_none() {
+        stop_process(&mut daemon);
+        panic!("daemon did not publish its runtime state");
+    }
+
+    let new_keg = prefix.join("Cellar/ocm/0.3.9/bin");
+    fs::create_dir_all(&new_keg).unwrap();
+    fs::write(new_keg.join("ocm"), "").unwrap();
+    fs::remove_file(prefix.join("bin/ocm")).unwrap();
+    std::os::unix::fs::symlink("../Cellar/ocm/0.3.9/bin/ocm", prefix.join("bin/ocm")).unwrap();
+    fs::remove_dir_all(&keg).unwrap();
+
+    set_service_enabled(&cwd, &env, "demo", true);
+    service.sync().unwrap();
+    let recorded = wait_for_file(&marker, Duration::from_secs(10));
+    stop_process(&mut daemon);
+    assert!(recorded, "the daemon did not start the Gateway");
+    assert_eq!(
+        fs::read_to_string(&marker).unwrap(),
+        path_string(&prefix.join("bin/ocm"))
+    );
+}
+
 #[test]
 fn daemon_run_once_executes_planned_children() {
     let _guard = daemon_runtime_test_lock();

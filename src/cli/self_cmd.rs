@@ -12,7 +12,7 @@ use serde::Serialize;
 use super::self_update_transaction::{Phase, Transaction, current_executable};
 use crate::infra::archive::extract_tar_gz;
 use crate::infra::download::{download_to_writer, http_agent, verify_file_sha256};
-use crate::infra::install_owner::NpmInstallation;
+use crate::infra::install_owner::{HomebrewKeg, NpmInstallation};
 
 use super::{Cli, render};
 
@@ -299,15 +299,7 @@ impl Cli {
                 .current_binary_path()?
                 .canonicalize()
                 .map_err(|error| format!("failed to resolve the current ocm binary: {error}"))?;
-            if let Some(bin) = binary.parent()
-                && bin.file_name().is_some_and(|name| name == "bin")
-                && let Some(keg) = bin.parent()
-                && keg
-                    .parent()
-                    .and_then(Path::file_name)
-                    .is_some_and(|name| name == "ocm")
-                && keg.join("INSTALL_RECEIPT.json").is_file()
-            {
+            if HomebrewKeg::from_executable(&binary).is_some() {
                 return Err(
                     "Homebrew manages this ocm installation; run `brew upgrade openclaw/tap/ocm` instead"
                         .to_string(),

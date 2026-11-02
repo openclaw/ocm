@@ -2840,6 +2840,98 @@ fn npx_cannot_rebind_daemon_but_can_inspect_and_stop_it() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn homebrew_keg_service_records_the_link_brew_upgrade_keeps() {
+    use std::os::unix::fs::symlink;
+    for case in [
+        "bin",
+        "opt",
+        "loop",
+        "none",
+        "other keg",
+        "dangling",
+        "no receipt",
+    ] {
+        let root = TestDir::new("service-homebrew-keg");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let env = systemd_env(&root);
+        setup_launcher_env(&cwd, &env);
+        let prefix = fs::canonicalize(root.path()).unwrap().join("linuxbrew");
+        let keg = prefix.join("Cellar/ocm/0.3.8");
+        let binary = keg.join("bin/ocm");
+        copy_test_ocm_binary(&binary);
+        if case != "no receipt" {
+            fs::write(keg.join("INSTALL_RECEIPT.json"), "{}").unwrap();
+        }
+        fs::create_dir_all(prefix.join("bin")).unwrap();
+        fs::create_dir_all(prefix.join("opt")).unwrap();
+        let bin_link = prefix.join("bin/ocm");
+        let expected = match case {
+            "bin" => {
+                symlink("../Cellar/ocm/0.3.8/bin/ocm", &bin_link).unwrap();
+                symlink("../Cellar/ocm/0.3.8", prefix.join("opt/ocm")).unwrap();
+                bin_link
+            }
+            "opt" => {
+                symlink("../Cellar/ocm/0.3.8", prefix.join("opt/ocm")).unwrap();
+                prefix.join("opt/ocm/bin/ocm")
+            }
+            "loop" => {
+                symlink("ocm", &bin_link).unwrap();
+                symlink("../Cellar/ocm/0.3.8", prefix.join("opt/ocm")).unwrap();
+                prefix.join("opt/ocm/bin/ocm")
+            }
+            // A link to another installation never replaces the running keg.
+            "other keg" => {
+                write_executable_script(
+                    &prefix.join("Cellar/ocm/0.3.9/bin/ocm"),
+                    "#!/bin/sh\nexit 0\n",
+                );
+                symlink("../Cellar/ocm/0.3.9/bin/ocm", &bin_link).unwrap();
+                binary.clone()
+            }
+            "dangling" | "no receipt" => {
+                let target = if case == "dangling" { "0.3.7" } else { "0.3.8" };
+                symlink(format!("../Cellar/ocm/{target}/bin/ocm"), &bin_link).unwrap();
+                binary.clone()
+            }
+            _ => binary.clone(),
+        };
+
+        // Linux reports a linked Homebrew executable by its keg path; macOS
+        // reports the invoked link. Both spellings must record the same path.
+        let mut invocations = vec![binary.clone()];
+        if case == "bin" {
+            invocations.push(prefix.join("bin/ocm"));
+        }
+        let expected = path_string(&expected);
+        for invoked in invocations {
+            let definition_path = managed_service_definition_path(&env, &cwd, "ocm");
+            let _ = fs::remove_file(&definition_path);
+            let output = crate::support::run_ocm_binary(
+                &invoked,
+                &cwd,
+                &env,
+                &["service", "install", "demo"],
+            );
+            assert!(output.status.success(), "{case}: {}", stderr(&output));
+            let definition = fs::read_to_string(&definition_path).unwrap();
+            assert!(
+                definition.contains(&format!("\nExecStart={expected} __daemon run\n")),
+                "{case} via {}: {definition}",
+                invoked.display()
+            );
+            assert!(
+                definition.contains(&format!("Environment=\"OCM_SELF={expected}\"")),
+                "{case} via {}: {definition}",
+                invoked.display()
+            );
+        }
+    }
+}
+
 #[test]
 fn systemd_service_lifecycle_uses_the_configured_unit_directory() {
     for setting in ["unset", "empty", "relative", "absolute"] {
