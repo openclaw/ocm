@@ -1180,7 +1180,7 @@ fn retry_service_manager_executable_busy<T>(
     unreachable!("busy retry loop always returns on its final attempt")
 }
 
-fn service_manager_detail(output: &Output) -> String {
+pub(crate) fn service_manager_detail(output: &Output) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     if !stderr.is_empty() {
         return stderr;

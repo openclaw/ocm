@@ -1347,6 +1347,73 @@ fn service_start_refuses_failed_or_unknown_manager_observations() {
 }
 
 #[test]
+fn service_activation_reports_unreachable_manager_error() {
+    for systemd in [false, true] {
+        let root = TestDir::new("service-activation-unreachable-manager");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let env = if systemd {
+            systemd_env(&root)
+        } else {
+            launchd_env(&root)
+        };
+        setup_launcher_env(&cwd, &env);
+        // The manager answers every call the way an unreachable user session does.
+        let (binary, log, cause, unreachable) = if systemd {
+            (
+                "systemctl",
+                "systemctl.log",
+                "systemctl --user show failed: Failed to connect to bus: No medium found",
+                "printf 'Failed to connect to bus: No medium found\\n' >&2; exit 1",
+            )
+        } else {
+            (
+                "launchctl",
+                "launchctl.log",
+                "launchctl print failed: Bad request.\nCould not find domain for user gui: 501",
+                "printf 'Bad request.\\nCould not find domain for user gui: 501\\n' >&2; exit 113",
+            )
+        };
+        let manager = root.child(format!("fake-bin/{binary}"));
+        let log = root.child(log);
+        write_executable_script(
+            &manager,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n{unreachable}\n",
+                path_string(&log)
+            ),
+        );
+        let definition = managed_service_definition_path(&env, &cwd, "ocm");
+        for command in ["install", "start", "restart"] {
+            let output = run_ocm(&cwd, &env, &["service", command, "demo"]);
+            assert!(!output.status.success(), "systemd={systemd}, {command}");
+            let error = stderr(&output);
+            assert!(
+                error.contains(&format!(
+                    "failed to inspect managed service ai.openclaw.ocm: {cause}; activation was refused to preserve running services"
+                )),
+                "systemd={systemd}, {command}: {error}"
+            );
+            assert!(!definition.exists(), "systemd={systemd}, {command}");
+            let shown = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
+            assert_eq!(json_output(&shown)["serviceEnabled"], false);
+            assert_eq!(json_output(&shown)["serviceRunning"], false);
+        }
+        let calls = fs::read_to_string(&log).unwrap();
+        for line in calls.lines() {
+            assert!(
+                if systemd {
+                    line.starts_with("--user show ")
+                } else {
+                    line.starts_with("print ")
+                },
+                "unexpected manager call: {line}"
+            );
+        }
+    }
+}
+
+#[test]
 fn service_start_rechecks_running_daemon_before_activation() {
     for systemd in [false, true] {
         for stopped in [false, true] {
