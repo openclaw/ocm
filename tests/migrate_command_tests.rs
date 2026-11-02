@@ -5482,6 +5482,20 @@ fn migrate_and_adopt_expand_home_relative_paths_with_placeholders_before_substit
             format!("{home_path}/logs/${{LOG_NAME}}.log")
         );
         assert_eq!(copied["messages"]["responsePrefix"], "~/${NAME}");
+        // The kept entry is named, because its placeholder may leave
+        // `~/.openclaw` once substituted.
+        let warnings = stderr(&imported);
+        assert_eq!(
+            warnings
+                .lines()
+                .filter(|line| line.starts_with(
+                    "warning: env copied keeps the ~/.openclaw entries of skills.load.extraDirs[] that contain a ${VAR} placeholder"
+                ))
+                .count(),
+            1,
+            "adopt={adopt}: {warnings}"
+        );
+        assert!(!warnings.contains("logging.file"), "{warnings}");
     }
 }
 
@@ -5506,6 +5520,8 @@ fn migrate_and_adopt_expand_worker_folders_without_resolving_parent_traversal() 
                 "~/hop/../work",
                 "~/.openclaw/wf",
                 "~/.openclaw/../work",
+                // `missing` does not exist, so OpenClaw rejects this entry.
+                "~/.openclaw/missing/../wf",
                 " ~/work",
             ]}}
         });
@@ -5534,6 +5550,9 @@ fn migrate_and_adopt_expand_worker_folders_without_resolving_parent_traversal() 
                 // Leaves the state directory, so the relocation of copied
                 // state paths keeps it.
                 format!("{home_path}/.openclaw/../work"),
+                // Kept, so it still names a missing directory in the copy
+                // instead of being resolved to the copied `wf`.
+                "~/.openclaw/missing/../wf",
                 // OpenClaw does not trim, so this is not home-relative.
                 " ~/work",
             ]),
@@ -5593,9 +5612,9 @@ fn migrate_and_adopt_keep_home_relative_trust_roots_and_name_them() {
             assert_eq!(
                 warnings
                     .lines()
-                    .filter(|line| line
-                        .starts_with("warning: env copied keeps the ~/ entries of trust root")
-                        && line.contains(&format!(" {setting} ")))
+                    .filter(|line| line.starts_with(&format!(
+                        "warning: env copied keeps the ~/ entries of trust root {setting}[] as written"
+                    )))
                     .count(),
                 1,
                 "adopt={adopt}: {warnings}"

@@ -38,9 +38,27 @@ pub(crate) struct OpenClawConfigAudit {
 pub(crate) struct OpenClawConfigRewriteOutcome {
     pub cleared_sandbox_origin: bool,
     pub sandbox_port: Option<u32>,
-    /// Trust-root settings whose home-relative entries migration kept as
-    /// written, so they now resolve under the environment root.
-    pub kept_home_relative_trust_roots: Vec<String>,
+    /// Settings whose home-relative entries migration kept as written
+    /// although they may now resolve under the environment root.
+    pub kept_home_relative_settings: Vec<KeptHomeRelativeSetting>,
+}
+
+/// A setting whose home-relative entries migration kept as written, because
+/// spelling them out could change what it means.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct KeptHomeRelativeSetting {
+    /// The setting's path, with `[]` for a list entry.
+    pub setting: String,
+    pub reason: KeptHomeRelativeReason,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum KeptHomeRelativeReason {
+    /// A trust root: spelling it out would change what the environment trusts.
+    TrustRoot,
+    /// A value under `~/.openclaw` with a `${VAR}` placeholder, which may
+    /// lead outside the state directory once substituted.
+    Placeholder,
 }
 
 pub(crate) fn audit_openclaw_config(
@@ -214,7 +232,7 @@ pub(crate) fn rewrite_openclaw_config_for_migration(
     gateway_port: Option<u32>,
     sandbox_origin: Option<&str>,
 ) -> Result<OpenClawConfigRewriteOutcome, String> {
-    let kept_trust_roots = expand_migrated_home_relative_paths(target_paths, source_home)?;
+    let kept = expand_migrated_home_relative_paths(target_paths, source_home)?;
     rewrite_migrated_plugin_load_paths(
         target_paths,
         source_state_root,
@@ -226,7 +244,7 @@ pub(crate) fn rewrite_openclaw_config_for_migration(
         gateway_port,
         SandboxOriginPolicy::NewEnvironment(sandbox_origin),
     )?;
-    outcome.kept_home_relative_trust_roots = kept_trust_roots.into_iter().collect();
+    outcome.kept_home_relative_settings = kept.into_iter().collect();
     Ok(outcome)
 }
 
@@ -236,18 +254,18 @@ pub(crate) fn rewrite_openclaw_config_for_migration(
 /// directory; every other home-relative path setting is spelled out against
 /// the source home so it keeps naming the same location. Absolute values
 /// inside the source state directory are then relocated by the later rewrites.
-/// Returns the trust-root settings whose home-relative entries were kept as
-/// written.
+/// Returns the settings whose home-relative entries were kept as written
+/// although they may now resolve elsewhere.
 fn expand_migrated_home_relative_paths(
     target: &EnvPaths,
     source_home: &Path,
-) -> Result<BTreeSet<String>, String> {
-    let mut kept_trust_roots = BTreeSet::new();
+) -> Result<BTreeSet<KeptHomeRelativeSetting>, String> {
+    let mut kept = BTreeSet::new();
     if !source_home.is_absolute() {
-        return Ok(kept_trust_roots);
+        return Ok(kept);
     }
     let Some(effective) = load_effective_openclaw_config(&target.config_path)? else {
-        return Ok(kept_trust_roots);
+        return Ok(kept);
     };
     let mut scopes = effective.include_scopes;
     scopes.insert(target.config_path.clone(), BTreeSet::from([Vec::new()]));
@@ -258,12 +276,7 @@ fn expand_migrated_home_relative_paths(
         let mut rewritten = None;
         for mut scope in scopes {
             let mut candidate = value.clone();
-            expand_home_relative_paths_in_scope(
-                &mut candidate,
-                &mut scope,
-                source_home,
-                &mut kept_trust_roots,
-            );
+            expand_home_relative_paths_in_scope(&mut candidate, &mut scope, source_home, &mut kept);
             if rewritten
                 .as_ref()
                 .is_some_and(|previous| previous != &candidate)
@@ -279,34 +292,48 @@ fn expand_migrated_home_relative_paths(
             write_copied_config_value(&path, &target.state_dir, &rewritten)?;
         }
     }
-    Ok(kept_trust_roots)
+    Ok(kept)
 }
 
 /// Expands the home-relative path settings in a config fragment included at
-/// `scope`, and records the trust-root settings it keeps as written.
-/// `$include` directives keep their own relocation.
+/// `scope`, and records the settings it keeps as written although they may
+/// now resolve elsewhere. `$include` directives keep their own relocation.
 fn expand_home_relative_paths_in_scope(
     value: &mut Value,
     scope: &mut Vec<ConfigSegment>,
     home: &Path,
-    kept_trust_roots: &mut BTreeSet<String>,
+    kept: &mut BTreeSet<KeptHomeRelativeSetting>,
 ) -> bool {
     match value {
         Value::String(raw) => {
-            let expanded = match home_relative_path_setting(scope) {
-                Some(HomePathRule::Lexical { trims }) => {
-                    expand_home_relative_path(raw, home, trims)
+            let Some(rule) = home_relative_path_setting(scope) else {
+                return false;
+            };
+            let (expanded, trims) = match rule {
+                HomePathRule::Lexical { trims } => {
+                    (expand_home_relative_path(raw, home, trims), trims)
                 }
-                Some(HomePathRule::Physical) => expand_physical_home_relative_path(raw, home),
-                Some(HomePathRule::TrustRoot(setting)) => {
-                    if expand_home_relative_path(raw, home, true).is_some() {
-                        kept_trust_roots.insert(setting.to_string());
+                HomePathRule::Physical => (expand_physical_home_relative_path(raw, home), false),
+                HomePathRule::TrustRoot => {
+                    let moves = expand_home_relative_path(raw, home, true).is_some()
+                        || has_home_relative_placeholder(raw, true);
+                    if moves {
+                        kept.insert(KeptHomeRelativeSetting {
+                            setting: config_setting_name(scope),
+                            reason: KeptHomeRelativeReason::TrustRoot,
+                        });
                     }
-                    None
+                    return false;
                 }
-                None => None,
             };
             let Some(expanded) = expanded else {
+                // A placeholder under `~/.openclaw` can still lead outside it.
+                if has_home_relative_placeholder(raw, trims) {
+                    kept.insert(KeptHomeRelativeSetting {
+                        setting: config_setting_name(scope),
+                        reason: KeptHomeRelativeReason::Placeholder,
+                    });
+                }
                 return false;
             };
             *raw = expanded;
@@ -316,8 +343,7 @@ fn expand_home_relative_paths_in_scope(
             let mut changed = false;
             for (index, nested) in values.iter_mut().enumerate() {
                 scope.push(ConfigSegment::Index(index));
-                changed |=
-                    expand_home_relative_paths_in_scope(nested, scope, home, kept_trust_roots);
+                changed |= expand_home_relative_paths_in_scope(nested, scope, home, kept);
                 scope.pop();
             }
             changed
@@ -326,8 +352,7 @@ fn expand_home_relative_paths_in_scope(
             let mut changed = false;
             for (key, nested) in values.iter_mut().filter(|(key, _)| *key != "$include") {
                 scope.push(ConfigSegment::Key(key.clone()));
-                changed |=
-                    expand_home_relative_paths_in_scope(nested, scope, home, kept_trust_roots);
+                changed |= expand_home_relative_paths_in_scope(nested, scope, home, kept);
                 scope.pop();
             }
             changed
@@ -345,9 +370,26 @@ enum HomePathRule {
     /// The leading `~` is replaced and the path is resolved through links
     /// (`realpath`), so a link before `..` decides where it leads.
     Physical,
-    /// A trust root, named here. Spelling it out would change what the
-    /// environment trusts, so it stays as written and is reported.
-    TrustRoot(&'static str),
+    /// A trust root. Spelling it out would change what the environment
+    /// trusts, so it stays as written and is reported.
+    TrustRoot,
+}
+
+/// The setting at `scope` as users write it, with `[]` for a list entry.
+fn config_setting_name(scope: &[ConfigSegment]) -> String {
+    let mut name = String::new();
+    for segment in scope {
+        match segment {
+            ConfigSegment::Key(key) => {
+                if !name.is_empty() {
+                    name.push('.');
+                }
+                name.push_str(key);
+            }
+            ConfigSegment::Index(_) => name.push_str("[]"),
+        }
+    }
+    name
 }
 
 /// Settings whose own OpenClaw consumers expand `~` against `OPENCLAW_HOME`
@@ -398,11 +440,11 @@ const CONSUMER_HOME_PATH_SETTINGS: &[(&[&str], HomePathRule)] = &[
     // src/skills/loading/symlink-targets.ts and src/security/install-policy.ts
     (
         &["skills", "load", "allowSymlinkTargets", "[]"],
-        HomePathRule::TrustRoot("skills.load.allowSymlinkTargets"),
+        HomePathRule::TrustRoot,
     ),
     (
         &["security", "installPolicy", "exec", "trustedDirs", "[]"],
-        HomePathRule::TrustRoot("security.installPolicy.exec.trustedDirs"),
+        HomePathRule::TrustRoot,
     ),
 ];
 
@@ -473,6 +515,17 @@ fn is_home_relative(value: &str) -> bool {
     value == "~" || value.starts_with("~/") || value.starts_with("~\\")
 }
 
+/// Whether OpenClaw would read `raw` as a home-relative value containing a
+/// `${VAR}` placeholder.
+fn has_home_relative_placeholder(raw: &str, trims: bool) -> bool {
+    let value = if trims {
+        raw.trim_matches(is_ecmascript_whitespace)
+    } else {
+        raw
+    };
+    is_home_relative(value) && value.contains("${")
+}
+
 /// Splits a home-relative value before the separator that precedes its
 /// first `${VAR}` placeholder. OpenClaw substitutes placeholders before it
 /// resolves the path, so a placeholder's value can still add `..` or name
@@ -512,32 +565,37 @@ fn expand_home_relative_path(raw: &str, home: &Path, trims: bool) -> Option<Stri
     let expanded = expanded.to_str()?;
     if expanded.ends_with(std::path::is_separator) {
         // The literal part resolved to a filesystem root.
-        rest = &rest[1..];
+        rest = rest.strip_prefix(std::path::is_separator).unwrap_or(rest);
     }
     Some(format!("{expanded}{rest}"))
 }
 
 /// Expands a setting OpenClaw resolves through links. Only the leading `~`
 /// is replaced: the consumer follows each link before the `..` after it,
-/// which removing `..` here would change. A value under `~/.openclaw` with
-/// no `..` already names the copied state directory and stays as written;
-/// the later relocation follows links the same way the consumer does.
+/// which removing `..` here would change. A value under `~/.openclaw`
+/// already names the copied state directory and stays as written, unless
+/// its `..` leads to an existing directory: the later relocation of state
+/// paths then follows links as the consumer does, but it would also step
+/// over a missing directory that makes the consumer reject the entry.
 fn expand_physical_home_relative_path(raw: &str, home: &Path) -> Option<String> {
     if !is_home_relative(raw) {
         return None;
     }
-    let (literal, _) = split_before_placeholder(raw);
+    let (literal, rest) = split_before_placeholder(raw);
     let mut literal_path = home.as_os_str().to_os_string();
     literal_path.push(&literal[1..]);
     let literal_path = Path::new(&literal_path);
+    let expanded = format!("{}{}", home.to_str()?, &raw[1..]);
     if literal_path.starts_with(home.join(".openclaw"))
-        && !literal_path
-            .components()
-            .any(|component| component == std::path::Component::ParentDir)
+        && (!rest.is_empty()
+            || !literal_path
+                .components()
+                .any(|component| component == std::path::Component::ParentDir)
+            || fs::canonicalize(&expanded).is_err())
     {
         return None;
     }
-    Some(format!("{}{}", home.to_str()?, &raw[1..]))
+    Some(expanded)
 }
 
 /// Moves a Gateway port that a copied `$include` supplies to `gateway_port`,
@@ -3094,6 +3152,17 @@ mod tests {
             Some("/home/alice/dev/p${N}.log")
         );
         assert_eq!(expand("~/../../${X}").as_deref(), Some("/${X}"));
+        // A value that resolves to the filesystem root has nothing after it.
+        assert_eq!(expand("~/../..").as_deref(), Some("/"));
+        assert_eq!(
+            expand_home_relative_path("~", Path::new("/"), true).as_deref(),
+            Some("/")
+        );
+        // On POSIX `\` is part of the name, which stays after a root home.
+        assert_eq!(
+            expand_home_relative_path("~\\${X}", Path::new("/"), true).as_deref(),
+            Some("/\\${X}")
+        );
         assert_eq!(expand("~/.openclaw/${SUB}/x"), None);
         assert_eq!(
             expand("~/.openclaw/../${SUB}").as_deref(),
@@ -3152,13 +3221,11 @@ mod tests {
         );
         assert_eq!(
             setting(&["skills", "load", "allowSymlinkTargets", "[]"]),
-            Some(HomePathRule::TrustRoot("skills.load.allowSymlinkTargets"))
+            Some(HomePathRule::TrustRoot)
         );
         assert_eq!(
             setting(&["security", "installPolicy", "exec", "trustedDirs", "[]"]),
-            Some(HomePathRule::TrustRoot(
-                "security.installPolicy.exec.trustedDirs"
-            ))
+            Some(HomePathRule::TrustRoot)
         );
         for text in [
             &["messages", "responsePrefix"][..],
@@ -3201,17 +3268,21 @@ mod tests {
             expand("~/hop/../work").as_deref(),
             Some("/home/alice/hop/../work")
         );
-        assert_eq!(
-            expand("~/.openclaw/../work").as_deref(),
-            Some("/home/alice/.openclaw/../work")
-        );
+        // Under `~/.openclaw`, `..` is spelled out only when it leads to an
+        // existing directory; this home does not exist.
+        assert_eq!(expand("~/.openclaw/../work"), None);
         assert_eq!(
             expand("~/${SUB}/work").as_deref(),
             Some("/home/alice/${SUB}/work")
         );
         // The consumer does not trim.
         assert_eq!(expand(" ~/work"), None);
-        for copied in ["~/.openclaw", "~/.openclaw/wf", "~/.openclaw/${SUB}"] {
+        for copied in [
+            "~/.openclaw",
+            "~/.openclaw/wf",
+            "~/.openclaw/${SUB}",
+            "~/.openclaw/a/../${SUB}",
+        ] {
             assert_eq!(expand(copied), None, "{copied}");
         }
         assert_eq!(
@@ -3258,6 +3329,10 @@ mod tests {
         assert_eq!(
             home_relative_path_setting(scopes.first().unwrap()),
             Some(HomePathRule::Lexical { trims: true })
+        );
+        assert_eq!(
+            config_setting_name(scopes.first().unwrap()),
+            "hooks.items[].paths[]"
         );
     }
 

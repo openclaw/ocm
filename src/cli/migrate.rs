@@ -169,9 +169,9 @@ impl Cli {
             result.sandbox_port,
         );
         self.warn_external_migration_plugins(&result.external_plugin_ids);
-        self.warn_kept_home_relative_trust_roots(
+        self.warn_kept_home_relative_settings(
             &result.summary.name,
-            &result.kept_home_relative_trust_roots,
+            &result.kept_home_relative_settings,
         );
         let summary = result.summary;
 
@@ -215,9 +215,9 @@ impl Cli {
             result.sandbox_port,
         );
         self.warn_external_migration_plugins(&result.external_plugin_ids);
-        self.warn_kept_home_relative_trust_roots(
+        self.warn_kept_home_relative_settings(
             &result.summary.name,
-            &result.kept_home_relative_trust_roots,
+            &result.kept_home_relative_settings,
         );
         let summary = result.summary;
 
@@ -251,11 +251,21 @@ impl Cli {
         }
     }
 
-    fn warn_kept_home_relative_trust_roots(&self, env_name: &str, settings: &[String]) {
-        for setting in settings {
-            self.stderr_line(format!(
-                "warning: env {env_name} keeps the ~/ entries of trust root {setting} as written; they now resolve under the env root instead of the source home, so OCM did not carry that trust over. Replace them with absolute paths to keep trusting the original directories"
-            ));
+    fn warn_kept_home_relative_settings(
+        &self,
+        env_name: &str,
+        settings: &[crate::store::KeptHomeRelativeSetting],
+    ) {
+        for kept in settings {
+            let setting = &kept.setting;
+            self.stderr_line(match kept.reason {
+                crate::store::KeptHomeRelativeReason::TrustRoot => format!(
+                    "warning: env {env_name} keeps the ~/ entries of trust root {setting} as written; they now resolve under the env root instead of the source home, so OCM did not carry that trust over. Replace them with absolute paths to keep trusting the original directories"
+                ),
+                crate::store::KeptHomeRelativeReason::Placeholder => format!(
+                    "warning: env {env_name} keeps the ~/.openclaw entries of {setting} that contain a ${{VAR}} placeholder as written; if a placeholder leads outside ~/.openclaw, the entry now resolves under the env root instead of the source home. Replace such entries with absolute paths"
+                ),
+            });
         }
     }
 
