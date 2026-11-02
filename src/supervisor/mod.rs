@@ -2165,6 +2165,9 @@ fn open_child_log(
 #[cfg(unix)]
 fn supervisor_self_executable() -> Result<PathBuf, String> {
     static HOMEBREW_LINK: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    if let Some(Some(link)) = HOMEBREW_LINK.get() {
+        return Ok(link.clone());
+    }
     let current = std::env::current_exe().map_err(|error| error.to_string())?;
     let link = HOMEBREW_LINK.get_or_init(|| {
         let durable = crate::infra::install_owner::durable_executable_path(&current);
