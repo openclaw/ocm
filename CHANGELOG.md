@@ -6,6 +6,7 @@ All notable changes to OCM are documented here.
 
 ### Fixed
 
+- Keep the gateway running when `ocm upgrade batch` refuses an environment before cutover under the default `--failure-policy continue`, as a single-environment upgrade and the rollback policy already did. Failures after cutover still leave the gateway stopped for external recovery, and environments without an installed service no longer report a stopped gateway.
 - Remove the incomplete environment root and import staging when `env clone` or `env import` is stopped by SIGINT, SIGTERM or SIGHUP, and exit with status 130. Retrying the same name now succeeds instead of failing on a non-empty root that no OCM command could remove. Signals ignored at startup, as under `nohup`, stay ignored.
 - Remove the temporary GitHub PR checkout when SIGINT, SIGTERM or SIGHUP stops `upgrade simulate` while it resolves a PR target, and report the interruption instead of leaving the checkout in the system temp directory.
 - Refuse new environment roots that are `OCM_HOME`, contain it, or overlap one of OCM's store directories there, such as `runtimes`, `launchers` or `snapshots`, so removing that environment can no longer delete other environments' runtimes, launchers or snapshots. Roots inside `envs` and disjoint roots elsewhere under `OCM_HOME` remain valid.

@@ -817,6 +817,226 @@ fn assert_refused_preflights(launcher: bool, explicit: bool) {
 }
 
 #[test]
+fn upgrade_batch_continue_keeps_gateway_refused_before_cutover() {
+    let root = TestDir::new("upgrade-batch-continue-precutover");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let available = Arc::new(AtomicBool::new(true));
+    let health_server = ControlledHealthServer::start(Arc::clone(&available));
+    let mut env = ocm_env(&root);
+    env.insert("OCM_INTERNAL_SERVICE_MANAGER".into(), "launchd".into());
+    install_fake_launchctl(&root, &mut env);
+    env.insert(
+        "OCM_TEST_NATIVE_DAEMON_PID".into(),
+        std::process::id().to_string(),
+    );
+    let receipt_path = root.child("preflight-receipt.json");
+    fs::write(
+        &receipt_path,
+        preflight_receipt_json("blocked", "2026.8.14").to_string(),
+    )
+    .unwrap();
+    for (key, value) in [
+        ("OCM_TEST_PREFLIGHT_RECEIPT", path_string(&receipt_path)),
+        (
+            "OCM_TEST_PREFLIGHT_OBSERVATION",
+            path_string(&root.child("preflight-observation")),
+        ),
+        ("OCM_TEST_PREFLIGHT_EXIT", "3".to_string()),
+    ] {
+        env.insert(key.into(), value);
+    }
+
+    // `refused` advertises the native preflight, which blocks startup before
+    // cutover. `broken` is a legacy package whose cold finalization fails after
+    // the source gateway was stopped.
+    let finalize = "    if [ \"$2\" = \"finalize\" ]; then\n";
+    let broken_script = fixture_openclaw_script("2026.8.15").replacen(
+        finalize,
+        &format!("{finalize}      printf 'synthetic finalize failure\\n' >&2\n      exit 23\n"),
+        1,
+    );
+    assert_ne!(broken_script, fixture_openclaw_script("2026.8.15"));
+    for (name, version, script, preflight) in [
+        (
+            "old",
+            "2026.8.13",
+            fixture_openclaw_script("2026.8.13"),
+            false,
+        ),
+        (
+            "refused",
+            "2026.8.14",
+            fixture_openclaw_script("2026.8.14"),
+            true,
+        ),
+        ("broken", "2026.8.15", broken_script, false),
+    ] {
+        let package = root.child(format!("packages/{name}"));
+        fs::create_dir_all(&package).unwrap();
+        support::write_executable_script(&package.join("openclaw.mjs"), &script);
+        let mut manifest = serde_json::json!({
+            "name": "openclaw",
+            "version": version,
+            "bin": {"openclaw": "openclaw.mjs"}
+        });
+        if preflight {
+            manifest["openclaw"] = serde_json::json!({"updatePreflightProtocol": 1});
+        }
+        fs::write(package.join("package.json"), manifest.to_string()).unwrap();
+        let added = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "runtime",
+                "add",
+                name,
+                "--path",
+                &path_string(&package.join("openclaw.mjs")),
+            ],
+        );
+        assert!(added.status.success(), "{}", stderr(&added));
+    }
+
+    // demo runs a supervised Gateway; peer has no installed service.
+    let port = health_server.port.to_string();
+    for args in [
+        vec!["env", "create", "demo", "--runtime", "old", "--port", &port],
+        vec!["env", "create", "peer", "--runtime", "old"],
+    ] {
+        let created = run_ocm(&cwd, &env, &args);
+        assert!(created.status.success(), "{}", stderr(&created));
+    }
+    for name in ["demo", "peer"] {
+        let meta = ocm::store::get_environment(name, &env, &cwd).unwrap();
+        fs::write(
+            ocm::store::derive_env_paths(&meta.root).config_path,
+            br#"{"gateway":{"mode":"local","auth":{"mode":"token","token":"synthetic-token"}}}"#,
+        )
+        .unwrap();
+    }
+    let started = run_ocm(&cwd, &env, &["service", "start", "demo"]);
+    assert!(started.status.success(), "{}", stderr(&started));
+    let registry_path = env_registry_path(&env, &cwd).unwrap();
+    let runtime_path = supervisor_runtime_path(&env, &cwd).unwrap();
+    fs::create_dir_all(runtime_path.parent().unwrap()).unwrap();
+    let ocm_home = env["OCM_HOME"].clone();
+    write_running_supervisor_runtime(
+        &runtime_path,
+        &ocm_home,
+        "runtime",
+        "old",
+        4242,
+        health_server.port,
+    );
+    // Mirror the supervisor: the Gateway runs exactly while its service is desired.
+    let done = Arc::new(AtomicBool::new(false));
+    let observer_done = Arc::clone(&done);
+    let observer_available = Arc::clone(&available);
+    let observer_runtime = runtime_path.clone();
+    let observer_registry = registry_path.clone();
+    let health_port = health_server.port;
+    let observer = thread::spawn(move || {
+        let mut was_running = true;
+        while !observer_done.load(Ordering::Relaxed) {
+            let running = env_desired_running(&observer_registry, was_running);
+            if running != was_running {
+                if running {
+                    write_running_supervisor_runtime(
+                        &observer_runtime,
+                        &ocm_home,
+                        "runtime",
+                        "old",
+                        4242,
+                        health_port,
+                    );
+                } else {
+                    write_empty_supervisor_runtime(&observer_runtime, &ocm_home);
+                }
+                observer_available.store(running, Ordering::SeqCst);
+                was_running = running;
+            }
+            sleep(Duration::from_millis(1));
+        }
+    });
+    let batch = |runtime: &str, policy: &[&str]| {
+        let mut args = vec![
+            "upgrade",
+            "batch",
+            "--runtime",
+            runtime,
+            "--envs",
+            "demo,peer",
+        ];
+        args.extend(policy);
+        args.extend(["--accept-fleet-outage", "--json"]);
+        let output = run_ocm(&cwd, &env, &args);
+        let summary: Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|_| panic!("{runtime}: {}", stderr(&output)));
+        assert!(!output.status.success(), "{summary}");
+        summary
+    };
+    let result = |summary: &Value, name: &str| {
+        summary["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["envName"] == name)
+            .unwrap_or_else(|| panic!("{name} missing: {summary}"))
+            .clone()
+    };
+    let desired_running = || {
+        let status = run_ocm(&cwd, &env, &["service", "status", "demo", "--json"]);
+        assert!(status.status.success(), "{}", stderr(&status));
+        serde_json::from_slice::<Value>(&status.stdout).unwrap()["desiredRunning"].clone()
+    };
+
+    // The default policy is continue; a refusal before cutover changes nothing.
+    let refused = batch("refused", &[]);
+    assert_eq!(refused["failurePolicy"], "continue", "{refused}");
+    assert_eq!(desired_running(), true, "{refused}");
+    assert_eq!(health_observation(health_server.port), Some(true));
+    for name in ["demo", "peer"] {
+        let item = result(&refused, name);
+        assert_eq!(item["outcome"], "failed", "{item}");
+        assert!(item["snapshotId"].is_null(), "{item}");
+        assert!(item["rollback"].is_null(), "{item}");
+        let note = item["note"].as_str().unwrap();
+        assert!(note.contains("failed before cutover"), "{note}");
+        assert!(
+            note.contains("candidate update preflight blocked"),
+            "{note}"
+        );
+        assert!(!note.contains("left the gateway stopped"), "{note}");
+    }
+
+    // A failure after cutover still leaves the Gateway stopped for recovery.
+    let failed = batch("broken", &["--failure-policy", "continue"]);
+    let demo = result(&failed, "demo");
+    assert_eq!(demo["outcome"], "failed", "{demo}");
+    assert_eq!(demo["rollback"], "disabled", "{demo}");
+    assert!(demo["snapshotId"].is_string(), "{demo}");
+    let note = demo["note"].as_str().unwrap();
+    assert!(
+        note.contains("failure policy left the gateway stopped for external recovery"),
+        "{note}"
+    );
+    let peer = result(&failed, "peer");
+    assert_eq!(peer["rollback"], "disabled", "{peer}");
+    let note = peer["note"].as_str().unwrap();
+    assert!(!note.contains("left the gateway stopped"), "{note}");
+    assert_eq!(desired_running(), false);
+    let history = run_ocm(&cwd, &env, &["upgrade", "history", "demo", "--json"]);
+    assert!(history.status.success(), "{}", stderr(&history));
+    let history: Value = serde_json::from_slice(&history.stdout).unwrap();
+    assert_eq!(history.as_array().unwrap().len(), 1, "{history}");
+
+    done.store(true, Ordering::Relaxed);
+    observer.join().unwrap();
+    health_server.stop();
+}
+
+#[test]
 fn upgrade_prepares_target_before_cutover_and_bounds_stop_to_ready() {
     let root = TestDir::new("upgrade-availability-ordering");
     let cwd = root.child("workspace");

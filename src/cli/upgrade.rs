@@ -1058,7 +1058,11 @@ impl Cli {
                 match result {
                     Ok(mut result)
                         if failure_policy == UpgradeFleetFailurePolicy::Continue
-                            && is_failed_upgrade_outcome(&result.outcome) =>
+                            && failed_after_cutover(&result)
+                            && cli
+                                .environment_service()
+                                .get(env_name)
+                                .map_or(true, |meta| meta.service_enabled) =>
                     {
                         let stop_note = match cli.service_service().stop_locked(env_name) {
                             Ok(_) => {
@@ -6764,6 +6768,13 @@ fn is_changed_upgrade_outcome(outcome: &str) -> bool {
 
 fn is_failed_upgrade_outcome(outcome: &str) -> bool {
     matches!(outcome, "failed" | "rolled-back" | "rollback-failed")
+}
+
+/// A failure after cutover always records its rollback disposition. A refusal
+/// before cutover records none: it left the source environment and service
+/// unchanged, so there is no transition to leave stopped for external recovery.
+fn failed_after_cutover(result: &UpgradeEnvSummary) -> bool {
+    is_failed_upgrade_outcome(&result.outcome) && result.rollback.is_some()
 }
 
 pub(crate) fn is_skipped_upgrade_outcome(outcome: &str) -> bool {

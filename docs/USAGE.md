@@ -1103,6 +1103,14 @@ both checkpoint and upgrade phases. Independent lock groups still run up to
 the requested parallelism. Existing lock paths and exclusion with other OCM
 processes are preserved.
 
+`--failure-policy continue`, the default, keeps upgrading the other selected
+environments when one fails. An environment whose upgrade failed after cutover
+is left with its gateway stopped, its fleet checkpoint and its upgrade history,
+for external recovery. An environment refused before cutover, for example by a
+preparation error or a blocked startup preflight, keeps its gateway running and
+its service unchanged. `--failure-policy rollback` restores each failed
+environment immediately instead.
+
 ### Upgrade every environment that can be updated safely
 
 ```bash
