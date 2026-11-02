@@ -16,7 +16,7 @@ use rusqlite::{Connection, OpenFlags};
 #[cfg(not(target_os = "macos"))]
 use std::io::Write;
 
-use super::common::{ensure_dir, path_exists};
+use super::common::{ExclusiveFileLock, ensure_dir, lock_file, path_exists, try_lock_file};
 use super::dev_sources::projected_path_contains;
 use super::layout::display_path;
 use super::openclaw_workspaces::canonicalize_path_allow_missing;
@@ -26,6 +26,12 @@ use crate::infra::tree_digest::{inventory_tree, inventory_tree_except};
 pub(crate) const STORAGE_APFS_CLONE: &str = "apfs-clone-v1";
 pub(crate) const STORAGE_FULL_COPY: &str = "full-copy-v1";
 pub(crate) const STORAGE_TAR_ARCHIVE: &str = "tar-archive-v1";
+const PREPARATION_PREFIX: &str = ".checkpoint-preparation-";
+// The owning capture holds this lock for the workspace's whole life.
+const PREPARATION_LOCK: &str = ".lock";
+// Removal renames the lock here before releasing it, so a creator that locks
+// the file afterwards no longer finds it at `PREPARATION_LOCK`.
+const RELEASED_PREPARATION_LOCK: &str = ".lock.released";
 
 #[derive(Debug)]
 pub(crate) struct PreparedTreeCheckpoint {
@@ -48,6 +54,7 @@ pub(crate) struct CheckpointCleanup(Arc<CheckpointWorkspace>);
 struct CheckpointWorkspace {
     root: PathBuf,
     next_retired: AtomicU64,
+    lock: Option<ExclusiveFileLock>,
 }
 
 impl CheckpointCleanup {
@@ -56,15 +63,41 @@ impl CheckpointCleanup {
         // Keep cleanup attached to the allocated directory if a storage alias
         // is changed while the prepared checkpoint is retained.
         let parent = fs::canonicalize(parent).map_err(|error| error.to_string())?;
-        let root = tempfile::Builder::new()
-            .prefix(".checkpoint-preparation-")
-            .tempdir_in(parent)
-            .map_err(|error| error.to_string())?
-            .keep();
-        Ok(Self(Arc::new(CheckpointWorkspace {
-            root,
-            next_retired: AtomicU64::new(0),
-        })))
+        // A leftover that cannot be removed now does not affect this capture.
+        let _ = remove_abandoned_checkpoint_preparations(&parent);
+        // Every capture into one snapshot directory holds its environment's
+        // operation lock. Only a hand-made alias between two environments'
+        // directories lets a reclaim take a new workspace before its lock is
+        // held; allocate another one then.
+        for _ in 0..3 {
+            let root = tempfile::Builder::new()
+                .prefix(PREPARATION_PREFIX)
+                .tempdir_in(&parent)
+                .map_err(|error| error.to_string())?
+                .keep();
+            let lock_path = root.join(PREPARATION_LOCK);
+            let lock = lock_file(&lock_path, "checkpoint preparation")
+                .and_then(|lock| Ok(lock.locks_path(&lock_path)?.then_some(lock)));
+            match lock {
+                Ok(Some(lock)) => {
+                    return Ok(Self(Arc::new(CheckpointWorkspace {
+                        root,
+                        next_retired: AtomicU64::new(0),
+                        lock: Some(lock),
+                    })));
+                }
+                Ok(None) => {}
+                Err(_) if !root.exists() => {}
+                Err(error) => {
+                    let _ = remove_preparation(&root, None);
+                    return Err(error);
+                }
+            }
+        }
+        Err(format!(
+            "checkpoint preparation in {} was removed concurrently; retry the capture",
+            display_path(&parent)
+        ))
     }
 
     fn candidate(&self) -> PathBuf {
@@ -89,7 +122,9 @@ impl CheckpointCleanup {
 
 impl Drop for CheckpointWorkspace {
     fn drop(&mut self) {
-        if let Err(error) = remove_tree_if_present(&self.root) {
+        // A workspace retained here is no longer locked; a later capture or
+        // snapshot removal reclaims it.
+        if let Err(error) = remove_preparation(&self.root, self.lock.take()) {
             eprintln!(
                 "ocm: retained checkpoint preparation {}: {error}",
                 display_path(&self.root)
@@ -98,6 +133,94 @@ impl Drop for CheckpointWorkspace {
             // Remove only an empty parent; never recursively clean a shared snapshot directory.
             let _ = fs::remove_dir(parent);
         }
+    }
+}
+
+/// Removes preparation workspaces in `parent` whose capture no longer runs,
+/// such as one stopped by a signal, which skips `Drop`. A running capture, in
+/// this or another process, holds its workspace lock, so its workspace is kept.
+/// An empty workspace belongs to a capture stopped before taking its lock. A
+/// workspace holds only copies of the source, never the only copy of any data.
+pub(crate) fn remove_abandoned_checkpoint_preparations(parent: &Path) -> Result<(), String> {
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut failures = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                failures.push(error.to_string());
+                continue;
+            }
+        };
+        if !entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(PREPARATION_PREFIX))
+            || !entry.file_type().is_ok_and(|kind| kind.is_dir())
+        {
+            continue;
+        }
+        let path = entry.path();
+        let lock_path = path.join(PREPARATION_LOCK);
+        if !fs::symlink_metadata(&lock_path).is_ok_and(|metadata| metadata.is_file()) {
+            // A released lock means its contents were already removed. The
+            // directory removal fails unless it is then empty: a lockless tree
+            // is not provably a leftover.
+            let _ = fs::remove_file(path.join(RELEASED_PREPARATION_LOCK));
+            let _ = fs::remove_dir(&path);
+            continue;
+        }
+        let Ok(Some(lock)) = try_lock_file(&lock_path, "checkpoint preparation") else {
+            continue;
+        };
+        if let Err(error) = remove_preparation(&path, Some(lock)) {
+            failures.push(format!("{}: {error}", display_path(&path)));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "failed to remove abandoned checkpoint preparation {}",
+            failures.join("; ")
+        ))
+    }
+}
+
+/// Removes a workspace's contents before its lock file, so a removal that
+/// stops partway leaves a workspace that a later reclaim still recognizes.
+fn remove_preparation(root: &Path, lock: Option<ExclusiveFileLock>) -> Result<(), String> {
+    let lock_path = root.join(PREPARATION_LOCK);
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    for entry in entries {
+        let path = entry.map_err(|error| error.to_string())?.path();
+        if path != lock_path {
+            remove_tree_if_present(&path)?;
+        }
+    }
+    // Move the lock aside while still holding it: a creator that locks it
+    // afterwards finds no lock at its path and allocates another workspace.
+    // The released file is removed after its lock closes, as Windows requires.
+    let released = root.join(RELEASED_PREPARATION_LOCK);
+    match fs::rename(&lock_path, &released) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            return Err(error.to_string());
+        }
+        _ => {}
+    }
+    drop(lock);
+    remove_tree_if_present(&released)?;
+    match fs::remove_dir(root) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.to_string()),
+        _ => Ok(()),
     }
 }
 
@@ -2400,6 +2523,97 @@ mod tests {
         drop(cleanup);
         assert!(!cleanup_root.exists());
         assert!(destination.exists());
+    }
+
+    #[test]
+    fn preparation_lock_detects_a_file_replaced_before_it_was_locked() {
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path().join(super::PREPARATION_LOCK);
+        let lock = super::lock_file(&path, "checkpoint preparation").unwrap();
+        assert!(lock.locks_path(&path).unwrap());
+        // A reclaim that won the lock first removes the file this creator then locks.
+        #[cfg(unix)]
+        {
+            fs::remove_file(&path).unwrap();
+            assert!(!lock.locks_path(&path).unwrap());
+            fs::write(&path, "").unwrap();
+            assert!(!lock.locks_path(&path).unwrap());
+        }
+    }
+
+    #[test]
+    fn reclaim_removes_only_preparations_whose_capture_stopped() {
+        let source = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("state.json"), "state").unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let workspace = |name: &str| {
+            let path = storage
+                .path()
+                .join(format!("{}{name}", super::PREPARATION_PREFIX));
+            fs::create_dir_all(path.join("tree/.openclaw")).unwrap();
+            fs::write(path.join("tree/.openclaw/state.json"), "copy").unwrap();
+            path
+        };
+        // A capture stopped by a signal leaves its unlocked workspace behind.
+        let abandoned = workspace("abandoned");
+        fs::write(abandoned.join(super::PREPARATION_LOCK), "").unwrap();
+        // A capture running elsewhere, such as through an aliased snapshot
+        // directory, holds its lock through another open file.
+        let elsewhere = workspace("elsewhere");
+        let elsewhere_lock = super::lock_file(
+            &elsewhere.join(super::PREPARATION_LOCK),
+            "checkpoint preparation",
+        )
+        .unwrap();
+        let unowned = workspace("unowned");
+        // A removal stopped after releasing its lock leaves only the released file.
+        let released = storage
+            .path()
+            .join(format!("{}released", super::PREPARATION_PREFIX));
+        fs::create_dir(&released).unwrap();
+        fs::write(released.join(super::RELEASED_PREPARATION_LOCK), "").unwrap();
+        let empty = storage
+            .path()
+            .join(format!("{}empty", super::PREPARATION_PREFIX));
+        fs::create_dir(&empty).unwrap();
+        let snapshot = storage.path().join("1-000000001.checkpoint");
+        fs::create_dir(&snapshot).unwrap();
+        #[cfg(unix)]
+        let outside = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            fs::write(outside.path().join(super::PREPARATION_LOCK), "").unwrap();
+            std::os::unix::fs::symlink(
+                outside.path(),
+                storage
+                    .path()
+                    .join(format!("{}link", super::PREPARATION_PREFIX)),
+            )
+            .unwrap();
+        }
+
+        // Preparing a capture reclaims leftovers before taking its own workspace.
+        let prepared = super::prepare_tree_checkpoint_in(source.path(), storage.path()).unwrap();
+        let live = prepared.cleanup.0.root.clone();
+        assert!(!abandoned.exists());
+        assert!(!empty.exists());
+        assert!(!released.exists());
+        assert!(elsewhere.join("tree/.openclaw/state.json").exists());
+        assert!(unowned.join("tree/.openclaw/state.json").exists());
+        assert!(snapshot.is_dir());
+        #[cfg(unix)]
+        assert!(outside.path().join(super::PREPARATION_LOCK).exists());
+
+        super::remove_abandoned_checkpoint_preparations(storage.path()).unwrap();
+        assert!(live.is_dir(), "a live capture's workspace was removed");
+        assert!(elsewhere.is_dir());
+        drop(elsewhere_lock);
+        super::remove_abandoned_checkpoint_preparations(storage.path()).unwrap();
+        assert!(!elsewhere.exists());
+        assert!(live.is_dir());
+        drop(prepared);
+        assert!(!live.exists());
+        super::remove_abandoned_checkpoint_preparations(&storage.path().join("missing")).unwrap();
     }
 
     #[cfg(target_os = "macos")]

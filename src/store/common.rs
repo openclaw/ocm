@@ -79,6 +79,22 @@ impl ExclusiveFileLockSet {
     }
 }
 
+impl ExclusiveFileLock {
+    /// Whether `path` still names the file this guard locks. Another process
+    /// may unlink or replace a lock file between its creation and its locking.
+    pub(crate) fn locks_path(&self, path: &Path) -> Result<bool, String> {
+        let held = self.file.metadata().map_err(|error| error.to_string())?;
+        let held = file_identity(&self.file, &held)?;
+        let current = match File::open(path) {
+            Ok(current) => current,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.to_string()),
+        };
+        let metadata = current.metadata().map_err(|error| error.to_string())?;
+        Ok(file_identity(&current, &metadata)? == held)
+    }
+}
+
 impl Drop for ExclusiveFileLock {
     fn drop(&mut self) {
         // An unrelated fork can retain CLOEXEC descriptors until it execs.

@@ -16,7 +16,8 @@ use time::OffsetDateTime;
 use super::checkpoints::{
     CheckpointCleanup, PreparedTreeCheckpoint, STORAGE_TAR_ARCHIVE, copy_tree_checkpoint,
     create_tree_checkpoint_from_preparation, default_snapshot_storage_kind,
-    prepare_scoped_tree_checkpoint_in, remove_tree_if_present,
+    prepare_scoped_tree_checkpoint_in, remove_abandoned_checkpoint_preparations,
+    remove_tree_if_present,
 };
 use super::common::{copy_path_recursive, load_json_files, path_exists, read_json, write_json};
 use super::dev_sources::{
@@ -1426,6 +1427,12 @@ pub fn remove_env_snapshot(
             "staged snapshot artifact cleanup failed at {}: {error}",
             display_path(&staging_dir)
         ));
+    }
+    // A preparation left by an interrupted capture must not keep the directory.
+    if let Err(error) = snapshot_env_dir(&snapshot.env_name, env, cwd)
+        .and_then(|dir| remove_abandoned_checkpoint_preparations(&dir))
+    {
+        warnings.push(error);
     }
     if let Err(error) = remove_snapshot_parent_if_empty(&snapshot.env_name, env, cwd) {
         warnings.push(format!(

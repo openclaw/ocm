@@ -1610,6 +1610,16 @@ divergence and a temporary restore candidate. These same-disk, secret-bearing
 checkpoints are operational rollback—not off-disk disaster recovery. Legacy tar
 snapshots remain readable.
 
+Snapshot and upgrade checkpoint capture prepare their copy in a hidden
+`.checkpoint-preparation-*` directory under `$OCM_HOME/snapshots/<env>`. A
+failed capture removes it. If OCM is interrupted or killed during capture, the
+next snapshot creation, upgrade checkpoint or snapshot removal for that
+environment removes the leftover directory, so removing the last snapshot also
+removes the environment's snapshot directory. A capture still running in
+another OCM process keeps its directory. Leftovers from OCM versions that did
+not lock their preparation directory are kept; remove them manually when no
+snapshot or upgrade command is running.
+
 Create:
 
 ```bash
