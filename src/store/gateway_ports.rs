@@ -193,11 +193,9 @@ pub(super) fn choose_source_ui_port(
 ) -> Result<u32, String> {
     let mut claimed = BTreeSet::new();
     reserve_foreign_openclaw_port_family(env, &mut claimed);
-    for port in resolve_effective_gateway_ports(envs, env)
-        .into_values()
-        .filter_map(Result::ok)
-    {
-        reserve_openclaw_port_family(port, &mut claimed);
+    let gateway_ports = resolve_effective_gateway_ports(envs, env);
+    for port in gateway_ports.values().filter_map(|port| port.as_ref().ok()) {
+        reserve_openclaw_port_family(*port, &mut claimed);
     }
     claimed.extend(active_ui_ports);
     claimed.extend(
@@ -211,6 +209,16 @@ pub(super) fn choose_source_ui_port(
     if let Some(port) = meta.dev_ui_port {
         if !(1..=u16::MAX as u32).contains(&port) {
             return Err(format!("env {} has an invalid retained UI port", meta.name));
+        }
+        let gateway_owner = gateway_ports.iter().find_map(|(name, base)| {
+            let (start, end) = openclaw_port_family_range(*base.as_ref().ok()?);
+            (start..=end).contains(&port).then_some((name, start, end))
+        });
+        if let Some((owner, start, end)) = gateway_owner {
+            return Err(format!(
+                "retained UI port {port} for env {} is claimed by env {owner}'s Gateway port family {start}..={end}; remove env {owner} to release it, or start with --no-ui",
+                meta.name,
+            ));
         }
         if !available(port) {
             return Err(format!(

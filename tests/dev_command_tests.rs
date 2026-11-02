@@ -2639,6 +2639,43 @@ fn dev_ui_claims_an_address_before_the_listener_starts() {
     assert!(rejected_session["ui"]["pending"].is_null());
     drop(occupied);
 
+    // Nothing listens now, but another environment's explicit Gateway port
+    // family contains the retained address; the refusal names that environment.
+    let claimer = run_ocm(
+        &second_repo,
+        &second_env,
+        &[
+            "env",
+            "create",
+            "claimer",
+            "--port",
+            &second_port.to_string(),
+        ],
+    );
+    assert!(claimer.status.success(), "{}", stderr(&claimer));
+    let mut claimed = DevWatchFixture::spawn(
+        &second_root,
+        &second_repo,
+        &second_env,
+        &["dev", "second", "--ui", "--no-watch"],
+    );
+    let rejected = claimed.wait_without_release();
+    assert!(!rejected.status.success());
+    let message = stderr(&rejected);
+    assert!(
+        message.contains(&format!(
+            "retained UI port {second_port} for env second is claimed by env claimer's Gateway port"
+        )) && message.contains("--no-ui")
+            && !message.contains("occupied or reserved"),
+        "{message}"
+    );
+    assert_eq!(
+        get_environment("second", &env, &repo).unwrap().dev_ui_port,
+        saved.dev_ui_port
+    );
+    let removed = run_ocm(&second_repo, &second_env, &["env", "remove", "claimer"]);
+    assert!(removed.status.success(), "{}", stderr(&removed));
+
     // Both original sessions are closed. A new generation must use the same
     // environment's reservation even when its backend watch mode changes.
     let mut restarted = DevWatchFixture::spawn(
