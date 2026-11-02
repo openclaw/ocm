@@ -3401,3 +3401,190 @@ fn env_export_does_not_open_excluded_sqlite_sidecars() {
     }));
     assert_eq!(fs::read(sidecar).unwrap(), b"excluded sidecar");
 }
+
+#[cfg(unix)]
+#[test]
+fn env_export_removes_its_staging_and_sqlite_snapshot_when_interrupted() {
+    use std::io::{Read, Write};
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    use rusqlite::Connection;
+
+    struct Exporter(Child);
+    impl Drop for Exporter {
+        fn drop(&mut self) {
+            if self.0.try_wait().ok().flatten().is_none() {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+
+    let root = TestDir::new("export-interrupt");
+    let mut env = ocm_env(&root);
+    let temp = root.child("tmp");
+    fs::create_dir_all(&temp).unwrap();
+    env.insert("TMPDIR".to_string(), temp.display().to_string());
+    let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let openclaw = root.child("ocm-home/envs/source/.openclaw");
+    fs::create_dir_all(openclaw.join("workspace")).unwrap();
+    // Dense bytes, so the staging file grows while the export runs.
+    let mut large = fs::File::create(openclaw.join("workspace/large.bin")).unwrap();
+    let block = vec![b'A'; 1024 * 1024];
+    for _ in 0..64 {
+        large.write_all(&block).unwrap();
+    }
+    drop(large);
+    fs::create_dir_all(openclaw.join("state")).unwrap();
+    let database = Connection::open(openclaw.join("state/agent.sqlite")).unwrap();
+    // WAL is the usual mode; its snapshot copy opens with -wal and -shm files.
+    database
+        .execute_batch(
+            "PRAGMA journal_mode=WAL; CREATE TABLE t(b BLOB); INSERT INTO t VALUES (zeroblob(67108864));",
+        )
+        .unwrap();
+    database.close().unwrap();
+    let destination = root.child("archives");
+    fs::create_dir(&destination).unwrap();
+
+    let entries = |directory: &std::path::Path| {
+        fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+    };
+    // (state included, signal, directory whose new file shows the export is
+    // mid-write: the staging file in the output directory, or the SQLite
+    // snapshot copy in TMPDIR, and whether the export starts with the signal
+    // ignored, as under nohup).
+    for (include_state, signal, watched, ignored) in [
+        (false, libc::SIGINT, &destination, false),
+        (true, libc::SIGTERM, &destination, false),
+        (false, libc::SIGHUP, &destination, false),
+        (true, libc::SIGINT, &temp, false),
+        (true, libc::SIGTERM, &temp, false),
+        (true, libc::SIGHUP, &destination, true),
+    ] {
+        let label = format!(
+            "include_state={include_state} signal={signal} watched={watched:?} ignored={ignored}"
+        );
+        let output = destination.join("interrupted.tar");
+        let mut command = Command::new(support::ocm_test_binary_path());
+        command
+            .current_dir(root.path())
+            .env_clear()
+            .envs(&env)
+            .args(["env", "export", "source", "--output"])
+            .arg(&output)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        if include_state {
+            command.arg("--include-state");
+        }
+        // Set the disposition either way: a test run under nohup would
+        // otherwise pass an ignored SIGHUP to every case.
+        let disposition = if ignored {
+            libc::SIG_IGN
+        } else {
+            libc::SIG_DFL
+        };
+        {
+            use std::os::unix::process::CommandExt;
+            unsafe {
+                command.pre_exec(move || {
+                    libc::signal(signal, disposition);
+                    Ok(())
+                });
+            }
+        }
+        let mut exporter = Exporter(command.spawn().unwrap());
+        let pid = exporter.0.id() as libc::pid_t;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            assert!(Instant::now() < deadline, "{label}: export never grew");
+            // Look only while the export is stopped, so it cannot finish
+            // between seeing it mid-write and queueing the signal.
+            assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+            let mut status = 0;
+            assert_eq!(
+                unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) },
+                pid
+            );
+            assert!(
+                libc::WIFSTOPPED(status),
+                "{label}: export finished before the signal"
+            );
+            let growing = fs::read_dir(watched).unwrap().any(|entry| {
+                let entry = entry.unwrap();
+                entry.file_name().to_string_lossy().starts_with('.')
+                    && entry
+                        .metadata()
+                        .is_ok_and(|metadata| metadata.len() >= 1024 * 1024)
+            });
+            if growing {
+                assert!(
+                    entries(&destination)
+                        .iter()
+                        .any(|name| name.starts_with(".ocm-export-")),
+                    "{label}: no staging file while stopped"
+                );
+                assert_eq!(unsafe { libc::kill(pid, signal) }, 0);
+                assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
+                break;
+            }
+            assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let status = loop {
+            if let Some(status) = exporter.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "{label}: export did not exit");
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        let mut errors = String::new();
+        exporter
+            .0
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut errors)
+            .unwrap();
+        if ignored {
+            assert!(status.success(), "{label}: {status:?} {errors}");
+            assert_eq!(entries(&destination), vec!["interrupted.tar".to_string()]);
+            fs::remove_file(&output).unwrap();
+        } else {
+            assert_eq!(status.code(), Some(130), "{label}: {status:?} {errors}");
+            assert!(
+                errors.contains("interrupted by a signal"),
+                "{label}: {errors}"
+            );
+            assert!(
+                !output.exists(),
+                "{label}: interrupted export was published"
+            );
+        }
+        assert_eq!(entries(&destination), Vec::<String>::new(), "{label}");
+        assert_eq!(entries(&temp), Vec::<String>::new(), "{label}");
+    }
+
+    let after = destination.join("after.tar");
+    let export = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "env",
+            "export",
+            "source",
+            "--include-state",
+            "--output",
+            after.to_str().unwrap(),
+        ],
+    );
+    assert!(export.status.success(), "{}", stderr(&export));
+    assert_eq!(entries(&destination), vec!["after.tar".to_string()]);
+    assert_eq!(entries(&temp), Vec::<String>::new());
+}

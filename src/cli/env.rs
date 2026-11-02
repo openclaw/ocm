@@ -697,13 +697,27 @@ impl Cli {
         };
         Self::assert_no_extra_args(&args[1..])?;
 
+        // A signal stops the export through its error path, which removes the
+        // staging file and SQLite snapshot copies it created.
+        crate::infra::interrupt::request_cancellation_on_signal()
+            .map_err(|error| format!("failed to install export signal handler: {error}"))?;
         let summary = self.with_progress(format!("Exporting env {name}"), || {
             self.environment_service().export(ExportEnvironmentOptions {
                 include_state,
                 name: name.clone(),
                 output,
             })
-        })?;
+        });
+        // An archive published before the signal took effect stays published.
+        if let Err(error) = &summary
+            && crate::infra::interrupt::cancellation_settled()
+        {
+            // The error itself may be a failure that came before the signal.
+            self.stderr_line(format!("ocm: {error}"));
+            self.stderr_line(format!("ocm: env export {name} interrupted by a signal"));
+            return Ok(130);
+        }
+        let summary = summary?;
 
         if json_flag {
             self.print_json(&summary)?;
