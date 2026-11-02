@@ -181,6 +181,52 @@ pub(crate) fn set_handler(
     Ok(())
 }
 
+/// Register the owner like `set_handler`, keeping each of SIGINT, SIGTERM and
+/// SIGHUP that was ignored when OCM started, as under `nohup` or for a
+/// background job, ignored. Call it before OCM starts other threads, so an
+/// ignored signal arriving during installation cannot reach the owner.
+pub(crate) fn set_handler_keeping_ignored(
+    handler: impl Fn() -> bool + Send + Sync + 'static,
+) -> Result<(), String> {
+    #[cfg(not(unix))]
+    return set_handler(handler);
+    #[cfg(unix)]
+    {
+        let ignored = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP]
+            .into_iter()
+            .map(|signal| signal_action(signal).map(|action| (signal, action)))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|(_, action)| action.sa_sigaction == libc::SIG_IGN)
+            .collect::<Vec<_>>();
+        // Block the ignored signals until their disposition is restored, so
+        // one arriving meanwhile stays pending and is then discarded instead
+        // of reaching the new handler. Threads started meanwhile inherit the
+        // block, which is moot for signals that stay ignored.
+        let mut blocked = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+        let mut previous = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+        // SAFETY: sigemptyset initializes the set before it is read, and
+        // pthread_sigmask writes the previous mask before it is restored.
+        unsafe {
+            libc::sigemptyset(blocked.as_mut_ptr());
+            for (signal, _) in &ignored {
+                libc::sigaddset(blocked.as_mut_ptr(), *signal);
+            }
+            libc::pthread_sigmask(libc::SIG_BLOCK, blocked.as_ptr(), previous.as_mut_ptr());
+        }
+        let result = set_handler(handler).and_then(|()| {
+            ignored
+                .iter()
+                .try_for_each(|(signal, action)| set_signal_action(*signal, action))
+        });
+        // SAFETY: previous was written by the pthread_sigmask call above.
+        unsafe {
+            libc::pthread_sigmask(libc::SIG_SETMASK, previous.as_ptr(), std::ptr::null_mut());
+        }
+        result
+    }
+}
+
 fn dispatch() {
     let handler = {
         let mut state = STATE.lock().unwrap();
@@ -285,49 +331,10 @@ static CANCELLATION_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// and return an error. A signal that was ignored when OCM started, as under
 /// `nohup` or for a background job, stays ignored.
 pub(crate) fn request_cancellation_on_signal() -> Result<(), String> {
-    let install = || {
-        set_handler(|| {
-            CANCELLATION_REQUESTED.store(true, Ordering::SeqCst);
-            true
-        })
-    };
-    #[cfg(not(unix))]
-    return install();
-    #[cfg(unix)]
-    {
-        let ignored = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP]
-            .into_iter()
-            .map(|signal| signal_action(signal).map(|action| (signal, action)))
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .filter(|(_, action)| action.sa_sigaction == libc::SIG_IGN)
-            .collect::<Vec<_>>();
-        // Block the ignored signals until their disposition is restored, so
-        // one arriving meanwhile stays pending and is then discarded instead
-        // of reaching the new handler. Threads started meanwhile inherit the
-        // block, which is moot for signals that stay ignored.
-        let mut blocked = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
-        let mut previous = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
-        // SAFETY: sigemptyset initializes the set before it is read, and
-        // pthread_sigmask writes the previous mask before it is restored.
-        unsafe {
-            libc::sigemptyset(blocked.as_mut_ptr());
-            for (signal, _) in &ignored {
-                libc::sigaddset(blocked.as_mut_ptr(), *signal);
-            }
-            libc::pthread_sigmask(libc::SIG_BLOCK, blocked.as_ptr(), previous.as_mut_ptr());
-        }
-        let result = install().and_then(|()| {
-            ignored
-                .iter()
-                .try_for_each(|(signal, action)| set_signal_action(*signal, action))
-        });
-        // SAFETY: previous was written by the pthread_sigmask call above.
-        unsafe {
-            libc::pthread_sigmask(libc::SIG_SETMASK, previous.as_ptr(), std::ptr::null_mut());
-        }
-        result
-    }
+    set_handler_keeping_ignored(|| {
+        CANCELLATION_REQUESTED.store(true, Ordering::SeqCst);
+        true
+    })
 }
 
 /// Whether a signal has asked the command to stop. Cheap enough to check on
@@ -351,6 +358,56 @@ pub(crate) fn cancelled_error() -> io::Error {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owner_keeping_ignored_signals_leaves_them_ignored() {
+        const CHILD: &str = "OCM_TEST_SIGNAL_KEEP_IGNORED_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // Signal registration is process-wide; isolate it from other tests.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "infra::interrupt::tests::owner_keeping_ignored_signals_leaves_them_ignored",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let signals = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&signals);
+        unsafe {
+            libc::signal(libc::SIGHUP, libc::SIG_IGN);
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::signal(libc::SIGTERM, libc::SIG_DFL);
+        }
+        set_handler_keeping_ignored(move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+            true
+        })
+        .unwrap();
+        assert_eq!(
+            signal_action(libc::SIGHUP).unwrap().sa_sigaction,
+            libc::SIG_IGN
+        );
+        for signal in [libc::SIGINT, libc::SIGTERM] {
+            assert!(!matches!(
+                signal_action(signal).unwrap().sa_sigaction,
+                libc::SIG_DFL | libc::SIG_IGN
+            ));
+        }
+        // The installation leaves this thread's mask as it found it, so the
+        // owner still receives the signals it handles.
+        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+        settle();
+        assert_eq!(signals.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn private_capture_preserves_owner_adoption_and_recovery_generations() {

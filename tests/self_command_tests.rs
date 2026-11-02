@@ -1018,3 +1018,219 @@ fn self_update_rejects_a_binary_reporting_the_wrong_version() {
     assert!(stderr(&output).contains("reported version \"8.8.8\"; expected \"9.9.9\""));
     assert_eq!(fs::read(&copied_binary).unwrap(), original);
 }
+
+#[cfg(unix)]
+fn assert_interrupted_download_removes_its_temporary_directory(
+    label: &str,
+    signal: libc::c_int,
+    inherited_ignored: Option<libc::c_int>,
+) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    struct UpdateChild(std::process::Child);
+    impl Drop for UpdateChild {
+        fn drop(&mut self) {
+            if matches!(self.0.try_wait(), Ok(None)) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+
+    let root = TestDir::new(label);
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let copied_binary = copied_ocm(&root);
+    let original = fs::read(&copied_binary).unwrap();
+    let temp = root.child("tmp");
+    fs::create_dir_all(&temp).unwrap();
+    let update_dirs = || -> Vec<std::path::PathBuf> {
+        fs::read_dir(&temp)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("ocm-self-update-"))
+            })
+            .collect()
+    };
+
+    // The asset announces the whole archive, sends half and stalls, so the
+    // signal arrives while the download is in progress.
+    let asset_name = current_release_asset_name();
+    let archive_path = root.child(&asset_name);
+    write_release_archive(&archive_path, "#!/bin/sh\nprintf '9.9.9\\n'\n");
+    let archive = fs::read(&archive_path).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let asset_url = format!("http://{}/download.tar.gz", listener.local_addr().unwrap());
+    let (half_sent, stalled) = std::sync::mpsc::channel();
+    let asset = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 4096];
+        let _ = stream.read(&mut request);
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/gzip\r\nConnection: close\r\n\r\n",
+            archive.len()
+        )
+        .unwrap();
+        stream.write_all(&archive[..archive.len() / 2]).unwrap();
+        stream.flush().unwrap();
+        half_sent.send(()).unwrap();
+        // Hold the connection until OCM closes it by exiting.
+        while matches!(stream.read(&mut request), Ok(read) if read > 0) {}
+    });
+    let metadata = format!(
+        "{{\"tag_name\":\"v9.9.9\",\"assets\":[{{\"name\":\"{asset_name}\",\"browser_download_url\":\"{asset_url}\",\"digest\":\"sha256:{}\"}}]}}",
+        file_sha256(&archive_path).unwrap()
+    );
+    let release =
+        TestHttpServer::serve_bytes("/release.json", "application/json", metadata.as_bytes());
+    let mut env = release_env(&root, &release.url());
+    env.insert("TMPDIR".to_string(), path_string(&temp));
+
+    let output_path = root.child("update.out");
+    let output = fs::File::create(&output_path).unwrap();
+    // The update keeps signals it inherits as ignored, so start it from the
+    // default dispositions whatever this test runner inherited, ignoring only
+    // `inherited_ignored` as `nohup` would. An absolute launcher keeps std on
+    // posix_spawn; a forked child would hold other tests' freshly copied
+    // binaries open for writing (ETXTBSY).
+    let ignored = match inherited_ignored {
+        Some(libc::SIGHUP) => "HUP",
+        Some(other) => panic!("unsupported inherited ignored signal {other}"),
+        None => "",
+    };
+    let mut command = Command::new("/usr/bin/perl");
+    command
+        .args([
+            "-e",
+            "my $ignored = shift; $SIG{$_} = 'DEFAULT' for qw(INT TERM HUP); \
+             $SIG{$ignored} = 'IGNORE' if length $ignored; \
+             exec { $ARGV[0] } @ARGV or die \"exec: $!\";",
+            ignored,
+        ])
+        .arg(&copied_binary)
+        .args(["self", "update", "--version", "9.9.9", "--raw"])
+        .current_dir(&cwd)
+        .env_clear()
+        .envs(&env)
+        .stdin(Stdio::null())
+        .stdout(output.try_clone().unwrap())
+        .stderr(output);
+    let mut update = UpdateChild(command.spawn().unwrap());
+    stalled
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the update did not start downloading the release asset");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let partial = update_dirs()
+            .first()
+            .map(|dir| dir.join(&asset_name))
+            .and_then(|archive| fs::metadata(archive).ok())
+            .is_some_and(|metadata| metadata.len() > 0);
+        if partial {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline && update.0.try_wait().unwrap().is_none(),
+            "no partial download appeared: {:?}",
+            fs::read_to_string(&output_path)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    if let Some(ignored) = inherited_ignored {
+        assert_eq!(
+            unsafe { libc::kill(update.0.id() as libc::pid_t, ignored) },
+            0
+        );
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            update.0.try_wait().unwrap().is_none(),
+            "a signal the caller ignored stopped the update: {:?}",
+            fs::read_to_string(&output_path)
+        );
+        assert_eq!(update_dirs().len(), 1);
+    }
+    assert_eq!(
+        unsafe { libc::kill(update.0.id() as libc::pid_t, signal) },
+        0
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = update.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the interrupted update did not exit"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    asset.join().unwrap();
+    assert_eq!(
+        (status.code(), status.signal()),
+        (Some(130), None),
+        "{:?}",
+        fs::read_to_string(&output_path)
+    );
+    assert_eq!(update_dirs(), Vec::<std::path::PathBuf>::new());
+    assert_eq!(fs::read(&copied_binary).unwrap(), original);
+    let journal = copied_binary.parent().unwrap().join(".ocm.self-update");
+    assert!(!journal.join("receipt.json").exists());
+
+    // The interruption leaves nothing that blocks the next update.
+    let (release, _asset) = serve_candidate_release(&root, 1);
+    let mut env = release_env(&root, &release.url());
+    env.insert("TMPDIR".to_string(), path_string(&temp));
+    let output = run_ocm_binary(&copied_binary, &cwd, &env, &["self", "update", "--raw"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("status: updated"));
+    assert_eq!(update_dirs(), Vec::<std::path::PathBuf>::new());
+}
+
+#[cfg(unix)]
+#[test]
+fn interrupted_self_update_download_removes_its_temporary_directory_on_sigint() {
+    assert_interrupted_download_removes_its_temporary_directory(
+        "self-update-interrupt-sigint",
+        libc::SIGINT,
+        None,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn interrupted_self_update_download_removes_its_temporary_directory_on_sigterm() {
+    assert_interrupted_download_removes_its_temporary_directory(
+        "self-update-interrupt-sigterm",
+        libc::SIGTERM,
+        None,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn interrupted_self_update_download_removes_its_temporary_directory_on_sighup() {
+    assert_interrupted_download_removes_its_temporary_directory(
+        "self-update-interrupt-sighup",
+        libc::SIGHUP,
+        None,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn interrupted_self_update_download_keeps_an_inherited_ignored_sighup() {
+    assert_interrupted_download_removes_its_temporary_directory(
+        "self-update-interrupt-nohup",
+        libc::SIGTERM,
+        Some(libc::SIGHUP),
+    );
+}

@@ -3,6 +3,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use semver::Version;
@@ -10,7 +11,7 @@ use serde::Serialize;
 
 use super::self_update_transaction::{Phase, Transaction, current_executable};
 use crate::infra::archive::extract_tar_gz;
-use crate::infra::download::{download_to_file, http_agent, verify_file_sha256};
+use crate::infra::download::{download_to_writer, http_agent, verify_file_sha256};
 use crate::infra::install_owner::NpmInstallation;
 
 use super::{Cli, render};
@@ -83,12 +84,48 @@ struct GitHubReleaseAsset {
     digest: Option<String>,
 }
 
+// The temporary directory of the update in progress. A signal does not unwind
+// the update, so the signal owner removes it instead of its Drop. The update
+// creates paths in it only while holding this lock.
+static OPEN_TEMP_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+fn open_temp_dir() -> MutexGuard<'static, Option<PathBuf>> {
+    OPEN_TEMP_DIR.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// SIGINT, SIGTERM or SIGHUP while the release archive is downloaded,
+/// extracted or staged removes its temporary directory before OCM exits with
+/// status 130, as other interrupted commands do. A signal the caller ignores,
+/// such as SIGHUP under `nohup`, stays ignored; that needs the handler
+/// installed while OCM still runs a single thread.
+fn install_self_update_interrupt_handler() -> Result<(), String> {
+    crate::infra::interrupt::set_handler_keeping_ignored(remove_open_temp_dir)
+        .map_err(|error| format!("failed to install self-update signal handler: {error}"))
+}
+
+fn remove_open_temp_dir() -> bool {
+    let mut open = open_temp_dir();
+    remove_registered_temp_dir(&mut open);
+    // Hold the lock until OCM exits, so the update cannot create anything in
+    // the removed directory again.
+    std::mem::forget(open);
+    false
+}
+
+fn remove_registered_temp_dir(open: &mut Option<PathBuf>) {
+    if let Some(path) = open.take() {
+        let _ = fs::remove_dir_all(path);
+    }
+}
+
 struct SelfUpdateTempDir {
     path: PathBuf,
 }
 
 impl SelfUpdateTempDir {
     fn create() -> Result<Self, String> {
+        // Held across creation, so a signal finds the directory once it exists.
+        let mut open = open_temp_dir();
         let unique = time::OffsetDateTime::now_utc().unix_timestamp_nanos();
         for attempt in 0..100 {
             let path = std::env::temp_dir().join(format!(
@@ -103,7 +140,10 @@ impl SelfUpdateTempDir {
                 builder.mode(0o700);
             }
             match builder.create(&path) {
-                Ok(()) => return Ok(Self { path }),
+                Ok(()) => {
+                    *open = Some(path.clone());
+                    return Ok(Self { path });
+                }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(error) => {
                     return Err(format!(
@@ -119,10 +159,22 @@ impl SelfUpdateTempDir {
     fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Runs a step that creates paths in the directory. A signal during the
+    /// step removes the directory once the step has finished, and a step after
+    /// the signal never starts.
+    fn create_within<T>(&self, create: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+        let _open = open_temp_dir();
+        create()
+    }
 }
 
 impl Drop for SelfUpdateTempDir {
     fn drop(&mut self) {
+        let mut open = open_temp_dir();
+        if open.as_ref() == Some(&self.path) {
+            *open = None;
+        }
         let _ = fs::remove_dir_all(&self.path);
     }
 }
@@ -263,6 +315,10 @@ impl Cli {
             }
         }
 
+        if !check {
+            // Before the progress output starts its thread.
+            install_self_update_interrupt_handler()?;
+        }
         let target_display = version.clone().unwrap_or_else(|| "latest".to_string());
         let mut summary = if check {
             self.self_update_check(version.as_deref())?
@@ -393,11 +449,16 @@ impl Cli {
 
         let temp_root = SelfUpdateTempDir::create()?;
         let archive_path = temp_root.path().join(&asset.name);
-        download_to_file(&asset.browser_download_url, &archive_path)?;
+        let mut archive = temp_root.create_within(|| {
+            File::create_new(&archive_path)
+                .map_err(|error| format!("failed to create {}: {error}", archive_path.display()))
+        })?;
+        download_to_writer(&asset.browser_download_url, &mut archive)?;
+        drop(archive);
         verify_file_sha256(&archive_path, expected_sha256)
             .map_err(|error| format!("failed to verify release asset {}: {error}", asset.name))?;
         let extract_dir = temp_root.path().join("extract");
-        extract_tar_gz(&archive_path, &extract_dir)?;
+        temp_root.create_within(|| extract_tar_gz(&archive_path, &extract_dir))?;
 
         let extracted_binary = extract_dir.join("ocm");
         let staged_binary = StagedBinary::copy_from(&extracted_binary, parent)?;
@@ -618,8 +679,9 @@ fn should_treat_target_as_current(
 #[cfg(test)]
 mod tests {
     use super::{
-        SelfUpdateTempDir, display_version_from_tag, normalize_release_tag, parse_release_version,
-        release_asset_name, self_release_url, should_treat_target_as_current,
+        SelfUpdateTempDir, display_version_from_tag, normalize_release_tag, open_temp_dir,
+        parse_release_version, release_asset_name, remove_registered_temp_dir, self_release_url,
+        should_treat_target_as_current,
     };
     use std::collections::BTreeMap;
 
@@ -724,6 +786,20 @@ mod tests {
         std::fs::write(path.join("partial-download"), b"partial").unwrap();
         drop(temp);
         assert!(!path.exists());
+        assert_eq!(*open_temp_dir(), None);
+
+        // The signal owner removes the open directory; the later Drop finds
+        // nothing left.
+        let temp = SelfUpdateTempDir::create().unwrap();
+        let path = temp.path().to_path_buf();
+        temp.create_within(|| {
+            std::fs::write(path.join("partial-download"), b"partial").map_err(|e| e.to_string())
+        })
+        .unwrap();
+        remove_registered_temp_dir(&mut open_temp_dir());
+        assert!(!path.exists());
+        assert_eq!(*open_temp_dir(), None);
+        drop(temp);
     }
 
     #[test]
