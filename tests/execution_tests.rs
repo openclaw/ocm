@@ -135,6 +135,7 @@ fn build_launcher_command_appends_after_recipes_without_a_trailing_comment() {
         "f() { openclaw; } # x",
         "declare -A a; a[ # ]=x; openclaw",
         "openclaw plugins/[ab].mjs # x",
+        r#"declare -A a; printf '%s\n' "$[a[" # marker"]]""#,
         "openclaw 'unterminated # x",
         "openclaw \"unterminated # x",
     ];

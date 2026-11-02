@@ -110,14 +110,14 @@ fn posix_recipe_tail(command: &str) -> Option<RecipeTail> {
 }
 
 /// The offset just past the double-quoted span opening at `start`, or `None`
-/// when it is unterminated or holds a substitution, backquote or line
-/// continuation.
+/// when it is unterminated or holds a substitution, bash `$[...]` arithmetic,
+/// backquote or line continuation.
 fn skip_double_quotes(bytes: &[u8], start: usize) -> Option<usize> {
     let mut index = start + 1;
     loop {
         match (*bytes.get(index)?, bytes.get(index + 1)) {
             (b'"', _) => return Some(index + 1),
-            (b'`', _) | (b'$', Some(b'(')) | (b'\\', Some(b'\n')) => return None,
+            (b'`', _) | (b'$', Some(b'(' | b'[')) | (b'\\', Some(b'\n')) => return None,
             (b'$', Some(b'{')) => index = skip_parameter(bytes, index)?,
             (b'\\', _) => index += 2,
             _ => index += 1,
