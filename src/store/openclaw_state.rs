@@ -1476,7 +1476,8 @@ pub(crate) fn validate_nonportable_runtime_state_paths(paths: &EnvPaths) -> Resu
 
 /// Checkpoints and state archives keep links inside the root as links, so a
 /// state directory linked outside the root would leave its contents behind.
-/// Links that stay inside the root are captured together with their targets.
+/// Links that stay inside the root are accepted; their targets are captured
+/// like any other directory in the root.
 pub(crate) fn validate_runtime_state_inside_root(paths: &EnvPaths) -> Result<(), String> {
     let root = fs::canonicalize(&paths.root).map_err(|error| error.to_string())?;
     for path in runtime_state_directories(paths) {
