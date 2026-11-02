@@ -1266,14 +1266,15 @@ config treats as paths (keys ending in `dir`, `path`, `paths`, `file`, `root` or
 `workspace`, the keys `paths` and `pathPrepend`, and the entries of `paths` and
 `pathPrepend` lists) and the settings whose own OpenClaw consumers expand `~`,
 including `skills.load.extraDirs`, `hooks.internal.load.extraDirs`, agent `cwd`,
-`session.store` and `cron.store`. Settings OpenClaw expands against the OS home
-keep their meaning without a rewrite, because the environment keeps your
-`HOME`. `nodeHost.workerRuns.folders`, and an include placed as a list entry of
-an array that other includes extend, are not rewritten yet
-([#972](https://github.com/openclaw/ocm/issues/972)). Each is expanded with the same whitespace handling and lexical
-`.` and `..` resolution as its OpenClaw consumer. Other strings, such as message
-text, stay as written. The source home is your home directory when the migrated
-directory is your own `~/.openclaw`, through any path that leads to it;
+`session.store` and `cron.store`. Each is expanded with the same whitespace
+handling and lexical `.` and `..` resolution as its OpenClaw consumer. Settings
+OpenClaw expands against the OS home keep their meaning without a rewrite,
+because the environment keeps your `HOME`. Other strings, such as message text,
+and values containing a `${VAR}` placeholder, which OpenClaw substitutes before
+resolving the path, stay as written. `nodeHost.workerRuns.folders`, and an
+include placed as a list entry of an array that other includes extend, are not
+rewritten yet ([#972](https://github.com/openclaw/ocm/issues/972)).
+The source home is your home directory when the migrated directory is your own `~/.openclaw`, through any path that leads to it;
 otherwise it is the directory that contains the migrated `.openclaw` as you
 spelled it, or as it is stored when only that path is named `.openclaw`, or
 your home directory for a state directory with another name. Values under

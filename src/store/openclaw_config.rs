@@ -424,6 +424,11 @@ fn expand_home_relative_path(raw: &str, home: &Path, trims: bool) -> Option<Stri
     if value != "~" && !value.starts_with("~/") && !value.starts_with("~\\") {
         return None;
     }
+    // OpenClaw substitutes `${VAR}` before resolving `..`, so a placeholder
+    // has no fixed location to spell out here; leave it as written.
+    if value.contains("${") {
+        return None;
+    }
     // Expand as OpenClaw does: replace the leading `~`, then resolve `.` and
     // `..` lexically, so later rewrites cannot follow links OpenClaw ignores.
     let mut expanded = home.as_os_str().to_os_string();
@@ -2927,7 +2932,13 @@ mod tests {
         assert_eq!(expand("~/x/../.openclaw/y"), None);
         // OpenClaw replaces the `~` of `~\` too; on POSIX the rest stays one name.
         assert_eq!(expand("~\\dev").as_deref(), Some("/home/alice\\dev"));
-        for unchanged in ["~alice/dev", "dev/~/p", "/abs/~/p", "~~/p"] {
+        for unchanged in [
+            "~alice/dev",
+            "dev/~/p",
+            "/abs/~/p",
+            "~~/p",
+            "~/${UP}/../shared",
+        ] {
             assert_eq!(expand(unchanged), None, "{unchanged}");
         }
         // A setting that does not trim keeps its whitespace semantics.
