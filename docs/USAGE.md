@@ -1270,10 +1270,12 @@ including `skills.load.extraDirs`, `hooks.internal.load.extraDirs`, agent `cwd`,
 handling and lexical `.` and `..` resolution as its OpenClaw consumer. Settings
 OpenClaw expands against the OS home keep their meaning without a rewrite,
 because the environment keeps your `HOME`. Other strings, such as message text,
-stay as written. Values containing a `${VAR}` placeholder, which OpenClaw
-substitutes before resolving the path, `nodeHost.workerRuns.folders`, and an
-include placed as a list entry of an array that other includes extend, are not
-rewritten yet ([#972](https://github.com/openclaw/ocm/issues/972)). The source
+stay as written. Not rewritten yet
+([#972](https://github.com/openclaw/ocm/issues/972)): values containing a
+`${VAR}` placeholder, which OpenClaw substitutes before resolving the path;
+`nodeHost.workerRuns.folders`; values in an include placed at a list position;
+and the trust roots `skills.load.allowSymlinkTargets` and
+`security.installPolicy.exec.trustedDirs`, which keep failing closed. The source
 home is your home directory when the migrated directory is your own
 `~/.openclaw`, through any path that leads to it;
 otherwise it is the directory that contains the migrated `.openclaw` as you

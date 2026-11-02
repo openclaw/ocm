@@ -5341,7 +5341,7 @@ fn migrate_and_adopt_resolve_parent_traversal_from_the_supplied_home_spelling() 
 }
 
 #[test]
-fn migrate_and_adopt_expand_home_relative_paths_in_an_include_at_a_list_entry() {
+fn migrate_and_adopt_keep_home_relative_paths_in_an_include_at_a_list_entry_as_written() {
     for adopt in [false, true] {
         let root = TestDir::new("migrate-home-relative-list-include");
         let env = ocm_env(&root);
@@ -5366,12 +5366,9 @@ fn migrate_and_adopt_expand_home_relative_paths_in_an_include_at_a_list_entry() 
         let copied: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(target.join("skills-dir.json")).unwrap())
                 .unwrap();
-        // The include is a list entry, so it is expanded like an inline entry.
-        assert_eq!(
-            copied,
-            home.join("shared-skills").to_str().unwrap(),
-            "adopt={adopt}"
-        );
+        // A recorded include index cannot be told apart from a digit-only
+        // key, so the value keeps its spelling (openclaw/ocm#972).
+        assert_eq!(copied, "~/shared-skills", "adopt={adopt}");
         assert_eq!(
             fs::read_to_string(source.join("skills-dir.json")).unwrap(),
             include

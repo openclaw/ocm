@@ -252,7 +252,10 @@ fn expand_migrated_home_relative_paths(
         };
         let mut rewritten = None;
         for scope in scopes {
-            let mut scope = typed_config_scope(&effective.value, scope);
+            // Include scopes are typed as object keys: a recorded index cannot
+            // be told apart from a digit-only key, so a value in an include
+            // placed at a list position keeps its spelling (openclaw/ocm#972).
+            let mut scope = scope.into_iter().map(ConfigSegment::Key).collect();
             let mut candidate = value.clone();
             expand_home_relative_paths_in_scope(&mut candidate, &mut scope, source_home);
             if rewritten
@@ -271,28 +274,6 @@ fn expand_migrated_home_relative_paths(
         }
     }
     Ok(())
-}
-
-/// Types an include scope from the resolved config: a segment below a list is
-/// a list entry, any other segment an object key.
-fn typed_config_scope(root: &Value, scope: Vec<String>) -> Vec<ConfigSegment> {
-    let mut current = Some(root);
-    scope
-        .into_iter()
-        .map(|segment| match current {
-            Some(Value::Array(entries)) => {
-                current = segment
-                    .parse::<usize>()
-                    .ok()
-                    .and_then(|index| entries.get(index));
-                ConfigSegment::Entry
-            }
-            parent => {
-                current = parent.and_then(|parent| parent.get(&segment));
-                ConfigSegment::Key(segment)
-            }
-        })
-        .collect()
 }
 
 /// One step from the config root to a value: an object key or a list entry.
@@ -349,13 +330,14 @@ fn expand_home_relative_paths_in_scope(
 /// OpenClaw a7fe06b17a9. Settings their consumers expand against the OS home
 /// (string `memory.search.extraPaths` entries, `messages.usageTemplate`, the
 /// voice-call store and the file-transfer path lists) keep their meaning,
-/// because `HOME` is unchanged in the environment. `nodeHost.workerRuns.folders`
-/// is not rewritten yet: its consumer resolves links before `..`, unlike the
-/// lexical expansion used here (openclaw/ocm#972).
+/// because `HOME` is unchanged in the environment. Not rewritten yet
+/// (openclaw/ocm#972): `nodeHost.workerRuns.folders`, whose consumer resolves
+/// links before `..`, unlike the lexical expansion used here, and the trust
+/// roots `skills.load.allowSymlinkTargets` and
+/// `security.installPolicy.exec.trustedDirs`, which keep failing closed.
 const CONSUMER_HOME_PATH_SETTINGS: &[(&[&str], bool)] = &[
     // src/skills/loading/workspace-skill-sources.ts, symlink-targets.ts
     (&["skills", "load", "extraDirs", "[]"], true),
-    (&["skills", "load", "allowSymlinkTargets", "[]"], true),
     // src/hooks/workspace.ts
     (&["hooks", "internal", "load", "extraDirs", "[]"], true),
     // src/config/sessions/paths.ts expands `~` without trimming first.
@@ -366,11 +348,6 @@ const CONSUMER_HOME_PATH_SETTINGS: &[(&[&str], bool)] = &[
     (&["agents", "defaults", "cwd"], true),
     (&["agents", "entries", "*", "cwd"], true),
     (&["agents", "list", "[]", "cwd"], true),
-    // src/security/install-policy.ts
-    (
-        &["security", "installPolicy", "exec", "trustedDirs", "[]"],
-        true,
-    ),
 ];
 
 /// Whether OpenClaw expands a leading `~` in the string setting at `scope`,
@@ -2978,27 +2955,6 @@ mod tests {
     }
 
     #[test]
-    fn migration_home_expansion_types_include_scopes_from_the_resolved_config() {
-        let root = json!({"agents": {"list": [{"id": "main"}]}, "skills": {"load": {}}});
-        assert_eq!(
-            typed_config_scope(&root, vec!["agents".into(), "list".into(), "0".into()]),
-            vec![
-                ConfigSegment::Key("agents".into()),
-                ConfigSegment::Key("list".into()),
-                ConfigSegment::Entry,
-            ]
-        );
-        assert_eq!(
-            typed_config_scope(&root, vec!["skills".into(), "load".into(), "0".into()]),
-            vec![
-                ConfigSegment::Key("skills".into()),
-                ConfigSegment::Key("load".into()),
-                ConfigSegment::Key("0".into()),
-            ]
-        );
-    }
-
-    #[test]
     fn migration_home_expansion_selects_the_settings_openclaw_expands() {
         let setting = |scope: &[&str]| {
             let scope = scope
@@ -3016,13 +2972,11 @@ mod tests {
             &["tools", "exec", "pathPrepend", "[]"],
             &["plugins", "entries", "demo", "config", "pathPrepend"],
             &["skills", "load", "extraDirs", "[]"],
-            &["skills", "load", "allowSymlinkTargets", "[]"],
             &["hooks", "internal", "load", "extraDirs", "[]"],
             &["agents", "list", "[]", "agentDir"],
             &["agents", "defaults", "cwd"],
             &["agents", "entries", "main", "cwd"],
             &["agents", "list", "[]", "cwd"],
-            &["security", "installPolicy", "exec", "trustedDirs", "[]"],
             &["gateway", "tls", "caPath"],
             &["logging", "file"],
             &["plugins", "entries", "demo", "config", "rootDir"],
@@ -3048,6 +3002,9 @@ mod tests {
                 "allowReadPaths",
                 "[]",
             ],
+            // Trust roots keep failing closed (openclaw/ocm#972).
+            &["skills", "load", "allowSymlinkTargets", "[]"],
+            &["security", "installPolicy", "exec", "trustedDirs", "[]"],
             // Resolved through links before `..`.
             &["nodeHost", "workerRuns", "folders", "[]"],
             &["agents", "list", "[]", "identity", "name"],
