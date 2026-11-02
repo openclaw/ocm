@@ -11,6 +11,7 @@ use time::OffsetDateTime;
 use zip::ZipArchive;
 
 use crate::env::{default_service_enabled, default_service_running};
+use crate::infra::interrupt::RemovedOnInterrupt;
 #[cfg(not(target_os = "linux"))]
 use crate::infra::sqlite_snapshot::create_sqlite_snapshot_no_follow;
 use crate::infra::sqlite_snapshot::{create_sqlite_snapshot, file_is_sqlite_database};
@@ -264,28 +265,33 @@ fn write_env_archive_with_capture<T: Serialize>(
     fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     let mut builder = tempfile::Builder::new();
     builder.prefix(".ocm-export-");
-    let staged = if options.private_output {
-        #[cfg(target_os = "macos")]
-        let file = builder.make_in(
-            parent,
-            crate::infra::macos_security::create_private_file_new,
-        );
-        #[cfg(windows)]
-        let file = builder.make_in(
-            parent,
-            crate::infra::windows_security::create_private_file_new,
-        );
-        #[cfg(not(any(windows, target_os = "macos")))]
-        let file = builder.tempfile_in(parent);
-        file
-    } else {
-        // Keep ordinary creation permissions and inherited ACLs. Only
-        // state-inclusive exports require the private-file creators above.
-        builder.make_in(parent, |path| {
-            File::options().write(true).create_new(true).open(path)
-        })
-    }
-    .map_err(|error| error.to_string())?;
+    let staged = RemovedOnInterrupt::create(
+        || {
+            if options.private_output {
+                #[cfg(target_os = "macos")]
+                let file = builder.make_in(
+                    parent,
+                    crate::infra::macos_security::create_private_file_new,
+                );
+                #[cfg(windows)]
+                let file = builder.make_in(
+                    parent,
+                    crate::infra::windows_security::create_private_file_new,
+                );
+                #[cfg(not(any(windows, target_os = "macos")))]
+                let file = builder.tempfile_in(parent);
+                file
+            } else {
+                // Keep ordinary creation permissions and inherited ACLs. Only
+                // state-inclusive exports require the private-file creators above.
+                builder.make_in(parent, |path| {
+                    File::options().write(true).create_new(true).open(path)
+                })
+            }
+            .map_err(|error| error.to_string())
+        },
+        |file| vec![file.path().to_path_buf()],
+    )?;
     // Stage both modes so retries and error cleanup touch only our own file.
     // Publication must acquire the destination without replacing any entry.
     let canonical_output = staged
@@ -306,9 +312,13 @@ fn write_env_archive_with_capture<T: Serialize>(
             .map_err(|error| error.to_string())?;
         match write_env_archive_attempt(metadata, source_root, file, options.clone(), capture) {
             Ok(()) => {
-                staged
-                    .persist_noclobber(output_path)
-                    .map_err(|error| error.to_string())?;
+                // A failed publication drops the staged file while its path
+                // is still tracked.
+                staged.release(|file| {
+                    file.persist_noclobber(output_path)
+                        .map(drop)
+                        .map_err(|error| error.to_string())
+                })?;
                 return Ok(());
             }
             Err(EnvArchiveWriteError::EntryDisappeared(_))

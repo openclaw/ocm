@@ -1,6 +1,9 @@
 //! Keep application signal ownership while bounded private commands settle.
+use std::fs;
+use std::ops::Deref;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 
 type Handler = Arc<dyn Fn() -> bool + Send + Sync>;
 
@@ -271,6 +274,126 @@ impl Drop for CaptureInterrupt {
         };
         if exit {
             std::process::exit(130);
+        }
+    }
+}
+
+struct Removals {
+    next_id: u64,
+    entries: Vec<(u64, Vec<PathBuf>)>,
+    // Set once a signal removed the entries: nothing new may be created
+    // while OCM exits.
+    removed: bool,
+}
+
+static REMOVALS: Mutex<Removals> = Mutex::new(Removals {
+    next_id: 0,
+    entries: Vec::new(),
+    removed: false,
+});
+
+fn removals() -> MutexGuard<'static, Removals> {
+    REMOVALS.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A temporary file or directory whose paths are removed if a signal stops
+/// OCM while it exists. A signal ends the process without unwinding, so the
+/// value's own Drop cleanup never runs then; a command that installs
+/// [`remove_temporary_paths_on_signal`] removes the paths instead. Without
+/// that owner the registration has no effect.
+pub(crate) struct RemovedOnInterrupt<T> {
+    value: Option<T>,
+    id: u64,
+}
+
+impl<T> RemovedOnInterrupt<T> {
+    /// Create the value and register `paths(&value)` under the lock a signal
+    /// removes them under, so a signal never finds it created but unregistered.
+    pub(crate) fn create(
+        create: impl FnOnce() -> Result<T, String>,
+        paths: impl FnOnce(&T) -> Vec<PathBuf>,
+    ) -> Result<Self, String> {
+        let mut removals = removals();
+        if removals.removed {
+            return Err("interrupted by a signal".to_string());
+        }
+        let value = create()?;
+        let id = removals.next_id;
+        removals.next_id += 1;
+        removals.entries.push((id, paths(&value)));
+        Ok(Self {
+            value: Some(value),
+            id,
+        })
+    }
+
+    /// Consume the value, such as by publishing it under its final name, and
+    /// stop tracking its paths, without a signal removing them in between.
+    pub(crate) fn release<R>(mut self, release: impl FnOnce(T) -> R) -> R {
+        let mut removals = removals();
+        removals.entries.retain(|(id, _)| *id != self.id);
+        release(self.value.take().expect("value is present until released"))
+    }
+}
+
+impl<T> Deref for RemovedOnInterrupt<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        self.value
+            .as_ref()
+            .expect("value is present until released")
+    }
+}
+
+impl<T> Drop for RemovedOnInterrupt<T> {
+    fn drop(&mut self) {
+        // The value's own cleanup runs first; the paths stay registered until
+        // it has finished.
+        if let Some(value) = self.value.take() {
+            drop(value);
+            removals().entries.retain(|(id, _)| *id != self.id);
+        }
+    }
+}
+
+/// Install the application signal owner for a command whose only duty on
+/// SIGINT, SIGTERM or SIGHUP is to remove the paths registered through
+/// [`RemovedOnInterrupt`]; OCM then exits with status 130.
+pub(crate) fn remove_temporary_paths_on_signal() -> Result<(), String> {
+    set_handler(|| {
+        remove_registered_paths();
+        false
+    })
+}
+
+/// Once a signal has removed the registered paths, the dispatcher is ending
+/// OCM with status 130. A command whose work may have seen a path disappear,
+/// as an error or as a finished result, waits here instead of reporting it.
+/// Only for commands that hold no [`CaptureInterrupt`], whose drop would
+/// otherwise be the exit this waits for.
+pub(crate) fn await_exit_after_signal_removal() {
+    if removals().removed {
+        loop {
+            std::thread::park();
+        }
+    }
+}
+
+fn remove_registered_paths() {
+    let mut removals = removals();
+    removals.removed = true;
+    for (_, paths) in removals.entries.drain(..) {
+        for path in paths {
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_dir() => {
+                    let _ = fs::remove_dir_all(&path);
+                }
+                Ok(_) => {
+                    let _ = fs::remove_file(&path);
+                }
+                Err(_) => {}
+            }
         }
     }
 }

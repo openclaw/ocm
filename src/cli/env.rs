@@ -697,13 +697,19 @@ impl Cli {
         };
         Self::assert_no_extra_args(&args[1..])?;
 
+        // A signal removes the staging file and SQLite snapshot copies, which
+        // otherwise only their Drop removes, before OCM exits with status 130.
+        crate::infra::interrupt::remove_temporary_paths_on_signal()
+            .map_err(|error| format!("failed to install export signal handler: {error}"))?;
         let summary = self.with_progress(format!("Exporting env {name}"), || {
             self.environment_service().export(ExportEnvironmentOptions {
                 include_state,
                 name: name.clone(),
                 output,
             })
-        })?;
+        });
+        crate::infra::interrupt::await_exit_after_signal_removal();
+        let summary = summary?;
 
         if json_flag {
             self.print_json(&summary)?;
