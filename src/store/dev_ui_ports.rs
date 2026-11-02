@@ -251,6 +251,8 @@ mod tests {
         let socket = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = u32::from(socket.local_addr().unwrap().port());
         alpha.dev_ui_port = Some(port);
+        // Keep alpha's own Gateway family clear of the bound port.
+        alpha.gateway_port = Some(if port < 32_768 { 60_000 } else { 20_000 });
         let refusal = |metas: &[EnvMeta]| {
             super::super::gateway_ports::choose_source_ui_port(&alpha, metas, &[], &env)
                 .unwrap_err()
