@@ -71,16 +71,8 @@ fn build_launcher_command_joins_the_last_command_before_a_trailing_comment_or_ba
             "'/opt/open claw' 'gateway' 'two words' # it's mine",
         ),
         (
-            r#"node "a # b" "${HOME}/x.mjs" $(cat flags) # dev"#,
-            r#"node "a # b" "${HOME}/x.mjs" $(cat flags) 'gateway' 'two words' # dev"#,
-        ),
-        (
-            r#"node "$(pwd)/entry.mjs" "$(dirname "$0")/x" `echo a` # dev"#,
-            r#"node "$(pwd)/entry.mjs" "$(dirname "$0")/x" `echo a` 'gateway' 'two words' # dev"#,
-        ),
-        (
-            "openclaw ${x:-\"a # b\"} $(echo ')' # c\n) # dev",
-            "openclaw ${x:-\"a # b\"} $(echo ')' # c\n) 'gateway' 'two words' # dev",
+            r#"node "a # b" "${HOME}/x.mjs" "$HOME" ${x:-a # b} x#y \# # dev"#,
+            r#"node "a # b" "${HOME}/x.mjs" "$HOME" ${x:-a # b} x#y \# 'gateway' 'two words' # dev"#,
         ),
         (
             "cd /src && pnpm openclaw # dev",
@@ -98,22 +90,6 @@ fn build_launcher_command_joins_the_last_command_before_a_trailing_comment_or_ba
             "openclaw # one\n  # two",
             "openclaw 'gateway' 'two words' # one\n  # two",
         ),
-        (
-            "pnpm openclaw \\\n# my checkout",
-            "pnpm openclaw 'gateway' 'two words' \\\n# my checkout",
-        ),
-        (
-            "node gw.mjs $((1<<2)) # dev",
-            "node gw.mjs $((1<<2)) 'gateway' 'two words' # dev",
-        ),
-        (
-            r#"openclaw --mode "$(echo case)" $(x) # dev"#,
-            r#"openclaw --mode "$(echo case)" $(x) 'gateway' 'two words' # dev"#,
-        ),
-        (
-            r#"printf '%s\n' "$(printf '%s' if case)" # tail"#,
-            r#"printf '%s\n' "$(printf '%s' if case)" 'gateway' 'two words' # tail"#,
-        ),
         // Operators still separate the arguments into a failing command.
         ("openclaw;# dev", "openclaw; 'gateway' 'two words' # dev"),
         ("openclaw \\", "openclaw 'gateway' 'two words'"),
@@ -130,35 +106,36 @@ fn build_launcher_command_joins_the_last_command_before_a_trailing_comment_or_ba
 fn build_launcher_command_appends_after_recipes_without_a_trailing_comment() {
     let mut recipes = vec![
         "openclaw",
-        "openclaw x#y $# ${HOME#/} ${x:-a # b} $(echo a)#b",
+        "openclaw x#y $# ${HOME#/} ${x:-a # b}",
         r"openclaw \# literal \\",
-        "openclaw 'a # b' \"a # b\" `echo # x`",
+        "openclaw 'a # b' \"a # b\"",
         "echo setup # one\nopenclaw",
         "# only a comment",
         "openclaw;",
         "openclaw &",
         "openclaw |",
-        // Unmodelled or unterminated forms keep the plain append.
+        // Forms that can hide or move token boundaries, and unterminated
+        // quotes, keep the plain append.
+        "openclaw $(pwd) # x",
+        "openclaw \"$(pwd)/x\" # x",
+        "openclaw `pwd` # x",
+        "openclaw \"`pwd`\" # x",
+        "openclaw $((1<<2)) # x",
+        "((n = 1 # 2 )); openclaw",
+        "openclaw <(cat) # x",
         "cat <<EOF # x",
         "openclaw $'a' # x",
-        "openclaw $(case x in a) echo;; esac) # x",
-        "openclaw $(true; if :; then case x in a) echo;; esac; fi) # x",
-        r#"printf '%s\n' $(( $(printf 1; : "))) # marker") ))"#,
-        "openclaw ${x:-$'a'} # x",
-        r"openclaw ${x:-$'a\'} # marker'}",
-        r#"printf '%s\n' "$(time ! case x in x) printf "%s" ") # marker";; esac)""#,
+        "openclaw ${x:-'}'} # x",
+        "openclaw \"${x:-'}\" \\'} \" # x\"",
+        "openclaw ${x:-${y}} # x",
+        "pnpm openclaw \\\n# x",
+        "printf '%s\\n' \"$\\\n(printf \"%s\" \") # x\")\"",
         "openclaw 'unterminated # x",
-        "openclaw \"$(echo # x\" # y",
+        "openclaw \"unterminated # x",
     ];
     if cfg!(windows) {
         recipes.push("openclaw # dev");
     }
-    let deeply_nested = format!(
-        "openclaw {}x{} # dev",
-        "\"$(echo ".repeat(40),
-        ")\"".repeat(40)
-    );
-    recipes.push(&deeply_nested);
     for recipe in recipes {
         assert_eq!(
             launcher_command(recipe),

@@ -51,94 +51,48 @@ enum RecipeTail {
 }
 
 /// Finds a trailing comment or dangling backslash after the last word of a
-/// POSIX shell recipe. A `#` starts a comment only at the start of a token
-/// outside quotes, expansions and substitutions. Constructs this scan does not
-/// model (here-documents, `$'...'`, a `case` statement inside a command
-/// substitution, nesting deeper than `MAX_SPAN_NESTING`) and unterminated
-/// quotes return `None`, so those recipes keep the plain append.
+/// POSIX shell recipe. The scan reads only plain words, quotes, backslash
+/// escapes, `$NAME` and plain `${...}` expansions, operators and comments; a `#`
+/// starts a comment only at the start of a token outside quotes and
+/// expansions. Anything that can hide or move token boundaries (command and
+/// process substitution, backquotes, `$'...'`, here-documents, line
+/// continuations, `((`, `${...}` holding quotes or nested expansions) and
+/// unterminated quotes return `None`, so those recipes keep the plain append.
 fn posix_recipe_tail(command: &str) -> Option<RecipeTail> {
-    match scan_tokens(command.as_bytes(), 0, false, 0)? {
-        (_, 0) => None,
-        (ScanEnd::Comment, word_end) => Some(RecipeTail::Comment(word_end)),
-        (ScanEnd::Backslash, word_end) => Some(RecipeTail::Backslash(word_end)),
-        _ => None,
-    }
-}
-
-const MAX_SPAN_NESTING: usize = 32;
-
-#[derive(Debug, PartialEq, Eq)]
-enum ScanEnd {
-    /// The text ended after a word or blanks.
-    Text,
-    /// The text ended in a `#` comment.
-    Comment,
-    /// The text ended in an unquoted backslash.
-    Backslash,
-    /// The `)` closing a command substitution; the offset is just past it.
-    Closed(usize),
-}
-
-/// Scans shell tokens from `start` to the end of the text or, inside a `$(`
-/// substitution, to its closing `)`. Returns how the scan ended and the offset
-/// just past the last word.
-fn scan_tokens(
-    bytes: &[u8],
-    start: usize,
-    in_substitution: bool,
-    nesting: usize,
-) -> Option<(ScanEnd, usize)> {
-    let mut index = start;
-    let mut word_end = start;
+    let bytes = command.as_bytes();
+    let mut index = 0;
+    let mut word_end = 0;
     let mut word_start = true;
-    let mut open_parens = 0usize;
     while let Some(&byte) = bytes.get(index) {
-        if opens_span(bytes, index) {
-            index = skip_span(bytes, index, nesting + 1)?;
-            word_end = index;
-            word_start = false;
-            continue;
-        }
         let next = bytes.get(index + 1);
-        match byte {
-            b'$' if next == Some(&b'\'') => return None,
+        let span_end = match byte {
+            b'\'' => Some(index + 2 + bytes[index + 1..].iter().position(|&b| b == b'\'')?),
+            b'"' => Some(skip_double_quotes(bytes, index)?),
+            b'$' if next == Some(&b'{') => Some(skip_parameter(bytes, index)?),
+            b'`' => return None,
+            b'$' if matches!(next, Some(b'(' | b'\'')) => return None,
+            b'<' | b'>' | b'(' if matches!(next, Some(b'(')) => return None,
             b'<' if next == Some(&b'<') => return None,
-            // A line continuation joins the lines without ending the token.
-            b'\\' if next == Some(&b'\n') => {
-                index += 2;
-                continue;
-            }
+            b'\\' if next == Some(&b'\n') => return None,
             b'\\' if next.is_none() => {
-                return (!in_substitution).then_some((ScanEnd::Backslash, word_end));
+                return (word_end > 0).then_some(RecipeTail::Backslash(word_end));
             }
-            b'\\' => {
-                index += 2;
-                word_end = index;
-                word_start = false;
-                continue;
-            }
-            b'#' if word_start => match bytes[index..].iter().position(|&byte| byte == b'\n') {
+            b'\\' => Some(index + 2),
+            b'#' if word_start => match bytes[index..].iter().position(|&b| b == b'\n') {
                 // The comment ends at this newline; scanning resumes there.
                 Some(offset) => {
                     index += offset;
                     continue;
                 }
-                None => return (!in_substitution).then_some((ScanEnd::Comment, word_end)),
+                None => return (word_end > 0).then_some(RecipeTail::Comment(word_end)),
             },
-            // `case` statement patterns would unbalance the parentheses. As an
-            // argument, `case` is an ordinary word.
-            b'c' if in_substitution
-                && is_word_at(bytes, index, b"case")
-                && in_command_position(&bytes[start..index]) =>
-            {
-                return None;
-            }
-            b'(' if in_substitution => open_parens += 1,
-            b')' if in_substitution => match open_parens.checked_sub(1) {
-                Some(remaining) => open_parens = remaining,
-                None => return Some((ScanEnd::Closed(index + 1), word_end)),
-            },
-            _ => {}
+            _ => None,
+        };
+        if let Some(end) = span_end {
+            index = end;
+            word_end = end;
+            word_start = false;
+            continue;
         }
         if !matches!(byte, b' ' | b'\t' | b'\n') {
             word_end = index + 1;
@@ -146,44 +100,37 @@ fn scan_tokens(
         word_start = ends_token(byte);
         index += 1;
     }
-    (!in_substitution).then_some((ScanEnd::Text, word_end))
+    None
 }
 
-/// Whether `word` is a whole token at `index`.
-fn is_word_at(bytes: &[u8], index: usize, word: &[u8]) -> bool {
-    bytes[index..].starts_with(word)
-        && (index == 0 || ends_token(bytes[index - 1]))
-        && bytes
-            .get(index + word.len())
-            .is_none_or(|&next| ends_token(next))
+/// The offset just past the double-quoted span opening at `start`, or `None`
+/// when it is unterminated or holds a substitution, backquote or line
+/// continuation.
+fn skip_double_quotes(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut index = start + 1;
+    loop {
+        match (*bytes.get(index)?, bytes.get(index + 1)) {
+            (b'"', _) => return Some(index + 1),
+            (b'`', _) | (b'$', Some(b'(')) | (b'\\', Some(b'\n')) => return None,
+            (b'$', Some(b'{')) => index = skip_parameter(bytes, index)?,
+            (b'\\', _) => index += 2,
+            _ => index += 1,
+        }
+    }
 }
 
-/// Whether a token following `before` may start a command: nothing, an
-/// operator or a newline precedes it, or a reserved word in command position
-/// that a command follows. A pipeline prefix (`!`, bash `time` and its options)
-/// also counts, so the scan errs toward the plain-append fallback.
-fn in_command_position(before: &[u8]) -> bool {
-    let Some(last) = before
-        .iter()
-        .rposition(|&byte| !matches!(byte, b' ' | b'\t'))
-    else {
-        return true;
-    };
-    if ends_token(before[last]) {
-        return true;
-    }
-    let first = before[..last]
-        .iter()
-        .rposition(|&byte| ends_token(byte))
-        .map_or(0, |at| at + 1);
-    let word = &before[first..=last];
-    if matches!(word, b"!" | b"time") || word.starts_with(b"-") {
-        return true;
-    }
-    matches!(
-        word,
-        b"if" | b"then" | b"else" | b"elif" | b"while" | b"until" | b"do" | b"{"
-    ) && in_command_position(&before[..first])
+/// The offset just past the `${...}` expansion opening at `start`, or `None`
+/// unless it closes before any quote, `$`, backquote, backslash, brace or
+/// newline.
+fn skip_parameter(bytes: &[u8], start: usize) -> Option<usize> {
+    let offset = bytes[start + 2..].iter().position(|&byte| {
+        matches!(
+            byte,
+            b'}' | b'\'' | b'"' | b'`' | b'$' | b'\\' | b'{' | b'\n'
+        )
+    })?;
+    let end = start + 2 + offset;
+    (bytes[end] == b'}').then_some(end + 1)
 }
 
 /// Blanks and operator characters end a shell token.
@@ -192,76 +139,6 @@ fn ends_token(byte: u8) -> bool {
         byte,
         b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b')' | b'<' | b'>'
     )
-}
-
-/// Whether a quoted span, `${...}` expansion or `$(...)` substitution opens at
-/// `index`.
-fn opens_span(bytes: &[u8], index: usize) -> bool {
-    match bytes[index] {
-        b'\'' | b'"' | b'`' => true,
-        b'$' => matches!(bytes.get(index + 1), Some(b'(' | b'{')),
-        _ => false,
-    }
-}
-
-/// The offset just past the span that `opens_span` found at `start`, or `None`
-/// when it is unterminated, nested too deeply or holds a construct the scan
-/// does not model.
-fn skip_span(bytes: &[u8], start: usize, nesting: usize) -> Option<usize> {
-    if nesting > MAX_SPAN_NESTING {
-        return None;
-    }
-    let (close, mut index) = match (bytes[start], bytes.get(start + 1)) {
-        (b'\'', _) => {
-            let end = bytes[start + 1..].iter().position(|&byte| byte == b'\'')?;
-            return Some(start + end + 2);
-        }
-        // Arithmetic expansion: its parentheses, outside nested spans.
-        (b'$', Some(b'(')) if bytes.get(start + 2) == Some(&b'(') => {
-            let mut index = start + 1;
-            let mut depth = 0usize;
-            loop {
-                let byte = *bytes.get(index)?;
-                if opens_span(bytes, index) {
-                    index = skip_span(bytes, index, nesting + 1)?;
-                    continue;
-                }
-                match byte {
-                    b'\\' => index += 1,
-                    b'(' => depth += 1,
-                    b')' if depth == 1 => return Some(index + 1),
-                    b')' => depth -= 1,
-                    _ => {}
-                }
-                index += 1;
-            }
-        }
-        (b'$', Some(b'(')) => {
-            return match scan_tokens(bytes, start + 2, true, nesting)? {
-                (ScanEnd::Closed(end), _) => Some(end),
-                _ => None,
-            };
-        }
-        (b'$', _) => (b'}', start + 2),
-        (delimiter, _) => (delimiter, start + 1),
-    };
-    // Double quotes, backquotes and `${...}`.
-    loop {
-        let byte = *bytes.get(index)?;
-        if byte == close {
-            return Some(index + 1);
-        }
-        if close == b'}' && byte == b'$' && bytes.get(index + 1) == Some(&b'\'') {
-            return None;
-        }
-        if byte == b'\\' {
-            index += 2;
-        } else if close != b'`' && opens_span(bytes, index) && (close == b'}' || byte != b'\'') {
-            index = skip_span(bytes, index, nesting + 1)?;
-        } else {
-            index += 1;
-        }
-    }
 }
 
 pub fn resolve_launcher_run_dir(launcher: &LauncherMeta, fallback_cwd: &Path) -> PathBuf {
