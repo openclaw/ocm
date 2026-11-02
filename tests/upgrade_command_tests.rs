@@ -11317,11 +11317,16 @@ fn upgrade_batch_continue_finishes_other_envs_and_leaves_failure_for_external_re
         .unwrap();
     assert_eq!(alpha["outcome"], "failed");
     assert_eq!(alpha["rollback"], "disabled");
+    assert!(alpha["snapshotId"].is_string(), "{alpha}");
+    let alpha_note = alpha["note"].as_str().unwrap();
     assert!(
-        alpha["note"]
-            .as_str()
-            .unwrap()
-            .contains("left the gateway stopped for external recovery")
+        alpha_note.contains("upgrade failed and rollback was disabled"),
+        "{alpha_note}"
+    );
+    // alpha has no installed service, so the policy has no gateway to stop.
+    assert!(
+        !alpha_note.contains("left the gateway stopped"),
+        "{alpha_note}"
     );
     assert_eq!(beta["outcome"], "switched");
 
@@ -12785,12 +12790,8 @@ fn candidate_batch_journal_keeps_bounded_redacted_notes_out_of_environment_histo
         assert!(note.lines().count() <= 12);
         assert!(!note.contains("private-token"));
         assert!(!note.contains("unrelated-private-payload"));
-        if failure_policy == "continue" {
-            assert!(
-                note.contains("failure policy left the gateway stopped for external recovery"),
-                "{note}"
-            );
-        }
+        // demo has no installed service, so neither policy reports stopping a gateway.
+        assert!(!note.contains("left the gateway stopped"), "{note}");
         let journal = fs::read_to_string(summary["journalPath"].as_str().unwrap()).unwrap();
         assert!(!journal.contains("private-token"));
         assert!(!journal.contains("unrelated-private-payload"));
