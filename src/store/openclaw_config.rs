@@ -17,7 +17,7 @@ use super::layout::{EnvPaths, clean_path, derive_env_paths, display_path, resolv
 use super::openclaw_workspaces::{
     OpenClawConfigReadContext, OpenClawConfigReadError, OpenClawWorkspaceInventory,
     OpenClawWorkspaceRuntime, load_effective_openclaw_config, read_openclaw_config_field,
-    read_regular_text_file, resolve_openclaw_config_env,
+    read_regular_text_file, resolve_effective_openclaw_config_value, resolve_openclaw_config_env,
 };
 
 #[cfg(all(test, target_os = "macos"))]
@@ -194,9 +194,6 @@ pub(crate) fn rewrite_openclaw_config_for_new_environment(
     gateway_port: Option<u32>,
     sandbox_origin: Option<&str>,
 ) -> Result<OpenClawConfigRewriteOutcome, String> {
-    if let Some(gateway_port) = gateway_port {
-        rewrite_included_gateway_port(target_paths, gateway_port)?;
-    }
     rewrite_openclaw_config_with_root_mapping(
         target_paths,
         source_root.map(|source_root| (source_root, target_paths.root.as_path())),
@@ -217,9 +214,6 @@ pub(crate) fn rewrite_openclaw_config_for_migration(
         source_state_root,
         canonical_source_state_root,
     )?;
-    if let Some(gateway_port) = gateway_port {
-        rewrite_included_gateway_port(target_paths, gateway_port)?;
-    }
     rewrite_openclaw_config_with_root_mapping(
         target_paths,
         Some((source_state_root, target_paths.state_dir.as_path())),
@@ -229,24 +223,40 @@ pub(crate) fn rewrite_openclaw_config_for_migration(
 }
 
 /// Moves a Gateway port that a copied `$include` supplies to `gateway_port`,
-/// with the MCP app sandbox port and loopback origin that follow it. A port the
-/// config file sets itself overrides its includes and is left to the file's own
-/// rewrite.
-fn rewrite_included_gateway_port(target: &EnvPaths, gateway_port: u32) -> Result<(), String> {
-    let Some(mut config) = read_config_value(&target.config_path)? else {
-        return Ok(());
-    };
-    if read_gateway_port(&config).is_some() {
-        return Ok(());
+/// with the MCP app sandbox port and loopback origin that follow it in
+/// `config`, the target's root config after its include directives point at
+/// the copies. A port the root config sets itself overrides its includes and
+/// is left to the root's own rewrite.
+fn rewrite_included_gateway_port(
+    config: &mut Value,
+    target: &EnvPaths,
+    gateway_port: u32,
+) -> Result<bool, String> {
+    if read_gateway_port(config).is_some() || !value_contains_include(config) {
+        return Ok(false);
     }
-    let Some(effective) = load_effective_openclaw_config(&target.config_path)? else {
-        return Ok(());
-    };
+    let effective = resolve_effective_openclaw_config_value(&target.config_path, config.clone())?;
     let Some(source_port) = read_gateway_port(&effective.value) else {
-        return Ok(());
+        return Ok(false);
     };
+    // A file reached through several paths, such as a symlinked include, is
+    // one include: rewriting it changes every place that reads it.
+    let mut includes = BTreeMap::<PathBuf, (Vec<PathBuf>, BTreeSet<Vec<String>>)>::new();
     for (path, scopes) in effective.include_scopes {
-        let Some(value) = read_config_value(&path)? else {
+        let file = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        let (paths, file_scopes) = includes.entry(file).or_default();
+        paths.push(path);
+        file_scopes.extend(scopes);
+    }
+    for (paths, scopes) in includes.into_values() {
+        let path = &paths[0];
+        let shared_include = || {
+            format!(
+                "cannot give the new environment its own Gateway port because OpenClaw include {} sets gateway.port and is also included elsewhere in the config; give gateway.port its own include before creating a new OCM environment",
+                display_path(path)
+            )
+        };
+        let Some(value) = read_config_value(path)? else {
             continue;
         };
         let mut rewritten = None;
@@ -257,21 +267,22 @@ fn rewrite_included_gateway_port(target: &EnvPaths, gateway_port: u32) -> Result
                 .as_ref()
                 .is_some_and(|previous| previous != &candidate)
             {
-                return Err(format!(
-                    "cannot give the new environment its own Gateway port because OpenClaw include {} sets gateway.port and is also included elsewhere in the config; give gateway.port its own include before creating a new OCM environment",
-                    display_path(&path)
-                ));
+                return Err(shared_include());
             }
             rewritten = Some(candidate);
         }
         if let Some(rewritten) = rewritten.filter(|rewritten| *rewritten != value) {
-            write_copied_config_value(&path, &target.state_dir, &rewritten)?;
+            if paths.len() > 1 {
+                return Err(shared_include());
+            }
+            write_copied_config_value(path, &target.state_dir, &rewritten)?;
         }
     }
-    if rewrite_port_coupled_mcp_app_sandbox(&mut config, source_port, gateway_port) {
-        write_config_value(&target.config_path, &config)?;
-    }
-    Ok(())
+    Ok(rewrite_port_coupled_mcp_app_sandbox(
+        config,
+        source_port,
+        gateway_port,
+    ))
 }
 
 /// Rewrites `gateway.port` in a config fragment included at `scope`.
@@ -544,9 +555,6 @@ pub(super) fn rewrite_archived_openclaw_config(
         .iter()
         .map(|root| derive_env_paths(root).state_dir)
         .collect::<Vec<_>>();
-    if let Some(gateway_port) = gateway_port {
-        rewrite_included_gateway_port(target_paths, gateway_port)?;
-    }
     rewrite_openclaw_config_with_path_rewriter(
         target_paths,
         gateway_port,
@@ -623,6 +631,12 @@ fn rewrite_openclaw_config_with_path_rewriter(
         &target_paths.workspace_dir,
     );
     if let Some(gateway_port) = gateway_port {
+        if matches!(
+            sandbox_origin_policy,
+            SandboxOriginPolicy::NewEnvironment(_)
+        ) {
+            changed |= rewrite_included_gateway_port(&mut value, target_paths, gateway_port)?;
+        }
         changed |= rewrite_gateway_port_family(&mut value, gateway_port);
     }
     if let SandboxOriginPolicy::NewEnvironment(sandbox_origin) = sandbox_origin_policy {

@@ -816,6 +816,14 @@ pub(super) fn load_effective_openclaw_config_with_config_roots(
     resolve_effective_openclaw_config(config_path, value, source_config_roots).map(Some)
 }
 
+/// Resolves an in-memory config as if it were stored at `config_path`.
+pub(crate) fn resolve_effective_openclaw_config_value(
+    config_path: &Path,
+    value: Value,
+) -> Result<EffectiveOpenClawConfig, String> {
+    resolve_effective_openclaw_config(config_path, value, &[])
+}
+
 fn resolve_effective_openclaw_config(
     config_path: &Path,
     value: Value,
