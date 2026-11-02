@@ -8,7 +8,8 @@ use crate::env::EnvMeta;
 
 use super::layout::{derive_env_paths, resolve_user_home};
 use super::openclaw_workspaces::{
-    load_effective_openclaw_config, load_effective_openclaw_config_with_config_roots,
+    OpenClawConfigReadContext, load_effective_openclaw_config_with_config_roots,
+    read_openclaw_config_field,
 };
 
 pub(crate) const DEFAULT_GATEWAY_PORT: u32 = 18_789;
@@ -273,9 +274,19 @@ fn openclaw_port_family(base_port: u32) -> Vec<u32> {
     (start_port..=end_port).collect()
 }
 
+// Read only `gateway.port`, as minimum setup reads the settings it fills, so
+// start never writes over a port this reader could not see. An inline port
+// overrides includes, and include branches that cannot supply the port are
+// not read.
 fn read_gateway_port_from_config(path: &Path) -> Option<u32> {
-    let config = load_effective_openclaw_config(path).ok()??;
-    read_port_number(config.value.get("gateway")?.get("port")?)
+    let port = read_openclaw_config_field(
+        path,
+        &["gateway", "port"],
+        &OpenClawConfigReadContext::default(),
+    )
+    .value
+    .ok()??;
+    read_port_number(&port)
 }
 
 pub(super) fn read_port_number(value: &Value) -> Option<u32> {
