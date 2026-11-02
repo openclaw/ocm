@@ -552,14 +552,16 @@ pub(crate) fn with_rollback_error(
 /// the user's home.
 fn plain_install_home(source_state_dir: &Path, env: &BTreeMap<String, String>) -> PathBuf {
     let user_home = clean_path(&resolve_user_home(env));
-    let source_state_dir = clean_path(source_state_dir);
+    // Compare identities through the supplied spelling: removing `..`
+    // lexically can name another directory once a link precedes it.
     if let (Ok(source), Ok(own)) = (
-        fs::canonicalize(&source_state_dir),
+        fs::canonicalize(source_state_dir),
         fs::canonicalize(user_home.join(".openclaw")),
     ) && source == own
     {
         return user_home;
     }
+    let source_state_dir = clean_path(source_state_dir);
     match source_state_dir.parent() {
         Some(home)
             if source_state_dir

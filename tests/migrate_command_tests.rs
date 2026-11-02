@@ -5185,7 +5185,7 @@ fn migrate_and_adopt_expand_home_relative_paths_of_a_custom_named_state_dir_agai
 #[cfg(unix)]
 #[test]
 fn migrate_and_adopt_expand_home_relative_paths_against_the_user_home_through_a_state_dir_alias() {
-    for adopt in [false, true] {
+    for (adopt, through_parent) in [(false, false), (true, false), (false, true), (true, true)] {
         let root = TestDir::new("migrate-home-relative-alias");
         let env = ocm_env(&root);
         let home = root.child("home");
@@ -5195,13 +5195,24 @@ fn migrate_and_adopt_expand_home_relative_paths_against_the_user_home_through_a_
         let alias = root.child("import/.openclaw");
         fs::create_dir_all(alias.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(&own, &alias).unwrap();
+        // `elsewhere/hop/../.openclaw` reaches the user's `~/.openclaw` only
+        // through the link; removing `..` lexically names a missing
+        // `elsewhere/.openclaw`.
+        fs::create_dir_all(home.join("deep")).unwrap();
+        fs::create_dir_all(root.child("elsewhere")).unwrap();
+        std::os::unix::fs::symlink(home.join("deep"), root.child("elsewhere/hop")).unwrap();
+        let source = if through_parent {
+            root.child("elsewhere/hop/../.openclaw")
+        } else {
+            alias.clone()
+        };
         let config = serde_json::json!({"plugins": {"load": {"paths": ["~/dev/my-plugin"]}}});
         support::write_text(&own.join("openclaw.json"), &config.to_string());
 
         let imported = run_ocm(
             root.path(),
             &env,
-            &migrate_or_adopt_args(adopt, "copied", &alias),
+            &migrate_or_adopt_args(adopt, "copied", &source),
         );
         assert!(imported.status.success(), "{}", stderr(&imported));
 
@@ -5214,7 +5225,7 @@ fn migrate_and_adopt_expand_home_relative_paths_against_the_user_home_through_a_
         assert_eq!(
             copied["plugins"]["load"]["paths"],
             serde_json::json!([home.join("dev/my-plugin").to_str().unwrap()]),
-            "adopt={adopt}"
+            "adopt={adopt}, through_parent={through_parent}"
         );
     }
 }
