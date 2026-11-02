@@ -65,7 +65,7 @@ fn launcher_command(recipe: &str) -> String {
 fn build_launcher_command_joins_the_last_command_before_a_trailing_comment_or_backslash() {
     for (recipe, expected) in [
         ("openclaw # dev", "openclaw 'gateway' 'two words' # dev"),
-        ("openclaw\t# dev", "openclaw\t'gateway' 'two words' # dev"),
+        ("openclaw\t# dev", "openclaw 'gateway' 'two words'\t# dev"),
         (
             "'/opt/open claw' # it's mine",
             "'/opt/open claw' 'gateway' 'two words' # it's mine",
@@ -75,6 +75,14 @@ fn build_launcher_command_joins_the_last_command_before_a_trailing_comment_or_ba
             r#"node "a # b" "${HOME}/x.mjs" $(cat flags) 'gateway' 'two words' # dev"#,
         ),
         (
+            r#"node "$(pwd)/entry.mjs" "$(dirname "$0")/x" `echo a` # dev"#,
+            r#"node "$(pwd)/entry.mjs" "$(dirname "$0")/x" `echo a` 'gateway' 'two words' # dev"#,
+        ),
+        (
+            "openclaw ${x:-\"a # b\"} $(echo ')' # c\n) # dev",
+            "openclaw ${x:-\"a # b\"} $(echo ')' # c\n) 'gateway' 'two words' # dev",
+        ),
+        (
             "cd /src && pnpm openclaw # dev",
             "cd /src && pnpm openclaw 'gateway' 'two words' # dev",
         ),
@@ -82,12 +90,20 @@ fn build_launcher_command_joins_the_last_command_before_a_trailing_comment_or_ba
             "echo setup # one\nopenclaw # two",
             "echo setup # one\nopenclaw 'gateway' 'two words' # two",
         ),
+        (
+            "pnpm openclaw\n# my checkout",
+            "pnpm openclaw 'gateway' 'two words'\n# my checkout",
+        ),
+        (
+            "openclaw # one\n  # two",
+            "openclaw 'gateway' 'two words' # one\n  # two",
+        ),
         // Operators still separate the arguments into a failing command.
         ("openclaw;# dev", "openclaw; 'gateway' 'two words' # dev"),
-        ("openclaw \\", "openclaw  'gateway' 'two words'"),
+        ("openclaw \\", "openclaw 'gateway' 'two words'"),
         (
             "'openclaw' --verbose \\",
-            "'openclaw' --verbose  'gateway' 'two words'",
+            "'openclaw' --verbose 'gateway' 'two words'",
         ),
     ] {
         assert_eq!(launcher_command(recipe), expected, "{recipe:?}");
@@ -98,7 +114,7 @@ fn build_launcher_command_joins_the_last_command_before_a_trailing_comment_or_ba
 fn build_launcher_command_appends_after_recipes_without_a_trailing_comment() {
     let mut recipes = vec![
         "openclaw",
-        "openclaw x#y $# ${HOME#/} ${x:-a # b}",
+        "openclaw x#y $# ${HOME#/} ${x:-a # b} $(echo a)#b",
         r"openclaw \# literal \\",
         "openclaw 'a # b' \"a # b\" `echo # x`",
         "echo setup # one\nopenclaw",
@@ -109,8 +125,9 @@ fn build_launcher_command_appends_after_recipes_without_a_trailing_comment() {
         // Unmodelled or unterminated forms keep the plain append.
         "cat <<EOF # x",
         "openclaw $'a' # x",
-        r#"node "$(dirname "$0")/x.mjs" # x"#,
+        "openclaw $(case x in a) echo;; esac) # x",
         "openclaw 'unterminated # x",
+        "openclaw \"$(echo # x\" # y",
     ];
     if cfg!(windows) {
         recipes.push("openclaw # dev");
