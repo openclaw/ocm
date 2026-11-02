@@ -158,9 +158,10 @@ fn is_word_at(bytes: &[u8], index: usize, word: &[u8]) -> bool {
             .is_none_or(|&next| ends_token(next))
 }
 
-/// Whether a token following `before` starts a command: nothing, an operator
-/// or a newline precedes it, or a reserved word in command position that a
-/// command follows.
+/// Whether a token following `before` may start a command: nothing, an
+/// operator or a newline precedes it, or a reserved word in command position
+/// that a command follows. A pipeline prefix (`!`, bash `time` and its options)
+/// also counts, so the scan errs toward the plain-append fallback.
 fn in_command_position(before: &[u8]) -> bool {
     let Some(last) = before
         .iter()
@@ -175,9 +176,13 @@ fn in_command_position(before: &[u8]) -> bool {
         .iter()
         .rposition(|&byte| ends_token(byte))
         .map_or(0, |at| at + 1);
+    let word = &before[first..=last];
+    if matches!(word, b"!" | b"time") || word.starts_with(b"-") {
+        return true;
+    }
     matches!(
-        &before[first..=last],
-        b"if" | b"then" | b"else" | b"elif" | b"while" | b"until" | b"do" | b"!" | b"{"
+        word,
+        b"if" | b"then" | b"else" | b"elif" | b"while" | b"until" | b"do" | b"{"
     ) && in_command_position(&before[..first])
 }
 

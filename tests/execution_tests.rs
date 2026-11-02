@@ -146,6 +146,7 @@ fn build_launcher_command_appends_after_recipes_without_a_trailing_comment() {
         r#"printf '%s\n' $(( $(printf 1; : "))) # marker") ))"#,
         "openclaw ${x:-$'a'} # x",
         r"openclaw ${x:-$'a\'} # marker'}",
+        r#"printf '%s\n' "$(time ! case x in x) printf "%s" ") # marker";; esac)""#,
         "openclaw 'unterminated # x",
         "openclaw \"$(echo # x\" # y",
     ];
