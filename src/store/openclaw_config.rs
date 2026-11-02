@@ -343,12 +343,10 @@ fn expand_home_relative_paths_in_scope(
                 HomePathRule::Lexical { trims } => {
                     match expand_home_relative_path(raw, home, trims) {
                         // The later relocation of state paths follows links
-                        // and would treat the placeholder as a directory name,
-                        // which OpenClaw substitutes before resolving `..`.
-                        Some(expanded)
-                            if has_home_relative_placeholder(raw, trims)
-                                && expansion.relocates(&expanded) =>
-                        {
+                        // and would read a placeholder, or an escaped `$${`,
+                        // as directory names, which OpenClaw substitutes or
+                        // unescapes before it resolves the path.
+                        Some(expanded) if raw.contains("${") && expansion.relocates(&expanded) => {
                             Err(KeptHomeRelativeReason::Placeholder)
                         }
                         Some(expanded) => Ok(expanded),

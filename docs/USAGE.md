@@ -1293,16 +1293,17 @@ rewritten like any other. In a value containing a `${VAR}` placeholder, only the
 directories before the first placeholder are resolved; OpenClaw substitutes the
 placeholder and resolves the rest, as it would for the same value spelled from
 your home, so a placeholder that itself leads into `~/.openclaw` names the
-source's state directory. A placeholder value under `~/.openclaw` stays as
-written, and migration prints a warning naming its setting, because its
-placeholder may still lead outside `~/.openclaw`. `nodeHost.workerRuns.folders`
-entries are not rewritten: OpenClaw resolves them to real paths, through
-symlinks, and grants workers access to the result, and migration can change the
-links and directories they resolve through (for example when it imports a linked
-workspace), so no spelling is known to keep the same folder. Their `~/...`
-entries now resolve under the environment root, and migration prints a warning
-naming the setting. Replace them with absolute paths to keep the original
-folders ([#972](https://github.com/openclaw/ocm/issues/972)). The trust roots
+source's state directory. A placeholder value under `~/.openclaw`, or one that
+reaches it through a symlink, stays as written, and migration prints a warning
+naming its setting, because the placeholder may still lead elsewhere once
+OpenClaw substitutes it. `nodeHost.workerRuns.folders` entries are not
+rewritten: OpenClaw resolves them to real paths, through symlinks, and grants
+workers access to the result, and migration can change the links and directories
+they resolve through (for example when it imports a linked workspace), so no
+spelling is known to keep the same folder. Their `~/...` entries now resolve
+under the environment root, and migration prints a warning naming the setting.
+Replace them with absolute paths to keep the original folders
+([#972](https://github.com/openclaw/ocm/issues/972)). The trust roots
 `skills.load.allowSymlinkTargets` and `security.installPolicy.exec.trustedDirs`
 are not rewritten, because that would change what the new environment trusts:
 their `~/...` entries outside `~/.openclaw` now resolve under the environment

@@ -5746,8 +5746,10 @@ fn migrate_and_adopt_keep_placeholder_paths_that_lead_into_the_state_dir_through
         // `~/external`; relocating the spelled-out value through the link
         // would name the environment's `external` instead.
         std::os::unix::fs::symlink(&source, home.join("alias")).unwrap();
+        // OpenClaw reads `$${X}` as the directory `${X}`, not this link.
+        std::os::unix::fs::symlink(&source, home.join("$${X}")).unwrap();
         let config = serde_json::json!({
-            "skills": {"load": {"extraDirs": ["~/alias/${SUB}", "~/shared/${SUB}"]}}
+            "skills": {"load": {"extraDirs": ["~/alias/${SUB}", "~/shared/${SUB}", "~/$${X}/skills"]}}
         });
         support::write_text(&source.join("openclaw.json"), &config.to_string());
 
@@ -5765,7 +5767,11 @@ fn migrate_and_adopt_keep_placeholder_paths_that_lead_into_the_state_dir_through
         let home_path = home.to_str().unwrap();
         assert_eq!(
             copied["skills"]["load"]["extraDirs"],
-            serde_json::json!(["~/alias/${SUB}", format!("{home_path}/shared/${{SUB}}")]),
+            serde_json::json!([
+                "~/alias/${SUB}",
+                format!("{home_path}/shared/${{SUB}}"),
+                "~/$${X}/skills"
+            ]),
             "adopt={adopt}"
         );
         assert!(
