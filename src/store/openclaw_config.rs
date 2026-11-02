@@ -281,9 +281,10 @@ fn expand_home_relative_paths(value: &mut Value, home: &Path) -> bool {
 
 fn expand_home_relative_path(raw: &str, home: &Path) -> Option<String> {
     // Only a leading `~` followed by a separator is expanded. A bare `~` is
-    // also an ordinary non-path value, and not every OpenClaw path setting
-    // trims surrounding whitespace before expanding, so those stay as written.
-    if !raw.starts_with("~/") && !raw.starts_with("~\\") {
+    // also an ordinary non-path value. OpenClaw path settings differ in
+    // whether they trim surrounding whitespace before expanding, so a value
+    // with surrounding whitespace has no single location and stays as written.
+    if (!raw.starts_with("~/") && !raw.starts_with("~\\")) || raw.trim_end() != raw {
         return None;
     }
     // Expand as OpenClaw does: replace the leading `~`, then resolve `.` and
@@ -2787,7 +2788,14 @@ mod tests {
         assert_eq!(expand("~/x/../.openclaw/y"), None);
         // OpenClaw replaces the `~` of `~\` too; on POSIX the rest stays one name.
         assert_eq!(expand("~\\dev").as_deref(), Some("/home/alice\\dev"));
-        for unchanged in ["~", " ~/dev/p", "~alice/dev", "dev/~/p", "/abs/~/p"] {
+        for unchanged in [
+            "~",
+            " ~/dev/p",
+            "~/dev/p ",
+            "~alice/dev",
+            "dev/~/p",
+            "/abs/~/p",
+        ] {
             assert_eq!(expand(unchanged), None, "{unchanged}");
         }
     }

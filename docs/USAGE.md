@@ -1262,10 +1262,13 @@ as a local plugin in `plugins.load.paths`, a `skills.load.extraDirs` entry, an
 agent directory or a session or cron store, is therefore rewritten in
 `openclaw.json` and its copied includes to the absolute path it named in the
 source home, with `.` and `..` resolved the way OpenClaw resolves them. The
-source home is the directory that contains the migrated `.openclaw`; for a state
-directory with another name it is your home directory. Values under
-`~/.openclaw` already name the environment's copied state and stay as written,
-as do a bare `~` and values with leading whitespace. Clone and archive import
+source home is your home directory when the migrated directory is your own
+`~/.openclaw`, through any path that leads to it. Otherwise it is the directory
+that contains a migrated `.openclaw`, or your home directory for a state
+directory with another name. Values under `~/.openclaw` already name the
+environment's copied state and stay as written, as do a bare `~` and values
+with leading or trailing whitespace, because OpenClaw settings differ in
+whether they trim it. Clone and archive import
 keep `~/...` values unchanged, because their source already expands `~` against
 an environment root.
 
