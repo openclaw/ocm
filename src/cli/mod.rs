@@ -502,7 +502,8 @@ impl Cli {
 
     /// Adds to a failed `<command> <word> <rest>...` invocation that `word`
     /// was read as a subcommand or help topic when an env of that name exists
-    /// and `rest` names no existing env, and how to address that env instead.
+    /// and `rest` names no existing env, alone or in a comma-separated list
+    /// such as `--envs`, and how to address that env instead.
     fn explain_env_name_collision<T>(
         &self,
         result: Result<T, String>,
@@ -511,9 +512,16 @@ impl Cli {
         rest: &[String],
     ) -> Result<T, String> {
         result.map_err(|error| {
-            let envs = self.environment_service();
-            let is_env = |name: &str| matches!(envs.find(name), Ok(Some(_)));
-            if !is_env(word) || rest.iter().any(|arg| !arg.starts_with('-') && is_env(arg)) {
+            let Ok(envs) = self.environment_service().list() else {
+                return error;
+            };
+            let is_env = |name: &str| envs.iter().any(|env| env.name == name);
+            let rest_names_env = rest
+                .iter()
+                .filter(|arg| !arg.starts_with('-'))
+                .flat_map(|arg| arg.split(','))
+                .any(is_env);
+            if !is_env(word) || rest_names_env {
                 return error;
             }
             let cmd = self.command_example();
