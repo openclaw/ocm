@@ -50,6 +50,7 @@ pub(crate) struct MigrateHomeResult {
     pub cleared_sandbox_origin: bool,
     pub sandbox_port: Option<u32>,
     pub external_plugin_ids: Vec<String>,
+    pub kept_home_relative_trust_roots: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -353,6 +354,7 @@ struct CompletedMigrationImport {
     cleared_sandbox_origin: bool,
     sandbox_port: Option<u32>,
     external_plugin_ids: Vec<String>,
+    kept_home_relative_trust_roots: Vec<String>,
 }
 
 pub fn default_migration_source_home(env: &BTreeMap<String, String>) -> PathBuf {
@@ -518,6 +520,7 @@ fn migrate_plain_openclaw_home_inner(
         cleared_sandbox_origin: completed.cleared_sandbox_origin,
         sandbox_port: completed.sandbox_port,
         external_plugin_ids: completed.external_plugin_ids,
+        kept_home_relative_trust_roots: completed.kept_home_relative_trust_roots,
     })
 }
 
@@ -646,6 +649,7 @@ fn complete_migration_import(
             cleared_sandbox_origin: config_rewrite.cleared_sandbox_origin,
             sandbox_port: config_rewrite.sandbox_port,
             external_plugin_ids: runtime_state.external_plugin_ids,
+            kept_home_relative_trust_roots: config_rewrite.kept_home_relative_trust_roots,
         });
     };
 
@@ -671,6 +675,7 @@ fn complete_migration_import(
             cleared_sandbox_origin: config_rewrite.cleared_sandbox_origin,
             sandbox_port: config_rewrite.sandbox_port,
             external_plugin_ids: runtime_state.external_plugin_ids,
+            kept_home_relative_trust_roots: config_rewrite.kept_home_relative_trust_roots,
         }),
         Err(error) => {
             let rollback = rollback_migrated_launcher(created_launcher.as_deref(), env, cwd);

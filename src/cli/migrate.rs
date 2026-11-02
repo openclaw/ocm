@@ -169,6 +169,10 @@ impl Cli {
             result.sandbox_port,
         );
         self.warn_external_migration_plugins(&result.external_plugin_ids);
+        self.warn_kept_home_relative_trust_roots(
+            &result.summary.name,
+            &result.kept_home_relative_trust_roots,
+        );
         let summary = result.summary;
 
         if json_flag {
@@ -211,6 +215,10 @@ impl Cli {
             result.sandbox_port,
         );
         self.warn_external_migration_plugins(&result.external_plugin_ids);
+        self.warn_kept_home_relative_trust_roots(
+            &result.summary.name,
+            &result.kept_home_relative_trust_roots,
+        );
         let summary = result.summary;
 
         if json_flag {
@@ -239,6 +247,14 @@ impl Cli {
         for plugin_id in plugin_ids {
             self.stderr_line(format!(
                 "warning: imported plugin {plugin_id} could not be isolated inside the env state; OCM preserved but did not copy or modify its external location"
+            ));
+        }
+    }
+
+    fn warn_kept_home_relative_trust_roots(&self, env_name: &str, settings: &[String]) {
+        for setting in settings {
+            self.stderr_line(format!(
+                "warning: env {env_name} keeps the ~/ entries of trust root {setting} as written; they now resolve under the env root instead of the source home, so OCM did not carry that trust over. Replace them with absolute paths to keep trusting the original directories"
             ));
         }
     }

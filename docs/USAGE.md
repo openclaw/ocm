@@ -1288,14 +1288,21 @@ including `skills.load.extraDirs`, `hooks.internal.load.extraDirs`, agent `cwd`,
 handling and lexical `.` and `..` resolution as its OpenClaw consumer. Settings
 OpenClaw expands against the OS home keep their meaning without a rewrite,
 because the environment keeps your `HOME`. Other strings, such as message text,
-stay as written. Not rewritten yet
-([#972](https://github.com/openclaw/ocm/issues/972)): values containing a
-`${VAR}` placeholder, which OpenClaw substitutes before resolving the path;
-`nodeHost.workerRuns.folders`; values in an include placed at a list position;
-and the trust roots `skills.load.allowSymlinkTargets` and
-`security.installPolicy.exec.trustedDirs`, which keep failing closed. The source
-home is your home directory when the migrated directory is your own
-`~/.openclaw`, through any path that leads to it;
+stay as written. Path values in an include placed at a list position are
+rewritten like any other. In a value containing a `${VAR}` placeholder, only the directories before the
+first placeholder are resolved; OpenClaw substitutes the placeholder and
+resolves the rest, as it would for the same value spelled from your home, so a
+placeholder that itself leads into `~/.openclaw` names the source's state
+directory. `nodeHost.workerRuns.folders` entries, which OpenClaw resolves
+through symlinks, only have their leading `~` replaced, so a link before `..`
+still decides where they lead. The trust roots `skills.load.allowSymlinkTargets`
+and `security.installPolicy.exec.trustedDirs` are not rewritten, because that
+would change what the new environment trusts: their `~/...` entries outside
+`~/.openclaw` now resolve under the environment root, and migration prints a
+warning naming each such setting. Replace those entries with absolute paths to
+keep trusting the original directories. The source home is your home
+directory when the migrated directory is your own `~/.openclaw`, through any
+path that leads to it;
 otherwise it is the directory that contains the migrated `.openclaw` as you
 spelled it, or as it is stored when only that path is named `.openclaw`, or
 your home directory for a state directory with another name. Values under

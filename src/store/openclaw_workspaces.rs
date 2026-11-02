@@ -37,7 +37,26 @@ impl<'a> OpenClawWorkspaceRuntime<'a> {
 pub(crate) struct EffectiveOpenClawConfig {
     pub(crate) value: Value,
     pub(crate) include_paths: BTreeSet<PathBuf>,
-    pub(crate) include_scopes: BTreeMap<PathBuf, BTreeSet<Vec<String>>>,
+    pub(crate) include_scopes: BTreeMap<PathBuf, BTreeSet<Vec<ConfigSegment>>>,
+}
+
+/// One step from the config root to a value, recorded while includes are
+/// traversed: once arrays from several includes are concatenated, a list
+/// index can no longer be told apart from a digit-only key in the result.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ConfigSegment {
+    Key(String),
+    Index(usize),
+}
+
+impl ConfigSegment {
+    /// Whether this step is spelled `name`; an index as its decimal digits.
+    pub(crate) fn is(&self, name: &str) -> bool {
+        match self {
+            Self::Key(key) => key == name,
+            Self::Index(index) => index.to_string() == name,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1542,16 +1561,16 @@ struct ConfigProjection {
 }
 
 impl ConfigProjection {
-    fn selects(&self, scope: &[String]) -> bool {
+    fn selects(&self, scope: &[ConfigSegment]) -> bool {
         // Keep selected leaves, their ancestors and complete leaf values.
         self.paths.iter().any(|path| {
             path.iter()
                 .zip(scope)
-                .all(|(expected, actual)| expected == actual)
+                .all(|(expected, actual)| actual.is(expected))
         })
     }
 
-    fn needed_from_include(&self, siblings: &Map<String, Value>, scope: &[String]) -> Self {
+    fn needed_from_include(&self, siblings: &Map<String, Value>, scope: &[ConfigSegment]) -> Self {
         Self {
             paths: self
                 .paths
@@ -1559,7 +1578,7 @@ impl ConfigProjection {
                 .filter(|path| {
                     path.iter()
                         .zip(scope)
-                        .all(|(expected, actual)| expected == actual)
+                        .all(|(expected, actual)| actual.is(expected))
                         && (path.len() <= scope.len()
                             || !scalar_override(siblings, &path[scope.len()..]))
                 })
@@ -1641,7 +1660,7 @@ struct IncludeProcessor {
     archived_config_roots: Vec<PathBuf>,
     canonical_root_dir: PathBuf,
     include_paths: BTreeSet<PathBuf>,
-    include_scopes: BTreeMap<PathBuf, BTreeSet<Vec<String>>>,
+    include_scopes: BTreeMap<PathBuf, BTreeSet<Vec<ConfigSegment>>>,
     projection: Option<ConfigProjection>,
     allowed_roots: Vec<PathBuf>,
     canonical_allowed_roots: Vec<PathBuf>,
@@ -1669,13 +1688,13 @@ impl IncludeProcessor {
         &self,
         base: ResolvedInclude,
         next: ResolvedInclude,
-        scope: &[String],
+        scope: &[ConfigSegment],
     ) -> ResolvedInclude {
         let masks_previous = self.projection.as_ref().is_some_and(|projection| {
             projection
                 .paths
                 .iter()
-                .filter(|path| path.iter().zip(scope).all(|(a, b)| a == b))
+                .filter(|path| path.iter().zip(scope).all(|(a, b)| b.is(a)))
                 .all(|path| {
                     scalar_value_override(&next.value, path.get(scope.len()..).unwrap_or(&[]))
                 })
@@ -1694,14 +1713,14 @@ impl IncludeProcessor {
         containing_file: &Path,
         depth: usize,
         stack: &mut Vec<PathBuf>,
-        scope: &[String],
+        scope: &[ConfigSegment],
     ) -> Result<ResolvedInclude, String> {
         if let Some(projection) = &self.projection {
             if !projection.selects(scope) {
                 return Ok(ResolvedInclude::known(Value::Null));
             }
             for path in &projection.paths {
-                if path.len() >= scope.len() && path.iter().zip(scope).all(|(a, b)| a == b) {
+                if path.len() >= scope.len() && path.iter().zip(scope).all(|(a, b)| b.is(a)) {
                     let mut observed = Some(&value);
                     for key in &path[scope.len()..] {
                         observed = observed.and_then(|v| v.get(key));
@@ -1716,7 +1735,7 @@ impl IncludeProcessor {
                 let mut outside = None;
                 for (index, value) in values.into_iter().enumerate() {
                     let mut child_scope = scope.to_vec();
-                    child_scope.push(index.to_string());
+                    child_scope.push(ConfigSegment::Index(index));
                     let child = self.process(value, containing_file, depth, stack, &child_scope)?;
                     outside = outside.or(child.outside);
                     result.push(child.value);
@@ -1734,7 +1753,7 @@ impl IncludeProcessor {
                             return true;
                         }
                         let mut child_scope = scope.to_vec();
-                        child_scope.push(key.clone());
+                        child_scope.push(ConfigSegment::Key(key.clone()));
                         projection.selects(&child_scope)
                     });
                 }
@@ -1771,7 +1790,7 @@ impl IncludeProcessor {
                 let mut outside = None;
                 for (key, value) in object {
                     let mut child_scope = scope.to_vec();
-                    child_scope.push(key.clone());
+                    child_scope.push(ConfigSegment::Key(key.clone()));
                     let child = self.process(value, containing_file, depth, stack, &child_scope)?;
                     outside = outside.or(child.outside);
                     siblings.insert(key, child.value);
@@ -1796,7 +1815,7 @@ impl IncludeProcessor {
         containing_file: &Path,
         depth: usize,
         stack: &mut Vec<PathBuf>,
-        scope: &[String],
+        scope: &[ConfigSegment],
     ) -> Result<ResolvedInclude, String> {
         match include {
             Value::String(path) => self.load_include(&path, containing_file, depth, stack, scope),
@@ -1821,7 +1840,7 @@ impl IncludeProcessor {
         containing_file: &Path,
         depth: usize,
         stack: &mut Vec<PathBuf>,
-        scope: &[String],
+        scope: &[ConfigSegment],
     ) -> Result<ResolvedInclude, String> {
         if depth >= MAX_INCLUDE_DEPTH {
             return Err(format!(
