@@ -29,6 +29,9 @@ pub(crate) const STORAGE_TAR_ARCHIVE: &str = "tar-archive-v1";
 const PREPARATION_PREFIX: &str = ".checkpoint-preparation-";
 // The owning capture holds this lock for the workspace's whole life.
 const PREPARATION_LOCK: &str = ".lock";
+// Removal renames the lock here before releasing it, so a creator that locks
+// the file afterwards no longer finds it at `PREPARATION_LOCK`.
+const RELEASED_PREPARATION_LOCK: &str = ".lock.released";
 
 #[derive(Debug)]
 pub(crate) struct PreparedTreeCheckpoint {
@@ -146,7 +149,13 @@ pub(crate) fn remove_abandoned_checkpoint_preparations(parent: &Path) -> Result<
     };
     let mut failures = Vec::new();
     for entry in entries {
-        let entry = entry.map_err(|error| error.to_string())?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                failures.push(error.to_string());
+                continue;
+            }
+        };
         if !entry
             .file_name()
             .to_str()
@@ -158,7 +167,10 @@ pub(crate) fn remove_abandoned_checkpoint_preparations(parent: &Path) -> Result<
         let path = entry.path();
         let lock_path = path.join(PREPARATION_LOCK);
         if !fs::symlink_metadata(&lock_path).is_ok_and(|metadata| metadata.is_file()) {
-            // Fails unless empty: a lockless tree is not provably a leftover.
+            // A released lock means its contents were already removed. The
+            // directory removal fails unless it is then empty: a lockless tree
+            // is not provably a leftover.
+            let _ = fs::remove_file(path.join(RELEASED_PREPARATION_LOCK));
             let _ = fs::remove_dir(&path);
             continue;
         }
@@ -194,20 +206,22 @@ fn remove_preparation(root: &Path, lock: Option<ExclusiveFileLock>) -> Result<()
             remove_tree_if_present(&path)?;
         }
     }
-    // Windows cannot remove an open lock file. Elsewhere, keep the lock until
-    // its file is gone, so a creator that locked it finds it unlinked.
-    #[cfg(windows)]
-    drop(lock);
-    remove_tree_if_present(&lock_path)?;
-    match fs::remove_dir(root) {
+    // Move the lock aside while still holding it: a creator that locks it
+    // afterwards finds no lock at its path and allocates another workspace.
+    // The released file is removed after its lock closes, as Windows requires.
+    let released = root.join(RELEASED_PREPARATION_LOCK);
+    match fs::rename(&lock_path, &released) {
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
             return Err(error.to_string());
         }
         _ => {}
     }
-    #[cfg(not(windows))]
     drop(lock);
-    Ok(())
+    remove_tree_if_present(&released)?;
+    match fs::remove_dir(root) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.to_string()),
+        _ => Ok(()),
+    }
 }
 
 impl PreparedTreeCheckpoint {
@@ -2552,6 +2566,12 @@ mod tests {
         )
         .unwrap();
         let unowned = workspace("unowned");
+        // A removal stopped after releasing its lock leaves only the released file.
+        let released = storage
+            .path()
+            .join(format!("{}released", super::PREPARATION_PREFIX));
+        fs::create_dir(&released).unwrap();
+        fs::write(released.join(super::RELEASED_PREPARATION_LOCK), "").unwrap();
         let empty = storage
             .path()
             .join(format!("{}empty", super::PREPARATION_PREFIX));
@@ -2577,6 +2597,7 @@ mod tests {
         let live = prepared.cleanup.0.root.clone();
         assert!(!abandoned.exists());
         assert!(!empty.exists());
+        assert!(!released.exists());
         assert!(elsewhere.join("tree/.openclaw/state.json").exists());
         assert!(unowned.join("tree/.openclaw/state.json").exists());
         assert!(snapshot.is_dir());
