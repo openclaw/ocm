@@ -5648,3 +5648,168 @@ fn copies_finish_under_read_only_source_directories() {
     assert_eq!(directory_mode(&source), 0o500);
     make_removable(root.path());
 }
+
+// Enough small files that the copy is still running when the watcher sees the
+// first ones arrive in the target.
+#[cfg(unix)]
+const INTERRUPT_FIXTURE_FILES: usize = 10_000;
+
+#[cfg(unix)]
+fn write_interrupt_fixture(workspace: &Path) {
+    let bulk = workspace.join("bulk");
+    fs::create_dir_all(&bulk).unwrap();
+    for index in 0..INTERRUPT_FIXTURE_FILES {
+        fs::write(bulk.join(format!("f{index:05}")), [b'x'; 1024]).unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn env_clone_interrupted_mid_copy_removes_its_root_so_a_retry_succeeds() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let root = TestDir::new("env-clone-interrupt");
+    let env = ocm_env(&root);
+    let created = run_ocm(root.path(), &env, &["env", "create", "source"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    write_interrupt_fixture(&root.child("ocm-home/envs/source/.openclaw/workspace"));
+    let target = root.child("ocm-home/envs/target");
+
+    for signal in [libc::SIGTERM, libc::SIGINT] {
+        let interrupted = (0..3)
+            .find_map(|_| {
+                let interrupted = support::signal_ocm_while_filling(
+                    root.path(),
+                    &env,
+                    &["env", "clone", "source", "target"],
+                    &target.join(".openclaw/workspace/bulk"),
+                    100,
+                    signal,
+                );
+                // A clone that registered completed before the signal took
+                // effect; undo it and try again.
+                let shown = run_ocm(root.path(), &env, &["env", "show", "target"]);
+                if shown.status.success() {
+                    let removed = run_ocm(root.path(), &env, &["env", "remove", "target"]);
+                    assert!(removed.status.success(), "{}", stderr(&removed));
+                    return None;
+                }
+                Some(interrupted)
+            })
+            .expect("the clone always finished before it could be interrupted");
+        assert_eq!(
+            (interrupted.status.code(), interrupted.status.signal()),
+            (Some(130), None),
+            "signal {signal}: {}",
+            stderr(&interrupted)
+        );
+        assert!(
+            fs::symlink_metadata(&target).is_err(),
+            "signal {signal} left the provisional root"
+        );
+
+        let retried = run_ocm(root.path(), &env, &["env", "clone", "source", "target"]);
+        assert!(retried.status.success(), "{}", stderr(&retried));
+        assert_eq!(
+            fs::read_dir(target.join(".openclaw/workspace/bulk"))
+                .unwrap()
+                .count(),
+            INTERRUPT_FIXTURE_FILES
+        );
+        let removed = run_ocm(root.path(), &env, &["env", "remove", "target"]);
+        assert!(removed.status.success(), "{}", stderr(&removed));
+    }
+
+    // A root that held files before the command is never OCM's to reclaim.
+    let foreign = root.child("foreign");
+    write_text(&foreign.join("user-file"), "keep");
+    let refused = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "env",
+            "clone",
+            "source",
+            "target",
+            "--root",
+            foreign.to_str().unwrap(),
+        ],
+    );
+    assert!(!refused.status.success());
+    assert!(stderr(&refused).contains("root already exists and is not empty"));
+    assert_eq!(
+        fs::read_dir(&foreign)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>(),
+        ["user-file"]
+    );
+    assert_eq!(
+        fs::read_to_string(foreign.join("user-file")).unwrap(),
+        "keep"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn env_clone_waiting_for_the_registry_lock_stops_on_a_signal() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::time::{Duration, Instant};
+
+    let root = TestDir::new("env-clone-interrupt-lock");
+    let env = ocm_env(&root);
+    let created = run_ocm(root.path(), &env, &["env", "create", "source"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    // Another command holds the registry, as a running clone does for its
+    // whole copy.
+    let registry = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(root.child("ocm-home/envs.lock"))
+        .unwrap();
+    fs2::FileExt::lock_exclusive(&registry).unwrap();
+
+    // Nothing shows when the clone has installed its signal owner, so a signal
+    // that arrives before that ends the process by default; wait longer then.
+    let output = [1, 3, 9]
+        .into_iter()
+        .find_map(|delay| {
+            let mut child = std::process::Command::new(support::ocm_test_binary_path())
+                .current_dir(root.path())
+                .args(["env", "clone", "source", "target"])
+                .env_clear()
+                .envs(&env)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            std::thread::sleep(Duration::from_secs(delay));
+            assert!(child.try_wait().unwrap().is_none(), "clone did not wait");
+            let pid = libc::pid_t::try_from(child.id()).unwrap();
+            assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while child.try_wait().unwrap().is_none() {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    panic!("clone kept waiting for the registry after SIGTERM");
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let output = child.wait_with_output().unwrap();
+            (output.status.signal() != Some(libc::SIGTERM)).then_some(output)
+        })
+        .expect("the clone never handled SIGTERM while waiting");
+    assert_eq!(
+        (output.status.code(), output.status.signal()),
+        (Some(130), None),
+        "{}",
+        stderr(&output)
+    );
+    assert!(fs::symlink_metadata(root.child("ocm-home/envs/target")).is_err());
+    drop(registry);
+    let shown = run_ocm(root.path(), &env, &["env", "show", "target"]);
+    assert!(!shown.status.success());
+}

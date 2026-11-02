@@ -1119,6 +1119,57 @@ pub fn run_ocm_within(
     }
 }
 
+/// Run ocm and send it `signal` once `watched` holds at least `entries`
+/// entries, so the signal lands while ocm is still filling that directory.
+/// A descheduled watcher can signal too late, or not at all; the caller tells
+/// that from a completed command by what the command registered.
+#[cfg(unix)]
+pub fn signal_ocm_while_filling(
+    cwd: &Path,
+    env: &BTreeMap<String, String>,
+    args: &[&str],
+    watched: &Path,
+    entries: usize,
+    signal: libc::c_int,
+) -> Output {
+    let mut child = Command::new(ocm_test_binary_path())
+        .current_dir(cwd)
+        .args(args)
+        .env_clear()
+        .envs(env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return child.wait_with_output().unwrap();
+        }
+        if fs::read_dir(watched).map_or(0, Iterator::count) >= entries {
+            let pid = libc::pid_t::try_from(child.id()).unwrap();
+            assert_eq!(unsafe { libc::kill(pid, signal) }, 0);
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{} never held {entries} entries", watched.display());
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("ocm {args:?} did not exit after signal {signal}");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    child.wait_with_output().unwrap()
+}
+
 #[cfg(unix)]
 pub fn make_fifo(path: &Path) {
     use std::os::unix::ffi::OsStrExt;

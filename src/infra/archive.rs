@@ -385,6 +385,19 @@ impl Write for ArchiveOutput {
     }
 }
 
+/// The archive being extracted. A requested cancellation fails the next read,
+/// so a signal stops extraction and the importer's staging cleanup runs.
+struct ArchiveInput(File);
+
+impl Read for ArchiveInput {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if crate::infra::interrupt::cancellation_requested() {
+            return Err(crate::infra::interrupt::cancelled_error());
+        }
+        self.0.read(buf)
+    }
+}
+
 fn append_env_root(
     builder: &mut Builder<ArchiveOutput>,
     source_root: &Path,
@@ -1593,7 +1606,7 @@ pub fn extract_env_archive<T: DeserializeOwned>(
     fs::create_dir_all(staging_dir).map_err(|error| error.to_string())?;
 
     let file = File::open(archive_path).map_err(|error| error.to_string())?;
-    let mut archive = Archive::new(file);
+    let mut archive = Archive::new(ArchiveInput(file));
     archive
         .unpack(staging_dir)
         .map_err(|error| error.to_string())?;
