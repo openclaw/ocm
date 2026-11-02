@@ -1298,10 +1298,11 @@ value spelled from your home, so a placeholder that itself leads into
 setting, because its placeholder may still lead outside `~/.openclaw`.
 `nodeHost.workerRuns.folders` entries, which OpenClaw resolves through
 symlinks, only have their leading `~` replaced, so a link before `..` still
-decides where they lead; an entry that then names a directory inside
-`~/.openclaw` moves to the environment's copy like any other state path, and
-one that would only reach the copy by stepping over a directory missing from
-`~/.openclaw` stays as written, so OpenClaw keeps rejecting it. The trust roots
+decides where they lead. An entry whose `..` or placeholder leads into
+`~/.openclaw` stays as written instead, and migration prints a warning naming
+its setting: OpenClaw then resolves it through the environment's copy of
+`~/.openclaw`, whose links and directories can differ from the source, for
+example after a linked workspace is imported. The trust roots
 `skills.load.allowSymlinkTargets` and `security.installPolicy.exec.trustedDirs`
 are not rewritten, because that would change what the new environment trusts:
 their `~/...` entries outside `~/.openclaw` now resolve under the environment

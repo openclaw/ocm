@@ -5489,7 +5489,7 @@ fn migrate_and_adopt_expand_home_relative_paths_with_placeholders_before_substit
             warnings
                 .lines()
                 .filter(|line| line.starts_with(
-                    "warning: env copied keeps the ~/.openclaw entries of skills.load.extraDirs[] that contain a ${VAR} placeholder"
+                    "warning: env copied keeps the ~/ entries of skills.load.extraDirs[] that contain a ${VAR} placeholder and point into ~/.openclaw"
                 ))
                 .count(),
             1,
@@ -5566,6 +5566,64 @@ fn migrate_and_adopt_expand_worker_folders_without_resolving_parent_traversal() 
         assert_eq!(
             fs::canonicalize(folders[1].as_str().unwrap()).unwrap(),
             fs::canonicalize(home.join("data/work")).unwrap()
+        );
+        let warnings = stderr(&imported);
+        assert_eq!(
+            warnings
+                .lines()
+                .filter(|line| line.starts_with(
+                    "warning: env copied keeps the ~/ entries of nodeHost.workerRuns.folders[] whose .. leads into ~/.openclaw as written"
+                ))
+                .count(),
+            1,
+            "adopt={adopt}: {warnings}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn migrate_and_adopt_keep_worker_folders_resolved_through_an_imported_workspace() {
+    for adopt in [false, true] {
+        let root = TestDir::new("migrate-home-relative-worker-workspace");
+        let env = ocm_env(&root);
+        let home = root.child("home");
+        let source = home.join(".openclaw");
+        fs::create_dir_all(source.join("wf")).unwrap();
+        fs::create_dir_all(home.join("external/deep")).unwrap();
+        fs::create_dir_all(home.join("external/wf")).unwrap();
+        // OpenClaw resolves `workspace/../wf` to `~/external/wf`. Migration
+        // imports the linked workspace, so the copied state no longer has
+        // that link and the same entry would name the copied `wf`.
+        std::os::unix::fs::symlink(home.join("external/deep"), source.join("workspace")).unwrap();
+        let config = serde_json::json!({
+            "agents": {"defaults": {"workspace": "~/.openclaw/workspace"}},
+            "nodeHost": {"workerRuns": {"folders": ["~/.openclaw/workspace/../wf"]}}
+        });
+        support::write_text(&source.join("openclaw.json"), &config.to_string());
+
+        let imported = run_ocm(
+            root.path(),
+            &env,
+            &migrate_or_adopt_args(adopt, "copied", &source),
+        );
+        assert!(imported.status.success(), "{}", stderr(&imported));
+
+        let target = root.child("ocm-home/envs/copied/.openclaw");
+        let copied: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(target.join("openclaw.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            copied["nodeHost"]["workerRuns"]["folders"],
+            serde_json::json!(["~/.openclaw/workspace/../wf"]),
+            "adopt={adopt}"
+        );
+        assert!(
+            stderr(&imported).lines().any(|line| line.starts_with(
+                "warning: env copied keeps the ~/ entries of nodeHost.workerRuns.folders[] whose .. leads into ~/.openclaw as written"
+            )),
+            "adopt={adopt}: {}",
+            stderr(&imported)
         );
     }
 }

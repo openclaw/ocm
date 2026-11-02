@@ -59,6 +59,10 @@ pub(crate) enum KeptHomeRelativeReason {
     /// A value under `~/.openclaw` with a `${VAR}` placeholder, which may
     /// lead outside the state directory once substituted.
     Placeholder,
+    /// A value resolved through links whose `..` passes through
+    /// `~/.openclaw`, where the copied state's links and directories decide
+    /// where it leads.
+    StateDirTraversal,
 }
 
 pub(crate) fn audit_openclaw_config(
@@ -325,37 +329,46 @@ fn expand_home_relative_paths_in_scope(
             let Some(rule) = home_relative_path_setting(scope) else {
                 return false;
             };
-            let (expanded, trims) = match rule {
+            let expanded = match rule {
                 HomePathRule::Lexical { trims } => {
-                    (expand_home_relative_path(raw, home, trims), trims)
+                    match expand_home_relative_path(raw, home, trims) {
+                        Some(expanded) => Ok(expanded),
+                        // A placeholder under `~/.openclaw` can still lead outside it.
+                        None if has_home_relative_placeholder(raw, trims) => {
+                            Err(KeptHomeRelativeReason::Placeholder)
+                        }
+                        None => return false,
+                    }
                 }
                 HomePathRule::Physical => {
-                    (expand_physical_home_relative_path(raw, expansion), false)
+                    match expand_physical_home_relative_path(raw, expansion) {
+                        Ok(Some(expanded)) => Ok(expanded),
+                        Ok(None) => return false,
+                        Err(reason) => Err(reason),
+                    }
                 }
                 HomePathRule::TrustRoot => {
-                    let moves = expand_home_relative_path(raw, home, true).is_some()
-                        || has_home_relative_placeholder(raw, true);
-                    if moves {
-                        kept.insert(KeptHomeRelativeSetting {
-                            setting: config_setting_name(scope),
-                            reason: KeptHomeRelativeReason::TrustRoot,
-                        });
+                    if expand_home_relative_path(raw, home, true).is_none()
+                        && !has_home_relative_placeholder(raw, true)
+                    {
+                        return false;
                     }
-                    return false;
+                    Err(KeptHomeRelativeReason::TrustRoot)
                 }
             };
-            let Some(expanded) = expanded else {
-                // A placeholder under `~/.openclaw` can still lead outside it.
-                if has_home_relative_placeholder(raw, trims) {
+            match expanded {
+                Ok(expanded) => {
+                    *raw = expanded;
+                    true
+                }
+                Err(reason) => {
                     kept.insert(KeptHomeRelativeSetting {
                         setting: config_setting_name(scope),
-                        reason: KeptHomeRelativeReason::Placeholder,
+                        reason,
                     });
+                    false
                 }
-                return false;
-            };
-            *raw = expanded;
-            true
+            }
         }
         Value::Array(values) => {
             let mut changed = false;
@@ -590,41 +603,60 @@ fn expand_home_relative_path(raw: &str, home: &Path, trims: bool) -> Option<Stri
 
 /// Expands a setting OpenClaw resolves through links. Only the leading `~`
 /// is replaced: the consumer follows each link before the `..` after it,
-/// which removing `..` here would change. A value under `~/.openclaw` with
-/// no `..` already names the copied state directory and stays as written.
-/// The later relocation of absolute state paths follows existing links as
-/// the consumer does, but it steps over a missing directory the consumer
-/// would reject. An entry it would move into the copied state although the
-/// source path does not resolve stays as written, so it keeps resolving
-/// through the copy of that missing directory.
-fn expand_physical_home_relative_path(raw: &str, expansion: &HomeExpansion<'_>) -> Option<String> {
+/// which removing `..` here would change. Returns `Ok(None)` for a value
+/// that keeps its meaning as written, such as one under `~/.openclaw` with
+/// no `..`, which already names the copied state directory. The later
+/// relocation of absolute state paths would move a spelled-out entry whose
+/// `..` or placeholder leads into the state directory to the copied state,
+/// whose links and directories migration may have changed (an imported
+/// workspace, for example), so it would no longer follow the source's links.
+/// Such an entry stays as written and is reported instead, as is a
+/// placeholder value under `~/.openclaw`.
+fn expand_physical_home_relative_path(
+    raw: &str,
+    expansion: &HomeExpansion<'_>,
+) -> Result<Option<String>, KeptHomeRelativeReason> {
     let home = expansion.home;
     if !is_home_relative(raw) {
-        return None;
+        return Ok(None);
     }
     let (literal, rest) = split_before_placeholder(raw);
     let mut literal_path = home.as_os_str().to_os_string();
     literal_path.push(&literal[1..]);
     let literal_path = Path::new(&literal_path);
-    if literal_path.starts_with(home.join(".openclaw"))
-        && (!rest.is_empty()
-            || !literal_path
-                .components()
-                .any(|component| component == std::path::Component::ParentDir))
-    {
-        return None;
+    let has_parent = |path: &Path| {
+        path.components()
+            .any(|component| component == std::path::Component::ParentDir)
+    };
+    if literal_path.starts_with(home.join(".openclaw")) {
+        if !rest.is_empty() {
+            return Err(KeptHomeRelativeReason::Placeholder);
+        }
+        if !has_parent(literal_path) {
+            return Ok(None);
+        }
     }
-    let expanded = format!("{}{}", home.to_str()?, &raw[1..]);
+    let Some(home_text) = home.to_str() else {
+        return Ok(None);
+    };
+    let expanded = format!("{home_text}{}", &raw[1..]);
+    // Probe a scratch copy with the same relocation that runs later: an
+    // entry it leaves alone keeps following the source's own links.
     let mut relocated = expanded.clone();
-    if rewrite_env_root_string(
-        &mut relocated,
-        expansion.source_state_dir,
-        expansion.target_state_dir,
-    ) && fs::canonicalize(&expanded).is_err()
+    if (has_parent(Path::new(&expanded)) || !rest.is_empty())
+        && rewrite_env_root_string(
+            &mut relocated,
+            expansion.source_state_dir,
+            expansion.target_state_dir,
+        )
     {
-        return None;
+        return Err(if rest.is_empty() {
+            KeptHomeRelativeReason::StateDirTraversal
+        } else {
+            KeptHomeRelativeReason::Placeholder
+        });
     }
-    Some(expanded)
+    Ok(Some(expanded))
 }
 
 /// Moves a Gateway port that a copied `$include` supplies to `gateway_port`,
@@ -3293,7 +3325,7 @@ mod tests {
             source_state_dir: Path::new("/home/alice/.openclaw"),
             target_state_dir: Path::new("/envs/copied/.openclaw"),
         };
-        let expand = |raw| expand_physical_home_relative_path(raw, &expansion);
+        let expand = |raw| expand_physical_home_relative_path(raw, &expansion).unwrap();
         assert_eq!(expand("~/work").as_deref(), Some("/home/alice/work"));
         assert_eq!(expand("~").as_deref(), Some("/home/alice"));
         // `..` stays for the consumer to resolve after following `hop`.
@@ -3310,21 +3342,29 @@ mod tests {
             expand("~/.openclaw/../../shared").as_deref(),
             Some("/home/alice/.openclaw/../../shared")
         );
-        // The relocation would step over `missing`, which does not resolve.
-        assert_eq!(expand("~/.openclaw/missing/../wf"), None);
+        // The relocation would resolve these through the copied state.
+        for traversal in ["~/.openclaw/missing/../wf", "~/.openclaw/a/../wf"] {
+            assert_eq!(
+                expand_physical_home_relative_path(traversal, &expansion),
+                Err(KeptHomeRelativeReason::StateDirTraversal),
+                "{traversal}"
+            );
+        }
         assert_eq!(
             expand("~/${SUB}/work").as_deref(),
             Some("/home/alice/${SUB}/work")
         );
         // The consumer does not trim.
         assert_eq!(expand(" ~/work"), None);
-        for copied in [
-            "~/.openclaw",
-            "~/.openclaw/wf",
-            "~/.openclaw/${SUB}",
-            "~/.openclaw/a/../${SUB}",
-        ] {
+        for copied in ["~/.openclaw", "~/.openclaw/wf"] {
             assert_eq!(expand(copied), None, "{copied}");
+        }
+        for placeholder in ["~/.openclaw/${SUB}", "~/.openclaw/a/../${SUB}"] {
+            assert_eq!(
+                expand_physical_home_relative_path(placeholder, &expansion),
+                Err(KeptHomeRelativeReason::Placeholder),
+                "{placeholder}"
+            );
         }
         assert_eq!(
             expand("~/.openclawish").as_deref(),

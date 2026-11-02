@@ -263,7 +263,10 @@ impl Cli {
                     "warning: env {env_name} keeps the ~/ entries of trust root {setting} as written; they now resolve under the env root instead of the source home, so OCM did not carry that trust over. Replace them with absolute paths to keep trusting the original directories"
                 ),
                 crate::store::KeptHomeRelativeReason::Placeholder => format!(
-                    "warning: env {env_name} keeps the ~/.openclaw entries of {setting} that contain a ${{VAR}} placeholder as written; if a placeholder leads outside ~/.openclaw, the entry now resolves under the env root instead of the source home. Replace such entries with absolute paths"
+                    "warning: env {env_name} keeps the ~/ entries of {setting} that contain a ${{VAR}} placeholder and point into ~/.openclaw as written; if a placeholder leads them outside ~/.openclaw, they now resolve under the env root instead of the source home. Replace such entries with absolute paths"
+                ),
+                crate::store::KeptHomeRelativeReason::StateDirTraversal => format!(
+                    "warning: env {env_name} keeps the ~/ entries of {setting} whose .. leads into ~/.openclaw as written; OpenClaw now resolves them through the env's copy of ~/.openclaw, whose links and directories can differ from the source, so they may name a different directory than before. Check them and replace them with absolute paths if needed"
                 ),
             });
         }
