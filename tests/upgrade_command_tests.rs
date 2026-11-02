@@ -4754,14 +4754,34 @@ fn interrupted_pull_request_resolution_removes_its_checkout() {
     let real_git = stdout(&real_git).trim().to_string();
     // A terminal delivers Ctrl-C or a hangup to the whole foreground group,
     // including the running fetch; `kill` or a service manager may signal
-    // only OCM, whose fetch then finishes before the run stops.
-    for (signal, signal_process_group) in [
-        (libc::SIGINT, true),
-        (libc::SIGTERM, false),
-        (libc::SIGHUP, false),
+    // only OCM, whose fetch then finishes before the run stops. The last case
+    // holds the final OpenClaw checkout validation instead of the fetch.
+    for (signal, signal_process_group, hold_validation) in [
+        (libc::SIGINT, true, false),
+        (libc::SIGTERM, false, false),
+        (libc::SIGHUP, false, false),
+        (libc::SIGTERM, false, true),
     ] {
         let root = TestDir::new("upgrade-simulate-pr-interrupted");
         let repo = init_openclaw_repo(&root);
+        // Validation reads the PR's package.json; as a link to a FIFO it
+        // blocks there until the test writes it.
+        let package = root.child("package.fifo");
+        if hold_validation {
+            let fifo = std::ffi::CString::new(path_string(&package)).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+            fs::remove_file(repo.join("package.json")).unwrap();
+            std::os::unix::fs::symlink(&package, repo.join("package.json")).unwrap();
+            for args in [&["add", "-A"][..], &["commit", "-q", "-m", "pr"][..]] {
+                let git = Command::new("git")
+                    .arg("-C")
+                    .arg(&repo)
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(git.status.success(), "{}", stderr(&git));
+            }
+        }
         let head = Command::new("git")
             .arg("-C")
             .arg(&repo)
@@ -4779,15 +4799,17 @@ fn interrupted_pull_request_resolution_removes_its_checkout() {
 
         let started = root.child("fetch.started");
         let release = root.child("fetch.release");
-        write_executable_script(
-            &root.child("fake-sim-bin/git"),
-            &format!(
-                "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = fetch ]; then\n    : > '{}'\n    while [ ! -e '{}' ]; do sleep 0.01; done\n    break\n  fi\ndone\nexec '{}' \"$@\"\n",
-                path_string(&started),
-                path_string(&release),
-                real_git
-            ),
-        );
+        if !hold_validation {
+            write_executable_script(
+                &root.child("fake-sim-bin/git"),
+                &format!(
+                    "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = fetch ]; then\n    : > '{}'\n    while [ ! -e '{}' ]; do sleep 0.01; done\n    break\n  fi\ndone\nexec '{}' \"$@\"\n",
+                    path_string(&started),
+                    path_string(&release),
+                    real_git
+                ),
+            );
+        }
         let output_path = root.child("simulation.out");
         let error_path = root.child("simulation.err");
         let mut simulation = SimulationChild(
@@ -4811,13 +4833,24 @@ fn interrupted_pull_request_resolution_removes_its_checkout() {
                 .unwrap(),
         );
         let deadline = Instant::now() + Duration::from_secs(60);
-        while !started.exists() {
+        let mut validation = None;
+        while !(started.exists() || validation.is_some()) {
             assert!(
                 simulation.0.try_wait().unwrap().is_none() && Instant::now() < deadline,
-                "simulation did not reach the PR fetch: {:?}; {:?}",
+                "simulation did not reach the held step: {:?}; {:?}",
                 fs::read_to_string(&output_path),
                 fs::read_to_string(&error_path)
             );
+            if hold_validation {
+                // A non-blocking open for writing succeeds only once OCM is
+                // opening the FIFO for reading.
+                use std::os::unix::fs::OpenOptionsExt;
+                validation = fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&package)
+                    .ok();
+            }
             sleep(Duration::from_millis(25));
         }
         let staged = || {
@@ -4827,7 +4860,7 @@ fn interrupted_pull_request_resolution_removes_its_checkout() {
                 .filter(|name| name.starts_with("ocm-pr-"))
                 .collect::<Vec<_>>()
         };
-        assert_eq!(staged().len(), 1, "the PR checkout is staged before fetch");
+        assert_eq!(staged().len(), 1, "the PR checkout is staged first");
 
         let target = if signal_process_group {
             -(simulation.0.id() as i32)
@@ -4835,7 +4868,12 @@ fn interrupted_pull_request_resolution_removes_its_checkout() {
             simulation.0.id() as i32
         };
         assert_eq!(unsafe { libc::kill(target, signal) }, 0);
-        fs::write(&release, "").unwrap();
+        if let Some(mut validation) = validation {
+            // A package OCM would otherwise reject as not OpenClaw.
+            validation.write_all(br#"{"name":"not-openclaw"}"#).unwrap();
+        } else {
+            fs::write(&release, "").unwrap();
+        }
         let status = simulation.0.wait().unwrap();
         let errors = fs::read_to_string(&error_path).unwrap();
         assert_eq!(status.code(), Some(1), "signal {signal}: {errors}");

@@ -52,10 +52,13 @@ impl PreparedPullRequest {
             number,
             head_sha,
         };
-        let checkout = tempfile::Builder::new()
-            .prefix("ocm-pr-")
-            .tempdir()
-            .map_err(|error| format!("failed to prepare GitHub PR checkout: {error}"))?;
+        let checkout = step(
+            fence,
+            tempfile::Builder::new()
+                .prefix("ocm-pr-")
+                .tempdir()
+                .map_err(|error| format!("failed to prepare GitHub PR checkout: {error}")),
+        )?;
         let root = checkout.path();
         step(
             fence,
