@@ -440,7 +440,7 @@ exit 0
     let command = launcher["command"].as_str().unwrap();
     let executable = path_string(&bin.join("openclaw"));
     assert!(
-        command == executable || command == format!("'{executable}'"),
+        command == executable || command == ocm::infra::shell::quote_posix(&executable),
         "{command}"
     );
 
