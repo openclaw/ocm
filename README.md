@@ -382,7 +382,8 @@ whose `.openclaw`, `.openclaw/agents` or `.openclaw/extensions` is a symlink
 that resolves outside the environment root, before capturing, stopping a running
 gateway or switching the runtime. Such a link would be captured instead of the
 state behind it, so restore and rollback could not return that state. Links at
-those paths that resolve inside the root are captured with their targets.
+those paths that resolve inside the root are still accepted; their targets are
+captured like the rest of the root, with the same exclusions.
 
 Snapshot removal validates that the stored environment, snapshot ID, and
 artifact path match the named snapshot before deleting anything. It takes the

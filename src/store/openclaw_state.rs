@@ -18,6 +18,7 @@ use crate::env::EnvMeta;
 use crate::infra::archive::{EnvArchiveEntryKind, EnvArchiveOptions, SymlinkRelocation};
 
 use super::common::path_exists;
+use super::dev_sources::path_identity;
 use super::layout::{EnvPaths, clean_path, derive_env_paths, display_path};
 use super::openclaw_config::{matching_foreign_env_root, normalize_path_allow_missing};
 use super::openclaw_workspaces::{
@@ -1485,11 +1486,8 @@ pub(crate) fn validate_runtime_state_inside_root(paths: &EnvPaths) -> Result<(),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error.to_string()),
         }
-        // Resolve the link's own target so a dangling external link is refused too.
-        let target = fs::read_link(&path).map_err(|error| error.to_string())?;
-        let parent = path.parent().ok_or("OpenClaw state path has no parent")?;
-        let resolved = canonicalize_path_allow_missing(&parent.join(target))?;
-        if resolved == root || !resolved.starts_with(&root) {
+        let resolved = resolve_link_destination(&path)?;
+        if !resolves_strictly_inside(&root, &resolved)? {
             return Err(format!(
                 "cannot safely preserve OpenClaw state through a symlink that resolves outside the environment root: {} (resolved: {}; environment root resolves to: {}); replace the link with a real directory inside the environment root",
                 display_path(&path),
@@ -1499,6 +1497,78 @@ pub(crate) fn validate_runtime_state_inside_root(paths: &EnvPaths) -> Result<(),
         }
     }
     Ok(())
+}
+
+/// Where a link leads, following every link on the way, including dangling
+/// ones, so a chain through a missing target cannot hide its destination.
+fn resolve_link_destination(path: &Path) -> Result<PathBuf, String> {
+    if let Ok(resolved) = fs::canonicalize(path) {
+        return Ok(resolved);
+    }
+    let mut pending: Vec<PathBuf> = path
+        .components()
+        .rev()
+        .map(|component| PathBuf::from(component.as_os_str()))
+        .collect();
+    let mut resolved = PathBuf::new();
+    let mut links = 0;
+    while let Some(next) = pending.pop() {
+        match next.components().next() {
+            Some(Component::CurDir) | None => {}
+            Some(Component::ParentDir) => {
+                resolved.pop();
+            }
+            Some(Component::Normal(name)) => {
+                let candidate = resolved.join(name);
+                match fs::symlink_metadata(&candidate) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        links += 1;
+                        if links > 40 {
+                            return Err(format!(
+                                "too many levels of symbolic links: {}",
+                                display_path(path)
+                            ));
+                        }
+                        let target =
+                            fs::read_link(&candidate).map_err(|error| error.to_string())?;
+                        if target.is_absolute() {
+                            resolved = PathBuf::new();
+                        }
+                        pending.extend(
+                            target
+                                .components()
+                                .rev()
+                                .map(|component| PathBuf::from(component.as_os_str())),
+                        );
+                    }
+                    Ok(_) => resolved = candidate,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        resolved = candidate;
+                    }
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+            Some(_) => resolved.push(&next),
+        }
+    }
+    canonicalize_path_allow_missing(&resolved)
+}
+
+fn resolves_strictly_inside(root: &Path, resolved: &Path) -> Result<bool, String> {
+    if resolved.starts_with(root) {
+        return Ok(resolved != root);
+    }
+    // Another spelling of a directory in the root, such as a macOS firmlink.
+    let root_identity = path_identity(root)?;
+    for (depth, ancestor) in resolved.ancestors().enumerate() {
+        match fs::symlink_metadata(ancestor) {
+            Ok(_) if path_identity(ancestor)? == root_identity => return Ok(depth > 0),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(false)
 }
 
 pub(crate) fn clear_nonportable_runtime_state(

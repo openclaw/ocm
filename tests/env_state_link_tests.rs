@@ -6,7 +6,10 @@ use std::fs;
 use std::os::unix::fs::symlink;
 
 use serde_json::Value;
-use support::{TestDir, ocm_env, run_ocm, stderr, write_executable_script, write_text};
+use support::{
+    TestDir, install_fake_service_manager, ocm_env, run_ocm, stderr, stdout,
+    write_executable_script, write_text,
+};
 
 fn check_copy_layout(layout: &str, import: bool) {
     let root = TestDir::new(&format!("state-link-{layout}-{import}"));
@@ -217,6 +220,7 @@ fn unmodified_export_import_preserves_source_state_across_directory_and_link_lay
 fn check_checkpoint_layout(layout: &str) {
     let root = TestDir::new(&format!("checkpoint-state-link-{layout}"));
     let mut env = ocm_env(&root);
+    install_fake_service_manager(&root, &mut env);
     let finalized = root.child("finalized");
     env.insert("OCM_TEST_FINALIZED".into(), finalized.display().to_string());
     for (name, version) in [("old", "2026.9.1"), ("new", "2026.9.2")] {
@@ -251,12 +255,14 @@ esac
         );
         assert!(result.status.success(), "{}", stderr(&result));
     }
-    let create = run_ocm(
-        root.path(),
-        &env,
-        &["env", "create", "demo", "--runtime", "old"],
-    );
-    assert!(create.status.success(), "{}", stderr(&create));
+    for name in ["demo", "other"] {
+        let create = run_ocm(
+            root.path(),
+            &env,
+            &["env", "create", name, "--runtime", "old"],
+        );
+        assert!(create.status.success(), "{}", stderr(&create));
+    }
     let env_root = root.child("ocm-home/envs/demo");
     let state = env_root.join(".openclaw");
     write_text(&state.join("openclaw.json"), "{}\n");
@@ -284,6 +290,22 @@ esac
             fs::remove_dir_all(&state).unwrap();
             symlink(root.child("missing"), &state).unwrap();
         }
+        "dangling-chain-state-link" => {
+            fs::remove_dir_all(&state).unwrap();
+            symlink(root.child("missing"), env_root.join("hop")).unwrap();
+            symlink("hop", &state).unwrap();
+        }
+        "firmlink-state-link" => {
+            // macOS reaches the same directory through its data-volume spelling.
+            let canonical = fs::canonicalize(&env_root).unwrap();
+            let alias = std::path::Path::new("/System/Volumes/Data")
+                .join(canonical.strip_prefix("/").unwrap());
+            if !alias.is_dir() {
+                return;
+            }
+            fs::rename(&state, env_root.join("state")).unwrap();
+            symlink(alias.join("state"), &state).unwrap();
+        }
         "agents-link" => moved("agents", external.clone()),
         "relative-agents-link" => {
             fs::rename(state.join("agents"), &external).unwrap();
@@ -302,11 +324,23 @@ esac
         assert!(list.status.success(), "{}", stderr(&list));
         serde_json::from_slice::<Value>(&list.stdout).unwrap()
     };
-    let binding = || {
-        let show = run_ocm(root.path(), &env, &["env", "show", "demo", "--json"]);
+    let binding_of = |name: &str| {
+        let show = run_ocm(root.path(), &env, &["env", "show", name, "--json"]);
         assert!(show.status.success(), "{}", stderr(&show));
         serde_json::from_slice::<Value>(&show.stdout).unwrap()["defaultRuntime"].clone()
     };
+    let binding = || binding_of("demo");
+    let controls = ["directory", "inside-state-link", "firmlink-state-link"];
+    let registry = root.child("ocm-home/envs.json");
+    if !controls.contains(&layout) {
+        // A refusal must come before a running gateway is stopped.
+        let cwd = root.path();
+        let mut meta = ocm::store::get_environment("demo", &env, cwd).unwrap();
+        meta.service_enabled = true;
+        meta.service_running = true;
+        ocm::store::save_environment(meta, &env, cwd).unwrap();
+    }
+    let registry_before = fs::read(&registry).unwrap();
 
     let snapshot = run_ocm(
         root.path(),
@@ -326,7 +360,7 @@ esac
             archive.to_str().unwrap(),
         ],
     );
-    if matches!(layout, "directory" | "inside-state-link") {
+    if controls.contains(&layout) {
         assert!(snapshot.status.success(), "{}", stderr(&snapshot));
         let id = serde_json::from_slice::<Value>(&snapshot.stdout).unwrap()["id"]
             .as_str()
@@ -382,10 +416,43 @@ esac
         "{}",
         stderr(&upgrade)
     );
+    // Batch upgrades may record the other environment's checkpoint.
+    assert_eq!(fs::read(&registry).unwrap(), registry_before);
+    let batch = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "upgrade",
+            "batch",
+            "--envs",
+            "demo,other",
+            "--runtime",
+            "new",
+            "--accept-fleet-outage",
+        ],
+    );
+    assert!(!batch.status.success(), "batch upgrade accepted: {layout}");
+    assert!(
+        format!("{}{}", stdout(&batch), stderr(&batch))
+            .contains("resolves outside the environment root"),
+        "{}{}",
+        stdout(&batch),
+        stderr(&batch)
+    );
+    assert_eq!(binding_of("other"), "old");
     assert!(!finalized.exists(), "upgrade finalized before refusing");
     assert_eq!(binding(), "old");
     assert_eq!(snapshots(), serde_json::json!([]));
-    if layout != "dangling-state-link" {
+    for log in ["launchctl.log", "systemctl.log"] {
+        let calls = fs::read_to_string(root.child(log)).unwrap_or_default();
+        assert!(
+            !calls
+                .lines()
+                .any(|call| call.contains("bootout") || call.contains(" stop ")),
+            "service stopped before refusal: {calls}"
+        );
+    }
+    if !layout.starts_with("dangling") {
         assert_eq!(fs::read_to_string(&session).unwrap(), "before\n");
     }
 }
@@ -397,6 +464,8 @@ fn checkpoints_and_state_export_refuse_state_linked_outside_the_root() {
         "inside-state-link",
         "state-link",
         "dangling-state-link",
+        "dangling-chain-state-link",
+        "firmlink-state-link",
         "agents-link",
         "relative-agents-link",
         "extensions-link",
