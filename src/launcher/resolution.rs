@@ -53,9 +53,9 @@ enum RecipeTail {
 /// Finds a trailing comment or dangling backslash after the last word of a
 /// POSIX shell recipe. A `#` starts a comment only at the start of a token
 /// outside quotes, expansions and substitutions. Constructs this scan does not
-/// model (here-documents, `$'...'`, `case` inside a command substitution,
-/// nesting deeper than `MAX_SPAN_NESTING`) and unterminated quotes return
-/// `None`, so those recipes keep the plain append.
+/// model (here-documents, `$'...'`, nesting deeper than `MAX_SPAN_NESTING`)
+/// and unterminated quotes return `None`, so those recipes keep the plain
+/// append.
 fn posix_recipe_tail(command: &str) -> Option<RecipeTail> {
     match scan_tokens(command.as_bytes(), 0, false, 0)? {
         (_, 0) => None,
@@ -125,13 +125,17 @@ fn scan_tokens(
                 }
                 None => return (!in_substitution).then_some((ScanEnd::Comment, word_end)),
             },
-            // `case` patterns would unbalance the parentheses.
-            b'c' if in_substitution
-                && word_start
-                && bytes[index..].starts_with(b"case")
-                && bytes.get(index + 4).is_none_or(|&next| ends_token(next)) =>
-            {
-                return None;
+            // `case` patterns would unbalance the parentheses, so the statement
+            // is skipped to its `esac`; without one, `case` is an ordinary word.
+            b'c' if in_substitution && word_start && is_word_at(bytes, index, b"case") => {
+                if let Some(end) = (index + 4..bytes.len())
+                    .find(|&at| is_word_at(bytes, at, b"esac"))
+                    .map(|at| at + 4)
+                {
+                    index = end;
+                    word_start = false;
+                    continue;
+                }
             }
             b'(' if in_substitution => open_parens += 1,
             b')' if in_substitution => match open_parens.checked_sub(1) {
@@ -147,6 +151,15 @@ fn scan_tokens(
         index += 1;
     }
     (!in_substitution).then_some((ScanEnd::Text, word_end))
+}
+
+/// Whether `word` is a whole token at `index`.
+fn is_word_at(bytes: &[u8], index: usize, word: &[u8]) -> bool {
+    bytes[index..].starts_with(word)
+        && (index == 0 || ends_token(bytes[index - 1]))
+        && bytes
+            .get(index + word.len())
+            .is_none_or(|&next| ends_token(next))
 }
 
 /// Blanks and operator characters end a shell token.
