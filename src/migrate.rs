@@ -545,6 +545,23 @@ pub(crate) fn with_rollback_error(
     }
 }
 
+/// The home a plain install expands `~` against. OpenClaw keeps its state in
+/// `<home>/.openclaw`; a state directory with any other name was selected
+/// separately, and `~` then still names the user's home.
+fn plain_install_home(source_state_dir: &Path, env: &BTreeMap<String, String>) -> PathBuf {
+    let source_state_dir = clean_path(source_state_dir);
+    match source_state_dir.parent() {
+        Some(home)
+            if source_state_dir
+                .file_name()
+                .is_some_and(|name| name == ".openclaw") =>
+        {
+            home.to_path_buf()
+        }
+        _ => clean_path(&resolve_user_home(env)),
+    }
+}
+
 fn complete_migration_import(
     created: crate::env::EnvMeta,
     target_paths: &crate::store::EnvPaths,
@@ -590,6 +607,7 @@ fn complete_migration_import(
     reject_include_owned_sandbox_origin(&target_paths.config_path)?;
     let config_rewrite = rewrite_openclaw_config_for_migration(
         target_paths,
+        &plain_install_home(source_home, env),
         source_home,
         &canonical_source_home,
         created.gateway_port,

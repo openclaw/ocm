@@ -5042,42 +5042,45 @@ fn migrate_or_adopt_args<'a>(adopt: bool, name: &'a str, source: &'a Path) -> Ve
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn migrate_and_adopt_keep_home_relative_paths_outside_the_state_dir_pointing_at_the_same_location()
 {
     for adopt in [false, true] {
         let root = TestDir::new("migrate-home-relative-paths");
         let env = ocm_env(&root);
-        let home = root.child("plain-home");
+        let home = root.child("home");
         let source = home.join(".openclaw");
         fs::create_dir_all(source.join("extensions/inner")).unwrap();
+        fs::create_dir_all(source.join("deep")).unwrap();
         fs::create_dir_all(home.join("dev/my-plugin")).unwrap();
-        fs::create_dir_all(home.join("dev/included-plugin")).unwrap();
         fs::create_dir_all(home.join("shared-skills")).unwrap();
         fs::create_dir_all(home.join("ext-agent/agent")).unwrap();
+        // OpenClaw resolves `..` lexically, so this names `~/dev/my-plugin`,
+        // not the state directory the link points into.
+        std::os::unix::fs::symlink(source.join("deep"), home.join("hop")).unwrap();
         let home_path = home.to_str().unwrap();
         let config = serde_json::json!({
             "gateway": {"port": 18789},
             "agents": {"list": [{"id": "main", "agentDir": "~/ext-agent/agent"}]},
-            "session": {"store": "~/ext-state/sessions.json"},
-            "cron": {"store": " ~/ext-state/cron.json "},
+            "session": {"store": "~/ext-state/{agentId}/sessions.json"},
+            "cron": {"store": "~/ext-state/cron.json"},
             "messages": {"responsePrefix": "~"},
-            "plugins": {
-                "load": {
-                    "paths": [
-                        "~/.openclaw/extensions/inner",
-                        "~/dev/my-plugin",
-                        "~/.openclaw/../dev/my-plugin",
-                        format!("{home_path}/dev/my-plugin"),
-                    ]
-                },
-                "entries": {"$include": "./plugin-entries.json"},
-            },
-            "skills": {"load": {"extraDirs": ["~/shared-skills"]}},
+            "plugins": {"load": {"$include": "./plugin-load.json"}},
+            "skills": {"load": {"extraDirs": ["~/shared-skills", " ~/spaced-skills"]}},
         });
         support::write_text(&source.join("openclaw.json"), &config.to_string());
-        let include = "{\"load\":{\"paths\":[\"~/dev/included-plugin\"]}}";
-        support::write_text(&source.join("plugin-entries.json"), include);
+        let include = serde_json::json!({
+            "paths": [
+                "~/.openclaw/extensions/inner",
+                "~/dev/my-plugin",
+                "~/.openclaw/../dev/my-plugin",
+                "~/hop/../dev/my-plugin",
+                format!("{home_path}/dev/my-plugin"),
+            ]
+        })
+        .to_string();
+        support::write_text(&source.join("plugin-load.json"), &include);
 
         let imported = run_ocm(
             root.path(),
@@ -5090,19 +5093,25 @@ fn migrate_and_adopt_keep_home_relative_paths_outside_the_state_dir_pointing_at_
         let copied: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(target.join("openclaw.json")).unwrap())
                 .unwrap();
-        let paths = &copied["plugins"]["load"]["paths"];
-        assert_eq!(paths[0], "~/.openclaw/extensions/inner", "adopt={adopt}");
-        assert_eq!(paths[1], format!("{home_path}/dev/my-plugin"));
-        // Parent traversal out of the state directory is spelled out too and
-        // keeps naming the external directory.
+        let plugin = format!("{home_path}/dev/my-plugin");
+        let copied_include: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(target.join("plugin-load.json")).unwrap())
+                .unwrap();
         assert_eq!(
-            fs::canonicalize(paths[2].as_str().unwrap()).unwrap(),
-            fs::canonicalize(home.join("dev/my-plugin")).unwrap()
+            copied_include["paths"],
+            serde_json::json!([
+                "~/.openclaw/extensions/inner",
+                plugin,
+                plugin,
+                plugin,
+                plugin
+            ]),
+            "adopt={adopt}"
         );
-        assert_eq!(paths[3], format!("{home_path}/dev/my-plugin"));
+        assert_eq!(copied["plugins"]["load"]["$include"], "./plugin-load.json");
         assert_eq!(
             copied["skills"]["load"]["extraDirs"],
-            serde_json::json!([format!("{home_path}/shared-skills")])
+            serde_json::json!([format!("{home_path}/shared-skills"), " ~/spaced-skills"])
         );
         assert_eq!(
             copied["agents"]["list"][0]["agentDir"],
@@ -5110,7 +5119,7 @@ fn migrate_and_adopt_keep_home_relative_paths_outside_the_state_dir_pointing_at_
         );
         assert_eq!(
             copied["session"]["store"],
-            format!("{home_path}/ext-state/sessions.json")
+            format!("{home_path}/ext-state/{{agentId}}/sessions.json")
         );
         assert_eq!(
             copied["cron"]["store"],
@@ -5118,38 +5127,28 @@ fn migrate_and_adopt_keep_home_relative_paths_outside_the_state_dir_pointing_at_
         );
         assert_eq!(copied["messages"]["responsePrefix"], "~");
         assert_eq!(
-            copied["plugins"]["entries"]["$include"],
-            "./plugin-entries.json"
-        );
-        let copied_include: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(target.join("plugin-entries.json")).unwrap())
-                .unwrap();
-        assert_eq!(
-            copied_include["load"]["paths"],
-            serde_json::json!([format!("{home_path}/dev/included-plugin")])
-        );
-        assert_eq!(
             fs::read_to_string(source.join("openclaw.json")).unwrap(),
             config.to_string()
         );
         assert_eq!(
-            fs::read_to_string(source.join("plugin-entries.json")).unwrap(),
+            fs::read_to_string(source.join("plugin-load.json")).unwrap(),
             include
         );
     }
 }
 
 #[test]
-fn migrate_and_adopt_relocate_home_relative_paths_into_a_custom_named_state_dir() {
+fn migrate_and_adopt_expand_home_relative_paths_of_a_custom_named_state_dir_against_the_user_home()
+{
     for adopt in [false, true] {
         let root = TestDir::new("migrate-home-relative-custom-state-dir");
         let env = ocm_env(&root);
+        let home = root.child("home");
         let source = root.child("legacy/openclaw");
-        fs::create_dir_all(source.join("extensions/inner")).unwrap();
-        fs::create_dir_all(source.join("skills-extra")).unwrap();
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(home.join("dev/my-plugin")).unwrap();
         let config = serde_json::json!({
-            "plugins": {"load": {"paths": ["~/openclaw/extensions/inner"]}},
-            "skills": {"load": {"extraDirs": ["~/openclaw/skills-extra"]}},
+            "plugins": {"load": {"paths": ["~/dev/my-plugin", "~/.openclaw/extensions/inner"]}},
         });
         support::write_text(&source.join("openclaw.json"), &config.to_string());
 
@@ -5164,16 +5163,15 @@ fn migrate_and_adopt_relocate_home_relative_paths_into_a_custom_named_state_dir(
         let copied: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(target.join("openclaw.json")).unwrap())
                 .unwrap();
-        let target_path = fs::canonicalize(&target).unwrap();
-        let plugin = Path::new(copied["plugins"]["load"]["paths"][0].as_str().unwrap());
+        // The state directory was not `<home>/.openclaw`, so `~` named the
+        // user's home, not the state directory's parent.
         assert_eq!(
-            fs::canonicalize(plugin).unwrap(),
-            target_path.join("extensions/inner"),
+            copied["plugins"]["load"]["paths"],
+            serde_json::json!([
+                home.join("dev/my-plugin").to_str().unwrap(),
+                "~/.openclaw/extensions/inner",
+            ]),
             "adopt={adopt}"
-        );
-        assert_eq!(
-            copied["skills"]["load"]["extraDirs"],
-            serde_json::json!([target.join("skills-extra").to_str().unwrap()])
         );
     }
 }

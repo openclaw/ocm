@@ -202,14 +202,16 @@ pub(crate) fn rewrite_openclaw_config_for_new_environment(
     )
 }
 
+/// `source_home` is the home a plain install expands `~` against.
 pub(crate) fn rewrite_openclaw_config_for_migration(
     target_paths: &EnvPaths,
+    source_home: &Path,
     source_state_root: &Path,
     canonical_source_state_root: &Path,
     gateway_port: Option<u32>,
     sandbox_origin: Option<&str>,
 ) -> Result<OpenClawConfigRewriteOutcome, String> {
-    expand_migrated_home_relative_paths(target_paths, source_state_root)?;
+    expand_migrated_home_relative_paths(target_paths, source_home)?;
     rewrite_migrated_plugin_load_paths(
         target_paths,
         source_state_root,
@@ -226,20 +228,19 @@ pub(crate) fn rewrite_openclaw_config_for_migration(
     )
 }
 
-/// A plain install expands `~` against the user's home, but the environment
-/// runs with `OPENCLAW_HOME` set to its root, which OpenClaw expands `~`
-/// against instead. Values under `~/.openclaw` already name the copied state
+/// A plain install expands `~` against its home, but the environment runs
+/// with `OPENCLAW_HOME` set to its root, which OpenClaw expands `~` against
+/// instead. Values under `~/.openclaw` already name the copied state
 /// directory; every other `~/` value is spelled out against the source home so
 /// it keeps naming the same location. Absolute values inside the source state
 /// directory are then relocated by the later rewrites.
 fn expand_migrated_home_relative_paths(
     target: &EnvPaths,
-    source_state_root: &Path,
+    source_home: &Path,
 ) -> Result<(), String> {
-    let source_state_root = clean_path(source_state_root);
-    let Some(source_home) = source_state_root.parent() else {
+    if !source_home.is_absolute() {
         return Ok(());
-    };
+    }
     let expand = |value: &mut Value| expand_home_relative_paths(value, source_home);
     if let Some(mut value) = read_config_value(&target.config_path)?
         && expand(&mut value)
@@ -279,16 +280,18 @@ fn expand_home_relative_paths(value: &mut Value, home: &Path) -> bool {
 }
 
 fn expand_home_relative_path(raw: &str, home: &Path) -> Option<String> {
-    let trimmed = raw.trim();
-    // A bare `~` is left alone: it is also an ordinary non-path setting value.
-    if !trimmed.starts_with("~/") && !trimmed.starts_with("~\\") {
+    // Only a leading `~` followed by a separator is expanded. A bare `~` is
+    // also an ordinary non-path value, and not every OpenClaw path setting
+    // trims surrounding whitespace before expanding, so those stay as written.
+    if !raw.starts_with("~/") && !raw.starts_with("~\\") {
         return None;
     }
-    // Expand as OpenClaw does, by replacing the leading `~`.
+    // Expand as OpenClaw does: replace the leading `~`, then resolve `.` and
+    // `..` lexically, so later rewrites cannot follow links OpenClaw ignores.
     let mut expanded = home.as_os_str().to_os_string();
-    expanded.push(&trimmed[1..]);
-    let expanded = PathBuf::from(expanded);
-    if clean_path(&expanded).starts_with(home.join(".openclaw")) {
+    expanded.push(&raw[1..]);
+    let expanded = clean_path(Path::new(&expanded));
+    if expanded.starts_with(home.join(".openclaw")) {
         return None;
     }
     expanded.to_str().map(str::to_string)
@@ -2760,6 +2763,34 @@ mod tests {
     use time::OffsetDateTime;
 
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_home_expansion_follows_openclaw_tilde_rules() {
+        let home = Path::new("/home/alice");
+        let expand = |raw| expand_home_relative_path(raw, home);
+        assert_eq!(expand("~/dev/p").as_deref(), Some("/home/alice/dev/p"));
+        assert_eq!(
+            expand("~/a/./../dev/p").as_deref(),
+            Some("/home/alice/dev/p")
+        );
+        assert_eq!(
+            expand("~/.openclaw/../dev/p").as_deref(),
+            Some("/home/alice/dev/p")
+        );
+        assert_eq!(
+            expand("~/.openclawish/p").as_deref(),
+            Some("/home/alice/.openclawish/p")
+        );
+        // Values under `~/.openclaw` already name the environment's copy.
+        assert_eq!(expand("~/.openclaw/extensions/x"), None);
+        assert_eq!(expand("~/x/../.openclaw/y"), None);
+        // OpenClaw replaces the `~` of `~\` too; on POSIX the rest stays one name.
+        assert_eq!(expand("~\\dev").as_deref(), Some("/home/alice\\dev"));
+        for unchanged in ["~", " ~/dev/p", "~alice/dev", "dev/~/p", "/abs/~/p"] {
+            assert_eq!(expand(unchanged), None, "{unchanged}");
+        }
+    }
 
     fn meta(name: &str, root: &str, gateway_port: Option<u32>) -> EnvMeta {
         EnvMeta {
