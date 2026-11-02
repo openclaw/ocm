@@ -1064,6 +1064,70 @@ fn env_import_moves_an_included_gateway_port_into_a_root_inside_the_source_confi
     assert_eq!(config["mcp"]["apps"]["sandboxPort"], imported + 1);
 }
 
+#[cfg(unix)]
+#[test]
+fn env_import_moves_an_included_gateway_port_that_is_also_read_through_a_symlink() {
+    let root = TestDir::new("env-import-included-gateway-port-symlink");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+
+    let create = run_ocm(&cwd, &env, &["env", "create", "source", "--port", "19789"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let source = root.child("ocm-home/envs/source/.openclaw");
+    write_text(
+        &source.join("openclaw.json"),
+        "{\"gateway\":{\"$include\":[\"./port.json\",\"./alias.json\"]},\"mcp\":{\"apps\":{\"sandboxPort\":19790}}}",
+    );
+    write_text(&source.join("port.json"), "{\"port\":19789}");
+    std::os::unix::fs::symlink("port.json", source.join("alias.json")).unwrap();
+    let export = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "env",
+            "export",
+            "source",
+            "--include-state",
+            "--output",
+            "./source.ocm-env.tar",
+        ],
+    );
+    assert!(export.status.success(), "{}", stderr(&export));
+    let import = run_ocm(
+        &cwd,
+        &env,
+        &["env", "import", "./source.ocm-env.tar", "--name", "target"],
+    );
+    assert!(import.status.success(), "{}", stderr(&import));
+    let status = run_ocm(&cwd, &env, &["env", "status", "target", "--json"]);
+    assert!(status.status.success(), "{}", stderr(&status));
+    let imported = serde_json::from_str::<Value>(&stdout(&status)).unwrap()["gatewayPort"]
+        .as_u64()
+        .unwrap();
+    assert_ne!(imported, 19789);
+
+    let target = root.child("ocm-home/envs/target/.openclaw");
+    assert!(
+        fs::symlink_metadata(target.join("alias.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    for path in ["port.json", "alias.json"] {
+        let value: Value =
+            serde_json::from_str(&fs::read_to_string(target.join(path)).unwrap()).unwrap();
+        assert_eq!(value, serde_json::json!({"port": imported}), "{path}");
+    }
+    let config: Value =
+        serde_json::from_str(&fs::read_to_string(target.join("openclaw.json")).unwrap()).unwrap();
+    assert_eq!(config["mcp"]["apps"]["sandboxPort"], imported + 1);
+    assert_eq!(
+        fs::read_to_string(source.join("port.json")).unwrap(),
+        "{\"port\":19789}"
+    );
+}
+
 #[test]
 fn env_import_refuses_a_gateway_port_in_a_shared_include() {
     let mut cases = vec![("shared", false)];

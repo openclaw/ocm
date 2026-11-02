@@ -240,7 +240,8 @@ fn rewrite_included_gateway_port(
         return Ok(false);
     };
     // A file reached through several paths, such as a symlinked include, is
-    // one include: rewriting it changes every place that reads it.
+    // one include: rewriting it changes every place that reads it, so its
+    // scopes are checked together.
     let mut includes = BTreeMap::<PathBuf, (Vec<PathBuf>, BTreeSet<Vec<String>>)>::new();
     for (path, scopes) in effective.include_scopes {
         let file = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
@@ -272,10 +273,20 @@ fn rewrite_included_gateway_port(
             rewritten = Some(candidate);
         }
         if let Some(rewritten) = rewritten.filter(|rewritten| *rewritten != value) {
-            if paths.len() > 1 {
+            // Every path reads it as the Gateway port. Write the file itself,
+            // so the paths that link to it keep reading it.
+            let file_path = if paths.len() == 1 {
+                Some(path)
+            } else {
+                paths.iter().find(|path| {
+                    fs::symlink_metadata(path)
+                        .is_ok_and(|metadata| !metadata.file_type().is_symlink())
+                })
+            };
+            let Some(file_path) = file_path else {
                 return Err(shared_include());
-            }
-            write_copied_config_value(path, &target.state_dir, &rewritten)?;
+            };
+            write_copied_config_value(file_path, &target.state_dir, &rewritten)?;
         }
     }
     Ok(rewrite_port_coupled_mcp_app_sandbox(
