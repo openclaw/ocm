@@ -3365,11 +3365,18 @@ fn env_export_removes_its_staging_and_sqlite_snapshot_when_interrupted() {
         if include_state {
             command.arg("--include-state");
         }
-        if ignored {
+        // Set the disposition either way: a test run under nohup would
+        // otherwise pass an ignored SIGHUP to every case.
+        let disposition = if ignored {
+            libc::SIG_IGN
+        } else {
+            libc::SIG_DFL
+        };
+        {
             use std::os::unix::process::CommandExt;
             unsafe {
                 command.pre_exec(move || {
-                    libc::signal(signal, libc::SIG_IGN);
+                    libc::signal(signal, disposition);
                     Ok(())
                 });
             }
@@ -3379,8 +3386,16 @@ fn env_export_removes_its_staging_and_sqlite_snapshot_when_interrupted() {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             assert!(Instant::now() < deadline, "{label}: export never grew");
+            // Look only while the export is stopped, so it cannot finish
+            // between seeing it mid-write and queueing the signal.
+            assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+            let mut status = 0;
+            assert_eq!(
+                unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) },
+                pid
+            );
             assert!(
-                exporter.0.try_wait().unwrap().is_none(),
+                libc::WIFSTOPPED(status),
                 "{label}: export finished before the signal"
             );
             let growing = fs::read_dir(watched).unwrap().any(|entry| {
@@ -3391,15 +3406,6 @@ fn env_export_removes_its_staging_and_sqlite_snapshot_when_interrupted() {
                         .is_ok_and(|metadata| metadata.len() >= 1024 * 1024)
             });
             if growing {
-                // Hold the export while the signal is queued, so it arrives
-                // mid-write rather than after the export finished.
-                assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
-                let mut status = 0;
-                assert_eq!(
-                    unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) },
-                    pid
-                );
-                assert!(libc::WIFSTOPPED(status));
                 assert!(
                     entries(&destination)
                         .iter()
@@ -3410,6 +3416,7 @@ fn env_export_removes_its_staging_and_sqlite_snapshot_when_interrupted() {
                 assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
                 break;
             }
+            assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
             std::thread::sleep(Duration::from_millis(1));
         }
         let status = loop {

@@ -306,6 +306,10 @@ fn write_env_archive_with_capture<T: Serialize>(
             .map_err(|error| error.to_string())?;
         match write_env_archive_attempt(metadata, source_root, file, options.clone(), capture) {
             Ok(()) => {
+                // A signal that arrived before publication cancels it.
+                if crate::infra::interrupt::cancellation_requested() {
+                    return Err(crate::infra::interrupt::cancelled_error().to_string());
+                }
                 staged
                     .persist_noclobber(output_path)
                     .map_err(|error| error.to_string())?;

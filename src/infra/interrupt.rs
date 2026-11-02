@@ -285,23 +285,49 @@ static CANCELLATION_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// and return an error. A signal that was ignored when OCM started, as under
 /// `nohup` or for a background job, stays ignored.
 pub(crate) fn request_cancellation_on_signal() -> Result<(), String> {
+    let install = || {
+        set_handler(|| {
+            CANCELLATION_REQUESTED.store(true, Ordering::SeqCst);
+            true
+        })
+    };
+    #[cfg(not(unix))]
+    return install();
     #[cfg(unix)]
-    let ignored = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP]
-        .into_iter()
-        .map(|signal| signal_action(signal).map(|action| (signal, action)))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .filter(|(_, action)| action.sa_sigaction == libc::SIG_IGN)
-        .collect::<Vec<_>>();
-    set_handler(|| {
-        CANCELLATION_REQUESTED.store(true, Ordering::SeqCst);
-        true
-    })?;
-    #[cfg(unix)]
-    for (signal, action) in ignored {
-        set_signal_action(signal, &action)?;
+    {
+        let ignored = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP]
+            .into_iter()
+            .map(|signal| signal_action(signal).map(|action| (signal, action)))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|(_, action)| action.sa_sigaction == libc::SIG_IGN)
+            .collect::<Vec<_>>();
+        // Block the ignored signals until their disposition is restored, so
+        // one arriving meanwhile stays pending and is then discarded instead
+        // of reaching the new handler. Threads started meanwhile inherit the
+        // block, which is moot for signals that stay ignored.
+        let mut blocked = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+        let mut previous = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+        // SAFETY: sigemptyset initializes the set before it is read, and
+        // pthread_sigmask writes the previous mask before it is restored.
+        unsafe {
+            libc::sigemptyset(blocked.as_mut_ptr());
+            for (signal, _) in &ignored {
+                libc::sigaddset(blocked.as_mut_ptr(), *signal);
+            }
+            libc::pthread_sigmask(libc::SIG_BLOCK, blocked.as_ptr(), previous.as_mut_ptr());
+        }
+        let result = install().and_then(|()| {
+            ignored
+                .iter()
+                .try_for_each(|(signal, action)| set_signal_action(*signal, action))
+        });
+        // SAFETY: previous was written by the pthread_sigmask call above.
+        unsafe {
+            libc::pthread_sigmask(libc::SIG_SETMASK, previous.as_ptr(), std::ptr::null_mut());
+        }
+        result
     }
-    Ok(())
 }
 
 /// Whether a signal has asked the command to stop. Cheap enough to check on
