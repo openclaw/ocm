@@ -638,6 +638,7 @@ fn complete_migration_import(
         env,
         OpenClawWorkspaceRuntime::for_env(&created.name, created.gateway_port),
     )?;
+    copying.into_directory_modes().restore()?;
 
     let Some(launcher) = migrated_launcher else {
         return Ok(CompletedMigrationImport {

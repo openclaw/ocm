@@ -16,11 +16,147 @@ pub fn build_launcher_command(launcher: &LauncherMeta, args: &[String]) -> Strin
         return launcher.command.clone();
     }
 
-    let mut command = launcher.command.clone();
-    let quoted = args.iter().map(|arg| quote_posix(arg)).collect::<Vec<_>>();
-    command.push(' ');
-    command.push_str(&quoted.join(" "));
-    command
+    let command = &launcher.command;
+    let quoted = args
+        .iter()
+        .map(|arg| quote_posix(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    // Appended text would sit inside a trailing comment, or behind a dangling
+    // backslash that escapes the separating space, so the arguments follow the
+    // last word of the recipe's last command instead. `cmd /C` has neither form.
+    match cfg!(unix).then(|| posix_recipe_tail(command)).flatten() {
+        Some(RecipeTail::Comment(word_end)) => {
+            let (head, comments) = command.split_at(word_end);
+            let separator = if comments.starts_with(char::is_whitespace) {
+                ""
+            } else {
+                " "
+            };
+            format!("{head} {quoted}{separator}{comments}")
+        }
+        Some(RecipeTail::Backslash(word_end)) => format!("{} {quoted}", &command[..word_end]),
+        None => format!("{command} {quoted}"),
+    }
+}
+
+/// How a POSIX shell recipe ends after its last word, given as the byte offset
+/// just past that word.
+#[derive(Debug, PartialEq, Eq)]
+enum RecipeTail {
+    /// Only blanks and `#` comments follow the last word.
+    Comment(usize),
+    /// An unquoted backslash ends the recipe.
+    Backslash(usize),
+}
+
+/// Finds a trailing comment or dangling backslash after the last word of a
+/// POSIX shell recipe. The scan reads only plain words, quotes, backslash
+/// escapes, `$NAME` and plain `${...}` expansions, operators and comments; a `#`
+/// starts a comment only at the start of a token outside quotes and
+/// expansions. Anything that can hide or move token boundaries (command and
+/// process substitution, backquotes, `$'...'`, here-documents, line
+/// continuations, `((`, `[[`, brackets or parentheses inside a word, `${...}` holding
+/// quotes or nested expansions, `alias` definitions) and unterminated quotes
+/// return `None`, so those recipes keep the plain append.
+fn posix_recipe_tail(command: &str) -> Option<RecipeTail> {
+    let bytes = command.as_bytes();
+    let mut index = 0;
+    let mut word_end = 0;
+    let mut word_start = true;
+    while let Some(&byte) = bytes.get(index) {
+        let next = bytes.get(index + 1);
+        let span_end = match byte {
+            b'\'' => Some(index + 2 + bytes[index + 1..].iter().position(|&b| b == b'\'')?),
+            b'"' => Some(skip_double_quotes(bytes, index)?),
+            b'$' if next == Some(&b'{') => Some(skip_parameter(bytes, index)?),
+            b'`' => return None,
+            b'$' if matches!(next, Some(b'(' | b'\'')) => return None,
+            b'<' | b'>' | b'(' if matches!(next, Some(b'(')) => return None,
+            // Bash reads `[[ ... ]]` regexes, array subscripts such as
+            // `a[ # ]=x` and extended globs such as `@(a|#b)` with their own
+            // rules for brackets, parentheses and `#`.
+            b'[' if !word_start || next == Some(&b'[') => return None,
+            b'(' | b')' if !word_start && !ends_token(bytes[index - 1]) => return None,
+            b'<' if next == Some(&b'<') => return None,
+            // An alias defined in the recipe can supply text, quotes included,
+            // that the scan never sees.
+            b'a' if word_start
+                && bytes[index..].starts_with(b"alias")
+                && bytes.get(index + 5).is_none_or(|&byte| ends_token(byte)) =>
+            {
+                return None;
+            }
+            b'\\' if next == Some(&b'\n') => return None,
+            b'\\' if next.is_none() => {
+                return (word_end > 0).then_some(RecipeTail::Backslash(word_end));
+            }
+            b'\\' => Some(index + 2),
+            b'#' if word_start => match bytes[index..].iter().position(|&b| b == b'\n') {
+                // The comment ends at this newline; scanning resumes there.
+                Some(offset) => {
+                    index += offset;
+                    continue;
+                }
+                None => return (word_end > 0).then_some(RecipeTail::Comment(word_end)),
+            },
+            _ => None,
+        };
+        if let Some(end) = span_end {
+            index = end;
+            word_end = end;
+            word_start = false;
+            continue;
+        }
+        if !matches!(byte, b' ' | b'\t' | b'\n') {
+            word_end = index + 1;
+        }
+        word_start = ends_token(byte);
+        index += 1;
+    }
+    None
+}
+
+/// The offset just past the double-quoted span opening at `start`, or `None`
+/// when it is unterminated or holds a substitution, bash `$[...]` arithmetic,
+/// backquote or line continuation.
+fn skip_double_quotes(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut index = start + 1;
+    loop {
+        match (*bytes.get(index)?, bytes.get(index + 1)) {
+            (b'"', _) => return Some(index + 1),
+            (b'`', _) | (b'$', Some(b'(' | b'[')) | (b'\\', Some(b'\n')) => return None,
+            (b'$', Some(b'{')) => index = skip_parameter(bytes, index)?,
+            (b'\\', _) => index += 2,
+            _ => index += 1,
+        }
+    }
+}
+
+/// The offset just past the `${...}` expansion opening at `start`, or `None`
+/// unless it closes before any quote, `$`, backquote, backslash, brace or
+/// newline. Bash 5.3 reads `${ command; }` and `${| command; }` as command
+/// substitutions, so a blank or `|` after `${` also returns `None`.
+fn skip_parameter(bytes: &[u8], start: usize) -> Option<usize> {
+    if matches!(bytes.get(start + 2), Some(b' ' | b'\t' | b'\n' | b'|')) {
+        return None;
+    }
+    let offset = bytes[start + 2..].iter().position(|&byte| {
+        matches!(
+            byte,
+            b'}' | b'\'' | b'"' | b'`' | b'$' | b'\\' | b'{' | b'\n'
+        )
+    })?;
+    let end = start + 2 + offset;
+    (bytes[end] == b'}').then_some(end + 1)
+}
+
+/// Blanks and operator characters end a shell token.
+fn ends_token(byte: u8) -> bool {
+    matches!(
+        byte,
+        b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b')' | b'<' | b'>'
+    )
 }
 
 pub fn resolve_launcher_run_dir(launcher: &LauncherMeta, fallback_cwd: &Path) -> PathBuf {

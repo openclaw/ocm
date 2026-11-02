@@ -52,6 +52,108 @@ fn build_launcher_command_quotes_forwarded_arguments() {
     assert_eq!(command, "openclaw 'gateway run' 'it'\"'\"'s-live'");
 }
 
+fn launcher_command(recipe: &str) -> String {
+    let launcher = LauncherMeta {
+        command: recipe.to_string(),
+        ..sample_launcher(None)
+    };
+    build_launcher_command(&launcher, &["gateway".to_string(), "two words".to_string()])
+}
+
+#[cfg(unix)]
+#[test]
+fn build_launcher_command_joins_the_last_command_before_a_trailing_comment_or_backslash() {
+    for (recipe, expected) in [
+        ("openclaw # dev", "openclaw 'gateway' 'two words' # dev"),
+        ("openclaw\t# dev", "openclaw 'gateway' 'two words'\t# dev"),
+        (
+            "'/opt/open claw' # it's mine",
+            "'/opt/open claw' 'gateway' 'two words' # it's mine",
+        ),
+        (
+            r#"node "a # b" "${HOME}/x.mjs" "$HOME" ${x:-a # b} x#y \# # dev"#,
+            r#"node "a # b" "${HOME}/x.mjs" "$HOME" ${x:-a # b} x#y \# 'gateway' 'two words' # dev"#,
+        ),
+        (
+            "cd /src && pnpm openclaw # dev",
+            "cd /src && pnpm openclaw 'gateway' 'two words' # dev",
+        ),
+        (
+            "echo setup # one\nopenclaw # two",
+            "echo setup # one\nopenclaw 'gateway' 'two words' # two",
+        ),
+        (
+            "pnpm openclaw\n# my checkout",
+            "pnpm openclaw 'gateway' 'two words'\n# my checkout",
+        ),
+        (
+            "openclaw # one\n  # two",
+            "openclaw 'gateway' 'two words' # one\n  # two",
+        ),
+        // Operators still separate the arguments into a failing command.
+        ("openclaw;# dev", "openclaw; 'gateway' 'two words' # dev"),
+        ("openclaw \\", "openclaw 'gateway' 'two words'"),
+        (
+            "'openclaw' --verbose \\",
+            "'openclaw' --verbose 'gateway' 'two words'",
+        ),
+    ] {
+        assert_eq!(launcher_command(recipe), expected, "{recipe:?}");
+    }
+}
+
+#[test]
+fn build_launcher_command_appends_after_recipes_without_a_trailing_comment() {
+    let mut recipes = vec![
+        "openclaw",
+        "openclaw x#y $# ${HOME#/} ${x:-a # b}",
+        r"openclaw \# literal \\",
+        "openclaw 'a # b' \"a # b\"",
+        "echo setup # one\nopenclaw",
+        "# only a comment",
+        "openclaw;",
+        "openclaw &",
+        "openclaw |",
+        // Forms that can hide or move token boundaries, and unterminated
+        // quotes, keep the plain append.
+        "openclaw $(pwd) # x",
+        "openclaw \"$(pwd)/x\" # x",
+        "openclaw `pwd` # x",
+        "openclaw \"`pwd`\" # x",
+        "openclaw $((1<<2)) # x",
+        "((n = 1 # 2 )); openclaw",
+        "openclaw <(cat) # x",
+        "cat <<EOF # x",
+        "openclaw $'a' # x",
+        "openclaw ${x:-'}'} # x",
+        "openclaw \"${x:-'}\" \\'} \" # x\"",
+        "openclaw ${x:-${y}} # x",
+        "pnpm openclaw \\\n# x",
+        "printf '%s\\n' \"$\\\n(printf \"%s\" \") # x\")\"",
+        "[[ '#' =~ (#) ]] && openclaw",
+        "printf '%s\\n' @(foo|#bar)",
+        "f() { openclaw; } # x",
+        "declare -A a; a[ # ]=x; openclaw",
+        "openclaw plugins/[ab].mjs # x",
+        r#"declare -A a; printf '%s\n' "$[a[" # marker"]]""#,
+        "printf '%s\\n' \"${ : # }\nprintf '%s' \" # marker\"; }\"",
+        "openclaw ${| REPLY=x; } # x",
+        "alias q=\"printf '%s\\n' '\"\nq # marker'",
+        "openclaw 'unterminated # x",
+        "openclaw \"unterminated # x",
+    ];
+    if cfg!(windows) {
+        recipes.push("openclaw # dev");
+    }
+    for recipe in recipes {
+        assert_eq!(
+            launcher_command(recipe),
+            format!("{recipe} 'gateway' 'two words'"),
+            "{recipe:?}"
+        );
+    }
+}
+
 #[test]
 fn resolve_launcher_run_dir_prefers_the_launcher_cwd() {
     let launcher = sample_launcher(Some("/tmp/launcher"));

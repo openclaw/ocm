@@ -16,7 +16,8 @@ use time::OffsetDateTime;
 use super::checkpoints::{
     CheckpointCleanup, PreparedTreeCheckpoint, STORAGE_TAR_ARCHIVE, copy_tree_checkpoint,
     create_tree_checkpoint_from_preparation, default_snapshot_storage_kind,
-    prepare_scoped_tree_checkpoint_in, remove_tree_if_present,
+    prepare_scoped_tree_checkpoint_in, remove_abandoned_checkpoint_preparations,
+    remove_tree_if_present,
 };
 use super::common::{copy_path_recursive, load_json_files, path_exists, read_json, write_json};
 use super::dev_sources::{
@@ -37,7 +38,7 @@ use super::openclaw_config::{
 use super::{
     OpenClawWorkspaceRuntime, audit_openclaw_state, clear_nonportable_runtime_state,
     get_environment, list_environments, now_utc, remove_upgrade_recovery_for_snapshot,
-    rewrite_openclaw_config_for_target,
+    rewrite_openclaw_config_for_target, validate_runtime_state_inside_root,
 };
 
 const UPGRADE_CHECKPOINT_KIND: &str = "ocm-env-upgrade-checkpoint-v1";
@@ -348,6 +349,7 @@ fn prepare_snapshot_capture(
             display_path(&env_paths.root)
         ));
     }
+    validate_runtime_state_inside_root(&env_paths)?;
     let upgrade_scope = if upgrade {
         validate_upgrade_independent_paths(&meta, &meta.upgrade_independent_paths, env)?;
         Some(UpgradeCheckpointScope {
@@ -404,6 +406,7 @@ pub(crate) fn create_env_snapshot_from_preparation(
             display_path(&env_paths.root)
         ));
     }
+    validate_runtime_state_inside_root(&env_paths)?;
 
     if let Some(scope) = &prepared.upgrade_scope {
         if scope.independent_paths != meta.upgrade_independent_paths {
@@ -1426,6 +1429,12 @@ pub fn remove_env_snapshot(
             "staged snapshot artifact cleanup failed at {}: {error}",
             display_path(&staging_dir)
         ));
+    }
+    // A preparation left by an interrupted capture must not keep the directory.
+    if let Err(error) = snapshot_env_dir(&snapshot.env_name, env, cwd)
+        .and_then(|dir| remove_abandoned_checkpoint_preparations(&dir))
+    {
+        warnings.push(error);
     }
     if let Err(error) = remove_snapshot_parent_if_empty(&snapshot.env_name, env, cwd) {
         warnings.push(format!(

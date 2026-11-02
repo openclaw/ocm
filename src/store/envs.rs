@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::os::unix::fs::DirBuilderExt;
 
 use super::common::{
-    copy_dir_recursive, copy_dir_with_sqlite_snapshots, copy_path, ensure_dir, path_exists,
+    copy_dir_with_sqlite_snapshots, copy_environment_dir, copy_path, ensure_dir, path_exists,
     read_json, write_json,
 };
 use super::dev_sources::{DevSourceRemoval, ensure_root_outside_dev_sources};
@@ -1021,7 +1021,7 @@ fn clone_environment_with_policy(
     source_workspaces.archive_relative_roots(&source_paths.root)?;
     let gateway_port = choose_cloned_gateway_port(&source, &registry.envs, env)?;
     let result = (|| {
-        copy_dir_with_sqlite_snapshots(
+        let directory_modes = copy_dir_with_sqlite_snapshots(
             &source_paths.root,
             &target_paths.root,
             &source_paths.state_dir,
@@ -1190,6 +1190,7 @@ fn clone_environment_with_policy(
         )?;
         super::openclaw_state::clear_cloned_agent_database_leases(&target_paths)?;
         copied_worktrees.finish(&target_paths)?;
+        directory_modes.restore()?;
 
         let meta = EnvMeta {
             upgrade_independent_paths: Vec::new(),
@@ -1512,7 +1513,9 @@ pub(crate) fn import_environment_with_sandbox_origin(
             ));
         }
 
-        if extracted.metadata.include_state {
+        // Ordinary extraction masks directory modes to 0o777; restore their
+        // special bits too. Windows keeps its state-inclusive link handling.
+        if extracted.metadata.include_state || cfg!(unix) {
             crate::infra::archive::restore_env_archive_directory_permissions(
                 &archive_path,
                 staging_dir,
@@ -1636,14 +1639,15 @@ pub(crate) fn import_environment_with_sandbox_origin(
             choose_available_gateway_port(preferred_gateway_port, &registry.envs, env)?;
         let imported = (|| {
             let target_runtime = OpenClawWorkspaceRuntime::for_env(&name, Some(gateway_port));
-            if extracted.metadata.include_state {
+            let directory_modes = if extracted.metadata.include_state {
                 super::common::copy_dir_preserving_permissions(
                     &extracted.root_dir,
                     &target_paths.root,
                 )?;
+                Default::default()
             } else {
-                copy_dir_recursive(&extracted.root_dir, &target_paths.root)?;
-            }
+                copy_environment_dir(&extracted.root_dir, &target_paths.root)?
+            };
             if extracted.metadata.include_state {
                 if config_directory_permissions.is_some() {
                     // The copied directory can be read-only. Rewrite inside a private,
@@ -1743,6 +1747,7 @@ pub(crate) fn import_environment_with_sandbox_origin(
                 fs::set_permissions(&target_paths.state_dir, permissions.clone())
                     .map_err(|error| error.to_string())?;
             }
+            directory_modes.restore()?;
 
             let created_at = now_utc();
             let meta = EnvMeta {
@@ -1799,7 +1804,7 @@ pub(crate) fn import_environment_with_sandbox_origin(
                         ));
                     }
                 } else {
-                    let _ = fs::remove_dir_all(&target_paths.root);
+                    let _ = super::common::remove_owned_tree(&target_paths.root);
                 }
                 Err(error)
             }
