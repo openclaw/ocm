@@ -1,9 +1,7 @@
 //! Keep application signal ownership while bounded private commands settle.
-use std::fs;
-use std::ops::Deref;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::io;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 
 type Handler = Arc<dyn Fn() -> bool + Send + Sync>;
 
@@ -278,124 +276,50 @@ impl Drop for CaptureInterrupt {
     }
 }
 
-struct Removals {
-    next_id: u64,
-    entries: Vec<(u64, Vec<PathBuf>)>,
-    // Set once a signal removed the entries: nothing new may be created
-    // while OCM exits.
-    removed: bool,
-}
+static CANCELLATION_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-static REMOVALS: Mutex<Removals> = Mutex::new(Removals {
-    next_id: 0,
-    entries: Vec::new(),
-    removed: false,
-});
-
-fn removals() -> MutexGuard<'static, Removals> {
-    REMOVALS.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-/// A temporary file or directory whose paths are removed if a signal stops
-/// OCM while it exists. A signal ends the process without unwinding, so the
-/// value's own Drop cleanup never runs then; a command that installs
-/// [`remove_temporary_paths_on_signal`] removes the paths instead. Without
-/// that owner the registration has no effect.
-pub(crate) struct RemovedOnInterrupt<T> {
-    value: Option<T>,
-    id: u64,
-}
-
-impl<T> RemovedOnInterrupt<T> {
-    /// Create the value and register `paths(&value)` under the lock a signal
-    /// removes them under, so a signal never finds it created but unregistered.
-    pub(crate) fn create(
-        create: impl FnOnce() -> Result<T, String>,
-        paths: impl FnOnce(&T) -> Vec<PathBuf>,
-    ) -> Result<Self, String> {
-        let mut removals = removals();
-        if removals.removed {
-            return Err("interrupted by a signal".to_string());
-        }
-        let value = create()?;
-        let id = removals.next_id;
-        removals.next_id += 1;
-        removals.entries.push((id, paths(&value)));
-        Ok(Self {
-            value: Some(value),
-            id,
-        })
-    }
-
-    /// Consume the value, such as by publishing it under its final name, and
-    /// stop tracking its paths, without a signal removing them in between.
-    pub(crate) fn release<R>(mut self, release: impl FnOnce(T) -> R) -> R {
-        let mut removals = removals();
-        removals.entries.retain(|(id, _)| *id != self.id);
-        release(self.value.take().expect("value is present until released"))
-    }
-}
-
-impl<T> Deref for RemovedOnInterrupt<T> {
-    type Target = T;
-
-    fn deref(&self) -> &T {
-        self.value
-            .as_ref()
-            .expect("value is present until released")
-    }
-}
-
-impl<T> Drop for RemovedOnInterrupt<T> {
-    fn drop(&mut self) {
-        // The value's own cleanup runs first; the paths stay registered until
-        // it has finished.
-        if let Some(value) = self.value.take() {
-            drop(value);
-            removals().entries.retain(|(id, _)| *id != self.id);
-        }
-    }
-}
-
-/// Install the application signal owner for a command whose only duty on
-/// SIGINT, SIGTERM or SIGHUP is to remove the paths registered through
-/// [`RemovedOnInterrupt`]; OCM then exits with status 130.
-pub(crate) fn remove_temporary_paths_on_signal() -> Result<(), String> {
+/// Register the application signal owner for a command that stops its own work
+/// when SIGINT, SIGTERM or SIGHUP arrives, so the cleanup its error path
+/// already performs still runs. The signal only requests cancellation; the
+/// command's long-running steps observe it through [`cancellation_requested`]
+/// and return an error. A signal that was ignored when OCM started, as under
+/// `nohup` or for a background job, stays ignored.
+pub(crate) fn request_cancellation_on_signal() -> Result<(), String> {
+    #[cfg(unix)]
+    let ignored = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP]
+        .into_iter()
+        .map(|signal| signal_action(signal).map(|action| (signal, action)))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|(_, action)| action.sa_sigaction == libc::SIG_IGN)
+        .collect::<Vec<_>>();
     set_handler(|| {
-        remove_registered_paths();
-        false
-    })
+        CANCELLATION_REQUESTED.store(true, Ordering::SeqCst);
+        true
+    })?;
+    #[cfg(unix)]
+    for (signal, action) in ignored {
+        set_signal_action(signal, &action)?;
+    }
+    Ok(())
 }
 
-/// Once a signal has removed the registered paths, the dispatcher is ending
-/// OCM with status 130. A command whose work may have seen a path disappear,
-/// as an error or as a finished result, waits here instead of reporting it.
-/// Only for commands that hold no [`CaptureInterrupt`], whose drop would
-/// otherwise be the exit this waits for.
-pub(crate) fn await_exit_after_signal_removal() {
-    if removals().removed {
-        loop {
-            std::thread::park();
-        }
-    }
+/// Whether a signal has asked the command to stop. Cheap enough to check on
+/// every buffered write of a long copy.
+pub(crate) fn cancellation_requested() -> bool {
+    CANCELLATION_REQUESTED.load(Ordering::SeqCst)
 }
 
-fn remove_registered_paths() {
-    let mut removals = removals();
-    removals.removed = true;
-    for (_, paths) in removals.entries.drain(..) {
-        for path in paths {
-            match fs::symlink_metadata(&path) {
-                Ok(metadata) if metadata.is_dir() => {
-                    let _ = fs::remove_dir_all(&path);
-                }
-                Ok(_) => {
-                    let _ = fs::remove_file(&path);
-                }
-                Err(_) => {}
-            }
-        }
-    }
+/// [`cancellation_requested`], counting a signal that already reached OCM but
+/// is still being dispatched, for the decision after the work returned.
+pub(crate) fn cancellation_settled() -> bool {
+    settle();
+    cancellation_requested()
+}
+
+/// The error a long-running step returns once cancellation is requested.
+pub(crate) fn cancelled_error() -> io::Error {
+    io::Error::other("interrupted by a signal")
 }
 
 #[cfg(all(test, unix))]

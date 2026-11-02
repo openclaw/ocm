@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs::{self, File};
-use std::io::{self, Cursor, Read, Seek, SeekFrom};
+use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use flate2::read::GzDecoder;
@@ -11,7 +11,6 @@ use time::OffsetDateTime;
 use zip::ZipArchive;
 
 use crate::env::{default_service_enabled, default_service_running};
-use crate::infra::interrupt::RemovedOnInterrupt;
 #[cfg(not(target_os = "linux"))]
 use crate::infra::sqlite_snapshot::create_sqlite_snapshot_no_follow;
 use crate::infra::sqlite_snapshot::{create_sqlite_snapshot, file_is_sqlite_database};
@@ -265,33 +264,28 @@ fn write_env_archive_with_capture<T: Serialize>(
     fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     let mut builder = tempfile::Builder::new();
     builder.prefix(".ocm-export-");
-    let staged = RemovedOnInterrupt::create(
-        || {
-            if options.private_output {
-                #[cfg(target_os = "macos")]
-                let file = builder.make_in(
-                    parent,
-                    crate::infra::macos_security::create_private_file_new,
-                );
-                #[cfg(windows)]
-                let file = builder.make_in(
-                    parent,
-                    crate::infra::windows_security::create_private_file_new,
-                );
-                #[cfg(not(any(windows, target_os = "macos")))]
-                let file = builder.tempfile_in(parent);
-                file
-            } else {
-                // Keep ordinary creation permissions and inherited ACLs. Only
-                // state-inclusive exports require the private-file creators above.
-                builder.make_in(parent, |path| {
-                    File::options().write(true).create_new(true).open(path)
-                })
-            }
-            .map_err(|error| error.to_string())
-        },
-        |file| vec![file.path().to_path_buf()],
-    )?;
+    let staged = if options.private_output {
+        #[cfg(target_os = "macos")]
+        let file = builder.make_in(
+            parent,
+            crate::infra::macos_security::create_private_file_new,
+        );
+        #[cfg(windows)]
+        let file = builder.make_in(
+            parent,
+            crate::infra::windows_security::create_private_file_new,
+        );
+        #[cfg(not(any(windows, target_os = "macos")))]
+        let file = builder.tempfile_in(parent);
+        file
+    } else {
+        // Keep ordinary creation permissions and inherited ACLs. Only
+        // state-inclusive exports require the private-file creators above.
+        builder.make_in(parent, |path| {
+            File::options().write(true).create_new(true).open(path)
+        })
+    }
+    .map_err(|error| error.to_string())?;
     // Stage both modes so retries and error cleanup touch only our own file.
     // Publication must acquire the destination without replacing any entry.
     let canonical_output = staged
@@ -312,13 +306,9 @@ fn write_env_archive_with_capture<T: Serialize>(
             .map_err(|error| error.to_string())?;
         match write_env_archive_attempt(metadata, source_root, file, options.clone(), capture) {
             Ok(()) => {
-                // A failed publication drops the staged file while its path
-                // is still tracked.
-                staged.release(|file| {
-                    file.persist_noclobber(output_path)
-                        .map(drop)
-                        .map_err(|error| error.to_string())
-                })?;
+                staged
+                    .persist_noclobber(output_path)
+                    .map_err(|error| error.to_string())?;
                 return Ok(());
             }
             Err(EnvArchiveWriteError::EntryDisappeared(_))
@@ -336,7 +326,7 @@ fn write_env_archive_attempt<T: Serialize>(
     options: EnvArchiveOptions,
     capture: Option<&ArchiveSource>,
 ) -> Result<(), EnvArchiveWriteError> {
-    let mut builder = Builder::new(file);
+    let mut builder = Builder::new(ArchiveOutput(file));
     builder.follow_symlinks(false);
     let mut metadata_raw = serde_json::to_string_pretty(metadata)
         .map_err(|error| EnvArchiveWriteError::Fatal(error.to_string()))?;
@@ -359,8 +349,26 @@ fn write_env_archive_attempt<T: Serialize>(
         .map_err(|error| EnvArchiveWriteError::Fatal(error.to_string()))
 }
 
+/// The staged archive. A requested cancellation fails the next write, so a
+/// signal stops the export within one buffered write of any entry, however
+/// large, and the export's error path removes the staging file.
+struct ArchiveOutput(File);
+
+impl Write for ArchiveOutput {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if crate::infra::interrupt::cancellation_requested() {
+            return Err(crate::infra::interrupt::cancelled_error());
+        }
+        self.0.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
 fn append_env_root(
-    builder: &mut Builder<File>,
+    builder: &mut Builder<ArchiveOutput>,
     source_root: &Path,
     options: &EnvArchiveOptions,
     capture: Option<&ArchiveSource>,
@@ -655,7 +663,7 @@ fn append_env_root(
 }
 
 fn append_directory_header(
-    builder: &mut Builder<File>,
+    builder: &mut Builder<ArchiveOutput>,
     path: &Path,
     metadata: &fs::Metadata,
 ) -> Result<(), EnvArchiveWriteError> {
@@ -1199,7 +1207,7 @@ fn open_archive_windows_entry(path: &Path, directory: bool) -> Result<File, EnvA
 }
 
 fn append_bounded_file(
-    builder: &mut Builder<File>,
+    builder: &mut Builder<ArchiveOutput>,
     archive_path: &Path,
     file: &mut File,
     metadata: &fs::Metadata,
@@ -2442,7 +2450,8 @@ mod tests {
             .write_all(&vec![b'b'; 1024])
             .unwrap();
         let archive_path = root.path().join("archive.tar");
-        let mut builder = tar::Builder::new(File::create(&archive_path).unwrap());
+        let mut builder =
+            tar::Builder::new(super::ArchiveOutput(File::create(&archive_path).unwrap()));
         assert!(
             super::append_bounded_file(&mut builder, Path::new("log"), &mut file, &metadata)
                 .is_ok()
@@ -2473,7 +2482,9 @@ mod tests {
         let mut file = File::open(&source).unwrap();
         let metadata = file.metadata().unwrap();
         fs::write(&source, b"short").unwrap();
-        let mut builder = tar::Builder::new(File::create(root.path().join("short.tar")).unwrap());
+        let mut builder = tar::Builder::new(super::ArchiveOutput(
+            File::create(root.path().join("short.tar")).unwrap(),
+        ));
         assert!(matches!(
             super::append_bounded_file(&mut builder, Path::new("log"), &mut file, &metadata),
             Err(super::EnvArchiveWriteError::EntryDisappeared(_))

@@ -10,15 +10,13 @@ use rusqlite::{Connection, ErrorCode, OpenFlags};
 use sha2::{Digest, Sha256};
 use tempfile::{NamedTempFile, TempDir};
 
-use crate::infra::interrupt::RemovedOnInterrupt;
-
 const SQLITE_BACKUP_PAGES_PER_STEP: i32 = 256;
 const SQLITE_BACKUP_RETRY_DELAY: Duration = Duration::from_millis(10);
 const SQLITE_BACKUP_TIMEOUT: Duration = Duration::from_secs(30);
 const RECOVERED_DATABASE: &str = "database";
 
 pub(crate) struct SqliteSnapshot {
-    file: RemovedOnInterrupt<NamedTempFile>,
+    file: NamedTempFile,
 }
 
 impl SqliteSnapshot {
@@ -55,7 +53,7 @@ pub(crate) fn sqlite_is_busy(error: &rusqlite::Error) -> bool {
 /// The committed state of a database left with a hot rollback journal,
 /// recovered by replaying the journal in a private copy.
 pub(crate) struct RecoveredSqliteDatabase {
-    directory: RemovedOnInterrupt<TempDir>,
+    directory: TempDir,
     source_digest: [u8; 32],
 }
 
@@ -89,15 +87,10 @@ fn recover_hot_journal_with_flags(
     if !journal_is_hot(source, flags, vfs)? {
         return Ok(None);
     }
-    let directory = RemovedOnInterrupt::create(
-        || {
-            tempfile::Builder::new()
-                .prefix("ocm-sqlite-recovery-")
-                .tempdir()
-                .map_err(|error| format!("failed to create private SQLite recovery: {error}"))
-        },
-        |directory| vec![directory.path().to_path_buf()],
-    )?;
+    let directory = tempfile::Builder::new()
+        .prefix("ocm-sqlite-recovery-")
+        .tempdir()
+        .map_err(|error| format!("failed to create private SQLite recovery: {error}"))?;
     let copy = directory.path().join(RECOVERED_DATABASE);
     let Some(source_digest) = copy_database_files(source, &copy, no_follow)? else {
         return Ok(None);
@@ -312,21 +305,16 @@ fn create_sqlite_snapshot_with_flags(
     flags: OpenFlags,
     vfs: Option<&CStr>,
 ) -> Result<SqliteSnapshot, String> {
-    let file = RemovedOnInterrupt::create(
-        || {
-            #[cfg(target_os = "macos")]
-            let file = tempfile::Builder::new()
-                .make(crate::infra::macos_security::create_private_file_new);
-            #[cfg(windows)]
-            let file = tempfile::Builder::new()
-                .make(crate::infra::windows_security::create_private_file_new);
-            #[cfg(not(any(windows, target_os = "macos")))]
-            let file = NamedTempFile::new();
-            file.map_err(|error| format!("failed to create private SQLite snapshot: {error}"))
-        },
-        |file| vec![file.path().to_path_buf()],
-    )?;
-    let snapshot = SqliteSnapshot { file };
+    #[cfg(target_os = "macos")]
+    let file = tempfile::Builder::new().make(crate::infra::macos_security::create_private_file_new);
+    #[cfg(windows)]
+    let file =
+        tempfile::Builder::new().make(crate::infra::windows_security::create_private_file_new);
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let file = NamedTempFile::new();
+    let snapshot = SqliteSnapshot {
+        file: file.map_err(|error| format!("failed to create private SQLite snapshot: {error}"))?,
+    };
     create_sqlite_snapshot_inner(source, snapshot.path(), flags, vfs)?;
     // Flush through the owned writable handle; Windows rejects a read-only handle.
     snapshot.file.as_file().sync_all().map_err(|error| {
@@ -357,12 +345,6 @@ fn create_sqlite_snapshot_inner(
     })?;
     target_db
         .busy_timeout(SQLITE_BACKUP_RETRY_DELAY)
-        .and_then(|()| {
-            // The snapshot is private and used only once complete, so it needs
-            // no rollback journal file. SQLite creates one by name, which an
-            // interrupted export could not remove.
-            target_db.query_row("PRAGMA journal_mode=MEMORY", [], |_| Ok(()))
-        })
         .map_err(|error| {
             format!(
                 "failed to configure SQLite snapshot target {}: {error}",
@@ -480,6 +462,15 @@ fn backup_database(
         )
     })?;
     loop {
+        // Stop between steps; returning closes the target connection before
+        // its caller removes the snapshot file.
+        if crate::infra::interrupt::cancellation_requested() {
+            return Err(format!(
+                "failed to copy SQLite database {}: {}",
+                source.display(),
+                crate::infra::interrupt::cancelled_error()
+            ));
+        }
         let status = match backup.step(SQLITE_BACKUP_PAGES_PER_STEP) {
             Ok(status) => status,
             Err(error) if sqlite_needs_rollback(&error) => return Ok(false),

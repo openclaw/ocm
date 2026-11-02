@@ -1684,9 +1684,11 @@ directory alias: its own output is excluded from the archived contents. An
 existing output path is refused, including a dangling symlink or a file created
 by another writer while export is preparing the archive. Both export modes
 publish without replacing that entry and clean up only their own staging file
-if writing or publication fails. If SIGINT (Ctrl-C), SIGTERM or SIGHUP stops an
-export, it removes its staging file and its private SQLite snapshot copies in
-`TMPDIR` and exits with status 130.
+if writing or publication fails. SIGINT (Ctrl-C), SIGTERM or SIGHUP stops an
+export the same way: it removes its staging file and its private SQLite
+snapshot copies in `TMPDIR` and exits with status 130. A signal that OCM was
+started with ignored, as under `nohup` or for a background job, is still
+ignored.
 
 Export omits `.openclaw/state` by default. Default export keeps shared managed
 skills under `.openclaw/skills` and their global ClawHub tracking metadata under

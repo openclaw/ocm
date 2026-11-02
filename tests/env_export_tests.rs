@@ -3321,8 +3321,11 @@ fn env_export_removes_its_staging_and_sqlite_snapshot_when_interrupted() {
     drop(large);
     fs::create_dir_all(openclaw.join("state")).unwrap();
     let database = Connection::open(openclaw.join("state/agent.sqlite")).unwrap();
+    // WAL is the usual mode; its snapshot copy opens with -wal and -shm files.
     database
-        .execute_batch("CREATE TABLE t(b BLOB); INSERT INTO t VALUES (zeroblob(67108864));")
+        .execute_batch(
+            "PRAGMA journal_mode=WAL; CREATE TABLE t(b BLOB); INSERT INTO t VALUES (zeroblob(67108864));",
+        )
         .unwrap();
     database.close().unwrap();
     let destination = root.child("archives");
@@ -3335,16 +3338,20 @@ fn env_export_removes_its_staging_and_sqlite_snapshot_when_interrupted() {
             .collect::<Vec<_>>()
     };
     // (state included, signal, directory whose new file shows the export is
-    // mid-write): the staging file in the output directory, or the SQLite
-    // snapshot copy in TMPDIR.
-    for (include_state, signal, watched) in [
-        (false, libc::SIGINT, &destination),
-        (true, libc::SIGTERM, &destination),
-        (false, libc::SIGHUP, &destination),
-        (true, libc::SIGINT, &temp),
-        (true, libc::SIGTERM, &temp),
+    // mid-write: the staging file in the output directory, or the SQLite
+    // snapshot copy in TMPDIR, and whether the export starts with the signal
+    // ignored, as under nohup).
+    for (include_state, signal, watched, ignored) in [
+        (false, libc::SIGINT, &destination, false),
+        (true, libc::SIGTERM, &destination, false),
+        (false, libc::SIGHUP, &destination, false),
+        (true, libc::SIGINT, &temp, false),
+        (true, libc::SIGTERM, &temp, false),
+        (true, libc::SIGHUP, &destination, true),
     ] {
-        let label = format!("include_state={include_state} signal={signal} watched={watched:?}");
+        let label = format!(
+            "include_state={include_state} signal={signal} watched={watched:?} ignored={ignored}"
+        );
         let output = destination.join("interrupted.tar");
         let mut command = Command::new(support::ocm_test_binary_path());
         command
@@ -3357,6 +3364,15 @@ fn env_export_removes_its_staging_and_sqlite_snapshot_when_interrupted() {
             .stderr(Stdio::piped());
         if include_state {
             command.arg("--include-state");
+        }
+        if ignored {
+            use std::os::unix::process::CommandExt;
+            unsafe {
+                command.pre_exec(move || {
+                    libc::signal(signal, libc::SIG_IGN);
+                    Ok(())
+                });
+            }
         }
         let mut exporter = Exporter(command.spawn().unwrap());
         let pid = exporter.0.id() as libc::pid_t;
@@ -3411,11 +3427,21 @@ fn env_export_removes_its_staging_and_sqlite_snapshot_when_interrupted() {
             .unwrap()
             .read_to_string(&mut errors)
             .unwrap();
-        assert_eq!(status.code(), Some(130), "{label}: {status:?} {errors}");
-        assert!(
-            !output.exists(),
-            "{label}: interrupted export was published"
-        );
+        if ignored {
+            assert!(status.success(), "{label}: {status:?} {errors}");
+            assert_eq!(entries(&destination), vec!["interrupted.tar".to_string()]);
+            fs::remove_file(&output).unwrap();
+        } else {
+            assert_eq!(status.code(), Some(130), "{label}: {status:?} {errors}");
+            assert!(
+                errors.contains("interrupted by a signal"),
+                "{label}: {errors}"
+            );
+            assert!(
+                !output.exists(),
+                "{label}: interrupted export was published"
+            );
+        }
         assert_eq!(entries(&destination), Vec::<String>::new(), "{label}");
         assert_eq!(entries(&temp), Vec::<String>::new(), "{label}");
     }
