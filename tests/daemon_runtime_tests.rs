@@ -3785,6 +3785,191 @@ fn daemon_child_inspects_the_spawning_daemons_xdg_service() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn homebrew_daemon_children_keep_the_link_across_brew_upgrade() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("daemon-homebrew-keg");
+    let mut env = ocm_env(&root);
+    install_fake_service_manager(&root, &mut env);
+    let prefix = fs::canonicalize(root.path()).unwrap().join("linuxbrew");
+    let keg = prefix.join("Cellar/ocm/0.3.8");
+    let binary = keg.join("bin/ocm");
+    fs::create_dir_all(binary.parent().unwrap()).unwrap();
+    fs::copy(ocm_test_binary_path(), &binary).unwrap();
+    fs::write(keg.join("INSTALL_RECEIPT.json"), "{}").unwrap();
+    fs::create_dir_all(prefix.join("bin")).unwrap();
+    std::os::unix::fs::symlink("../Cellar/ocm/0.3.8/bin/ocm", prefix.join("bin/ocm")).unwrap();
+
+    // The first child to run simulates `brew upgrade`: a new keg, the link
+    // repointed, the daemon's own keg removed. Every child records OCM_SELF.
+    let upgraded = root.child("upgraded");
+    let script = root.child("bin/openclaw");
+    write_legacy_openclaw_script(
+        &script,
+        &format!(
+            "#!/bin/sh\nprintf '%s' \"$OCM_SELF\" > '{root}/self-'$$\nif [ ! -e '{upgraded}' ]; then\n  mkdir -p '{prefix}/Cellar/ocm/0.3.9/bin' && : > '{prefix}/Cellar/ocm/0.3.9/bin/ocm'\n  ln -sfn ../Cellar/ocm/0.3.9/bin/ocm '{prefix}/bin/ocm' && rm -rf '{keg}' && : > '{upgraded}'\nfi\n",
+            root = root.path().display(),
+            upgraded = upgraded.display(),
+            prefix = prefix.display(),
+            keg = keg.display(),
+        ),
+    );
+    let launcher = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "launcher",
+            "add",
+            "stable",
+            "--command",
+            script.to_str().unwrap(),
+        ],
+    );
+    assert!(launcher.status.success(), "{}", stderr(&launcher));
+    for name in ["first", "second"] {
+        let created = run_ocm(
+            root.path(),
+            &env,
+            &["env", "create", name, "--launcher", "stable"],
+        );
+        assert!(created.status.success(), "{}", stderr(&created));
+        set_service_enabled(root.path(), &env, name, true);
+    }
+    SupervisorService::new(&env, root.path()).sync().unwrap();
+
+    let mut run = Command::new(&binary);
+    run.current_dir(root.path())
+        .args(["__daemon", "run", "--once", "--json"])
+        .env_clear()
+        .envs(&env);
+    let output = (0..5)
+        .find_map(|_| match run.output() {
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                sleep(Duration::from_millis(20));
+                None
+            }
+            result => Some(result.unwrap()),
+        })
+        .expect("copied ocm stayed busy");
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(upgraded.exists(), "no child simulated the upgrade");
+    let link = path_string(&prefix.join("bin/ocm"));
+    let recorded: Vec<String> = fs::read_dir(root.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("self-"))
+        })
+        .map(|path| fs::read_to_string(path).unwrap())
+        .collect();
+    assert_eq!(recorded, vec![link.clone(), link]);
+}
+
+#[cfg(unix)]
+#[test]
+fn homebrew_daemon_started_before_brew_upgrade_gives_new_gateways_the_link() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("daemon-homebrew-idle");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    env.insert(
+        "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
+        "launchd".to_string(),
+    );
+    install_fake_launchctl(&root, &mut env);
+    let prefix = fs::canonicalize(root.path()).unwrap().join("linuxbrew");
+    let keg = prefix.join("Cellar/ocm/0.3.8");
+    let binary = keg.join("bin/ocm");
+    fs::create_dir_all(binary.parent().unwrap()).unwrap();
+    fs::copy(ocm_test_binary_path(), &binary).unwrap();
+    fs::write(keg.join("INSTALL_RECEIPT.json"), "{}").unwrap();
+    fs::create_dir_all(prefix.join("bin")).unwrap();
+    std::os::unix::fs::symlink("../Cellar/ocm/0.3.8/bin/ocm", prefix.join("bin/ocm")).unwrap();
+
+    let marker = root.child("child-ocm-self");
+    let runtime = root.child("bin/openclaw-runtime");
+    write_legacy_openclaw_script(
+        &runtime,
+        &format!(
+            "#!/bin/sh\nprintf '%s' \"$OCM_SELF\" > '{}'\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
+            marker.display()
+        ),
+    );
+    let add = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "runtime",
+            "add",
+            "fixture",
+            "--path",
+            &path_string(&runtime),
+        ],
+    );
+    assert!(add.status.success(), "{}", stderr(&add));
+    let create = run_ocm(
+        &cwd,
+        &env,
+        &["env", "create", "demo", "--runtime", "fixture"],
+    );
+    assert!(create.status.success(), "{}", stderr(&create));
+    let service = SupervisorService::new(&env, &cwd);
+    service.sync().unwrap();
+    service.install_daemon().unwrap();
+
+    // The daemon starts with no Gateway, so nothing but its startup resolves
+    // the link before the upgrade below removes its keg.
+    let runtime_path = root.child("ocm-home/supervisor/runtime.json");
+    let mut command = Command::new("/bin/sh");
+    command
+        .args([
+            "-c",
+            "printf '%s\\n' \"$$\" > \"$OCM_TEST_NATIVE_DAEMON_PID_FILE\" || exit 1; exec \"$@\"",
+            "ocm-daemon-fixture",
+        ])
+        .arg(&binary)
+        .args(["__daemon", "run"])
+        .current_dir(&cwd)
+        .env_clear()
+        .envs(&env)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut daemon = (0..5)
+        .find_map(|_| match command.spawn() {
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                sleep(Duration::from_millis(20));
+                None
+            }
+            result => Some(result.unwrap()),
+        })
+        .expect("copied ocm stayed busy");
+    let started = wait_for_runtime_children(&runtime_path, 0, None, Duration::from_secs(5));
+    if started.is_none() {
+        stop_process(&mut daemon);
+        panic!("daemon did not publish its runtime state");
+    }
+
+    let new_keg = prefix.join("Cellar/ocm/0.3.9/bin");
+    fs::create_dir_all(&new_keg).unwrap();
+    fs::write(new_keg.join("ocm"), "").unwrap();
+    fs::remove_file(prefix.join("bin/ocm")).unwrap();
+    std::os::unix::fs::symlink("../Cellar/ocm/0.3.9/bin/ocm", prefix.join("bin/ocm")).unwrap();
+    fs::remove_dir_all(&keg).unwrap();
+
+    set_service_enabled(&cwd, &env, "demo", true);
+    service.sync().unwrap();
+    let recorded = wait_for_file(&marker, Duration::from_secs(10));
+    stop_process(&mut daemon);
+    assert!(recorded, "the daemon did not start the Gateway");
+    assert_eq!(
+        fs::read_to_string(&marker).unwrap(),
+        path_string(&prefix.join("bin/ocm"))
+    );
+}
+
 #[test]
 fn daemon_run_once_executes_planned_children() {
     let _guard = daemon_runtime_test_lock();
@@ -6900,6 +7085,164 @@ fn daemon_stops_repeated_quick_clean_exit_after_restart_handoff() {
     assert!(daemon.try_wait().unwrap().is_none());
 
     stop_process(&mut daemon);
+}
+
+#[test]
+fn back_to_back_service_restarts_keep_a_handoff_gateway_running() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("daemon-back-to-back-restarts");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    install_fake_service_manager(&root, &mut env);
+    let service = SupervisorService::new(&env, &cwd);
+    let runtime_path = root.child("ocm-home/supervisor/runtime.json");
+
+    // A protocol v1 Gateway that runs until `gateway restart` hands it off,
+    // then exits cleanly, as OpenClaw does for `ocm service restart`.
+    let intent = root.child("restart-intent.txt");
+    let current = root.child("gateway.pid");
+    let script = root.child("bin/openclaw.mjs");
+    write_executable_script(
+        &script,
+        &format!(
+            "#!/bin/sh\n{protocol}if [ \"${{1:-}}\" = gateway ] && [ \"${{2:-}}\" = restart ]; then\n  pid=$(cat '{current}')\n  printf '%s\\n' \"$pid\" > '{intent}'\n  kill -TERM \"$pid\"\n  exit 0\nfi\nprintf '%s\\n' \"$$\" > '{current}'\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1 & wait $!; done\n",
+            protocol = restart_handoff_protocol_shell_snippet(&intent),
+            current = path_string(&current),
+            intent = path_string(&intent),
+        ),
+    );
+
+    let launcher = run_ocm(
+        &cwd,
+        &env,
+        &["launcher", "add", "dev", "--command", &path_string(&script)],
+    );
+    assert!(launcher.status.success(), "{}", stderr(&launcher));
+    let created = run_ocm(&cwd, &env, &["env", "create", "demo", "--launcher", "dev"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    set_service_enabled(&cwd, &env, "demo", true);
+    service.sync().unwrap();
+    service.install_daemon().unwrap();
+
+    let mut daemon = spawn_daemon_process(&cwd, &env);
+    // Always settle the owned daemon, including on a failed assertion.
+    let result = std::panic::catch_unwind(|| {
+        let runtime =
+            wait_for_runtime_children(&runtime_path, 1, Some("demo"), Duration::from_secs(10))
+                .expect("daemon did not start the Gateway");
+        let mut previous_pid = runtime_child_pid(&runtime, "demo").unwrap();
+        assert_eq!(runtime["services"][0]["restartHandoff"], "protocol-v1");
+
+        // Each restart replaces a Gateway that is seconds old, which is quick
+        // by the clean-exit loop guard's measure.
+        for attempt in 1..=3 {
+            let restarted = run_ocm(&cwd, &env, &["service", "restart", "demo", "--json"]);
+            assert!(
+                restarted.status.success(),
+                "restart {attempt}: {}",
+                stderr(&restarted)
+            );
+            let body: Value = serde_json::from_slice(&restarted.stdout).unwrap();
+            assert_eq!(body["running"], true, "restart {attempt}: {body}");
+            assert_eq!(body["gatewayState"], "running", "restart {attempt}: {body}");
+            assert_eq!(
+                body["warnings"],
+                Value::Array(Vec::new()),
+                "restart {attempt}"
+            );
+            let pid = runtime_child_pid(&read_persisted_service_state(&runtime_path), "demo")
+                .expect("restart left no running Gateway");
+            assert_ne!(pid, previous_pid, "restart {attempt} kept the old Gateway");
+            previous_pid = pid;
+        }
+    });
+    stop_process(&mut daemon);
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
+}
+
+#[test]
+fn rejected_restart_inside_the_gateway_keeps_no_handoff_request() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("daemon-inside-gateway-restart-request");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    install_fake_service_manager(&root, &mut env);
+    let service = SupervisorService::new(&env, &cwd);
+    let runtime_path = root.child("ocm-home/supervisor/runtime.json");
+    let state_path = root.child("ocm-home/supervisor/state.json");
+
+    // `gateway restart` either rejects the request or accepts it for later,
+    // leaving the Gateway running, as OpenClaw does for a deferred restart.
+    let intent = root.child("restart-intent.txt");
+    let control = root.child("restart-control.txt");
+    let script = root.child("bin/openclaw.mjs");
+    write_executable_script(
+        &script,
+        &format!(
+            "#!/bin/sh\n{protocol}if [ \"${{1:-}}\" = gateway ] && [ \"${{2:-}}\" = restart ]; then\n  [ \"$(cat '{control}')\" = reject ] && exit 23\n  exit 0\nfi\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1 & wait $!; done\n",
+            protocol = restart_handoff_protocol_shell_snippet(&intent),
+            control = path_string(&control),
+        ),
+    );
+
+    let launcher = run_ocm(
+        &cwd,
+        &env,
+        &["launcher", "add", "dev", "--command", &path_string(&script)],
+    );
+    assert!(launcher.status.success(), "{}", stderr(&launcher));
+    let created = run_ocm(&cwd, &env, &["env", "create", "demo", "--launcher", "dev"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    set_service_enabled(&cwd, &env, "demo", true);
+    service.sync().unwrap();
+    service.install_daemon().unwrap();
+
+    let mut daemon = spawn_daemon_process(&cwd, &env);
+    // Always settle the owned daemon, including on a failed assertion.
+    let result = std::panic::catch_unwind(|| {
+        let runtime =
+            wait_for_runtime_children(&runtime_path, 1, Some("demo"), Duration::from_secs(10))
+                .expect("daemon did not start the Gateway");
+        let pid = runtime_child_pid(&runtime, "demo").unwrap();
+        assert_eq!(runtime["services"][0]["restartHandoff"], "protocol-v1");
+        let mut inside = env.clone();
+        inside.insert("OCM_ACTIVE_ENV".to_string(), "demo".to_string());
+        inside.insert("OPENCLAW_SERVICE_KIND".to_string(), "gateway".to_string());
+        let pending_requests = || {
+            read_persisted_service_state(&state_path)["handoffRestartRequests"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        };
+        let restart = |mode: &str| {
+            fs::write(&control, mode).unwrap();
+            run_ocm(&cwd, &inside, &["service", "restart", "demo", "--json"])
+        };
+
+        let rejected = restart("reject");
+        assert!(!rejected.status.success(), "{}", stdout(&rejected));
+        assert!(stderr(&rejected).contains("rejected the recovery-aware restart"));
+        assert!(pending_requests().is_empty());
+
+        let scheduled = restart("defer");
+        assert!(scheduled.status.success(), "{}", stderr(&scheduled));
+        let pending = pending_requests();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0]["pid"], pid);
+
+        // A rejected retry clears only its own request, not the scheduled one.
+        let retried = restart("reject");
+        assert!(!retried.status.success(), "{}", stdout(&retried));
+        assert_eq!(pending_requests(), pending);
+    });
+    stop_process(&mut daemon);
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
 }
 
 #[test]
