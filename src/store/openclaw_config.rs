@@ -350,8 +350,8 @@ fn expand_home_relative_paths_in_scope(
 /// (string `memory.search.extraPaths` entries, `messages.usageTemplate`, the
 /// voice-call store and the file-transfer path lists) keep their meaning,
 /// because `HOME` is unchanged in the environment. `nodeHost.workerRuns.folders`
-/// is left out: its consumer resolves links before `..`, which a rewritten
-/// path cannot reproduce.
+/// is not rewritten yet: its consumer resolves links before `..`, unlike the
+/// lexical expansion used here (openclaw/ocm#972).
 const CONSUMER_HOME_PATH_SETTINGS: &[(&[&str], bool)] = &[
     // src/skills/loading/workspace-skill-sources.ts, symlink-targets.ts
     (&["skills", "load", "extraDirs", "[]"], true),
