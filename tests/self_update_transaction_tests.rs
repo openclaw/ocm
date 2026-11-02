@@ -734,6 +734,21 @@ fn local_transaction_survives_gateway_teardown_and_recovers_failures() {
         assert_eq!(shown["phase"], "applying");
         assert_eq!(shown["id"], id);
     }
+    // Another spelling of the install directory reaches the same journal. On
+    // macOS the process reports the executable through the spelling it ran.
+    let bin_link = crash.root.child("bin-link");
+    std::os::unix::fs::symlink(crash.binary.parent().unwrap(), &bin_link).unwrap();
+    let aliased_binary = bin_link.join("ocm");
+    let status = run_ocm_binary(
+        &aliased_binary,
+        crash.root.path(),
+        &crash.env,
+        &["self", "update", "--status"],
+    );
+    assert!(status.status.success(), "{}", stderr(&status));
+    let shown: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(shown["phase"], "applying");
+    assert_eq!(shown["id"], id);
     assert_eq!(
         fs::read(crash.root.child("manager.log")).unwrap(),
         before_recovery
@@ -748,7 +763,7 @@ fn local_transaction_survives_gateway_teardown_and_recovers_failures() {
         crash.root.child("home-link").to_string_lossy().into(),
     );
     let recovered = run_ocm_binary(
-        &crash.binary,
+        &aliased_binary,
         crash.root.path(),
         &alias_env,
         &["self", "update", "--recover"],
