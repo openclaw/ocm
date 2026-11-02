@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs::{self, File};
-use std::io::{self, Cursor, Read, Seek, SeekFrom};
+use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use flate2::read::GzDecoder;
@@ -97,6 +97,20 @@ pub enum EnvArchiveEntryKind {
     Other,
 }
 
+/// How the archive records links whose targets are inside the archived root.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum SymlinkRelocation {
+    /// Keep every captured target.
+    #[default]
+    Keep,
+    /// Rewrite absolute targets inside the root, existing or dangling, as
+    /// relative targets so an import does not reach the source. Relative
+    /// targets are kept.
+    Absolute,
+    /// Rewrite every existing owned target; dangling targets are kept.
+    Owned,
+}
+
 #[derive(Clone)]
 pub struct EnvArchiveOptions {
     pub should_skip_path: fn(&Path, EnvArchiveEntryKind) -> bool,
@@ -108,7 +122,7 @@ pub struct EnvArchiveOptions {
     pub preserved_byte_roots: BTreeSet<PathBuf>,
     pub preserved_entry_paths: BTreeSet<PathBuf>,
     pub private_output: bool,
-    pub relocate_internal_symlinks: bool,
+    pub symlink_relocation: SymlinkRelocation,
     pub sqlite_content_roots: BTreeSet<PathBuf>,
     /// Source-relative path of the file this archive is being written to.
     /// Set by the archive writer; it is never archived, wherever it lives.
@@ -127,7 +141,7 @@ impl Default for EnvArchiveOptions {
             preserved_byte_roots: BTreeSet::new(),
             preserved_entry_paths: BTreeSet::new(),
             private_output: false,
-            relocate_internal_symlinks: false,
+            symlink_relocation: SymlinkRelocation::Keep,
             sqlite_content_roots: BTreeSet::new(),
             own_output_path: None,
         }
@@ -218,7 +232,7 @@ pub fn write_env_archive_with_options<T: Serialize>(
         .map_err(|error| error.to_string())?;
     let source_root = resolved_root.as_path();
     let capture = if options.sqlite_content_roots.is_empty()
-        && !options.relocate_internal_symlinks
+        && options.symlink_relocation == SymlinkRelocation::Keep
         && !options.snapshot_sqlite_files
     {
         None
@@ -306,6 +320,10 @@ fn write_env_archive_with_capture<T: Serialize>(
             .map_err(|error| error.to_string())?;
         match write_env_archive_attempt(metadata, source_root, file, options.clone(), capture) {
             Ok(()) => {
+                // A signal that reached OCM before publication cancels it.
+                if crate::infra::interrupt::cancellation_settled() {
+                    return Err(crate::infra::interrupt::cancelled_error().to_string());
+                }
                 staged
                     .persist_noclobber(output_path)
                     .map_err(|error| error.to_string())?;
@@ -326,7 +344,7 @@ fn write_env_archive_attempt<T: Serialize>(
     options: EnvArchiveOptions,
     capture: Option<&ArchiveSource>,
 ) -> Result<(), EnvArchiveWriteError> {
-    let mut builder = Builder::new(file);
+    let mut builder = Builder::new(ArchiveOutput(file));
     builder.follow_symlinks(false);
     let mut metadata_raw = serde_json::to_string_pretty(metadata)
         .map_err(|error| EnvArchiveWriteError::Fatal(error.to_string()))?;
@@ -349,8 +367,26 @@ fn write_env_archive_attempt<T: Serialize>(
         .map_err(|error| EnvArchiveWriteError::Fatal(error.to_string()))
 }
 
+/// The staged archive. A requested cancellation fails the next write, so a
+/// signal stops the export within one buffered write of any entry, however
+/// large, and the export's error path removes the staging file.
+struct ArchiveOutput(File);
+
+impl Write for ArchiveOutput {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if crate::infra::interrupt::cancellation_requested() {
+            return Err(crate::infra::interrupt::cancelled_error());
+        }
+        self.0.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
 fn append_env_root(
-    builder: &mut Builder<File>,
+    builder: &mut Builder<ArchiveOutput>,
     source_root: &Path,
     options: &EnvArchiveOptions,
     capture: Option<&ArchiveSource>,
@@ -590,15 +626,19 @@ fn append_env_root(
         if metadata.is_symlink() && capture.is_some() {
             let source = capture.unwrap();
             let captured_target = source.link(relative_path, &metadata)?;
-            let owned = if options.relocate_internal_symlinks {
-                owned_archive_link_target(
+            let owned = match options.symlink_relocation {
+                SymlinkRelocation::Keep => None,
+                SymlinkRelocation::Absolute => absolute_archive_link_target(
+                    &source.root.join(relative_path),
+                    &source.root,
+                    &captured_target,
+                ),
+                SymlinkRelocation::Owned => owned_archive_link_target(
                     &source.root.join(relative_path),
                     &source.root,
                     &captured_target,
                     options,
-                )?
-            } else {
-                None
+                )?,
             };
             #[cfg(windows)]
             let directory_link = {
@@ -645,7 +685,7 @@ fn append_env_root(
 }
 
 fn append_directory_header(
-    builder: &mut Builder<File>,
+    builder: &mut Builder<ArchiveOutput>,
     path: &Path,
     metadata: &fs::Metadata,
 ) -> Result<(), EnvArchiveWriteError> {
@@ -1189,7 +1229,7 @@ fn open_archive_windows_entry(path: &Path, directory: bool) -> Result<File, EnvA
 }
 
 fn append_bounded_file(
-    builder: &mut Builder<File>,
+    builder: &mut Builder<ArchiveOutput>,
     archive_path: &Path,
     file: &mut File,
     metadata: &fs::Metadata,
@@ -1240,18 +1280,92 @@ fn owned_archive_link_target(
     // still follows them. Fall back to the resolved target otherwise.
     let named = named_owned_link_target(parent, &root, captured_target, options)
         .unwrap_or_else(|| target.to_path_buf());
-    let common = shared_ancestors(parent, &named);
+    Ok(Some((
+        relative_link_target(parent, &named),
+        target.to_path_buf(),
+    )))
+}
+
+// Returns where an absolute link target lies inside `root`, a resolved
+// directory, as a path relative to it, or `None` when it lies outside. A
+// target spelled through the root (or an alias of it) keeps that spelling, so
+// links along it keep their meaning in a copy; other spellings are resolved,
+// allowing a missing tail. Clone, migration and ordinary archives share this.
+pub(crate) fn root_relative_link_target(root: &Path, target: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    for ancestor in target.ancestors().collect::<Vec<_>>().into_iter().rev() {
+        if !fs::canonicalize(ancestor).is_ok_and(|resolved| resolved == root) {
+            continue;
+        }
+        let remainder = target.strip_prefix(ancestor).ok()?;
+        if remainder
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+        {
+            return Some(remainder.to_path_buf());
+        }
+        // Parent components follow links; only full resolution is exact. A
+        // target that cannot resolve, such as `missing/..`, dangles in the
+        // source, and keeping its spelling under the copy dangles the same.
+        return match resolve_allowing_missing(target) {
+            Some(resolved) => resolved.strip_prefix(root).ok().map(Path::to_path_buf),
+            None => Some(remainder.to_path_buf()),
+        };
+    }
+    resolve_allowing_missing(target)?
+        .strip_prefix(root)
+        .ok()
+        .map(Path::to_path_buf)
+}
+
+fn resolve_allowing_missing(target: &Path) -> Option<PathBuf> {
+    let mut existing = target;
+    let mut missing = Vec::new();
+    loop {
+        if let Ok(mut resolved) = fs::canonicalize(existing) {
+            resolved.extend(missing.iter().rev());
+            return Some(resolved);
+        }
+        missing.push(existing.file_name()?);
+        existing = existing.parent()?;
+    }
+}
+
+// The relative target that names `target` from a link in `link_parent`, both
+// relative to the same root.
+pub(crate) fn relative_link_target(link_parent: &Path, target: &Path) -> PathBuf {
+    let common = shared_ancestors(link_parent, target);
     let mut relative = PathBuf::new();
-    for _ in parent.components().skip(common) {
+    for _ in link_parent.components().skip(common) {
         relative.push("..");
     }
-    for part in named.components().skip(common) {
+    for part in target.components().skip(common) {
         relative.push(part);
     }
     if relative.as_os_str().is_empty() {
         relative.push(".");
     }
-    Ok(Some((relative, target.to_path_buf())))
+    relative
+}
+
+// Ordinary archives rewrite only absolute targets inside the root, using the
+// same mapping as clone; relative targets keep their authored form.
+fn absolute_archive_link_target(
+    path: &Path,
+    source_root: &Path,
+    captured_target: &Path,
+) -> Option<(PathBuf, PathBuf)> {
+    if !captured_target.is_absolute() {
+        return None;
+    }
+    let inside = root_relative_link_target(source_root, captured_target)?;
+    let parent = path.parent()?.strip_prefix(source_root).ok()?;
+    // The physical target decides whether the archived link names a directory.
+    let physical = fs::canonicalize(source_root.join(&inside))
+        .ok()
+        .and_then(|target| target.strip_prefix(source_root).ok().map(Path::to_path_buf))
+        .unwrap_or_else(|| inside.clone());
+    Some((relative_link_target(parent, &inside), physical))
 }
 
 // Returns the root-relative path a link target names, without resolving the
@@ -1681,7 +1795,7 @@ mod tests {
 
     use super::{
         ArchivedEnvMeta, EnvArchiveEntryKind, EnvArchiveMetadata, EnvArchiveOptions,
-        EnvArchiveWriteError, extract_env_archive, write_env_archive,
+        EnvArchiveWriteError, SymlinkRelocation, extract_env_archive, write_env_archive,
         write_env_archive_with_options,
     };
 
@@ -1985,7 +2099,7 @@ mod tests {
             EnvArchiveOptions {
                 sqlite_content_roots: BTreeSet::from([PathBuf::new()]),
                 should_exclude_path: replace_observed_directory,
-                relocate_internal_symlinks: true,
+                symlink_relocation: SymlinkRelocation::Owned,
                 private_output: true,
                 ..EnvArchiveOptions::default()
             },
@@ -2056,7 +2170,7 @@ mod tests {
             EnvArchiveOptions {
                 sqlite_content_roots: BTreeSet::from([PathBuf::new()]),
                 should_exclude_path: exclude_skipped_link,
-                relocate_internal_symlinks: true,
+                symlink_relocation: SymlinkRelocation::Owned,
                 private_output: true,
                 ..EnvArchiveOptions::default()
             },
@@ -2097,7 +2211,7 @@ mod tests {
             &output,
             EnvArchiveOptions {
                 sqlite_content_roots: BTreeSet::from([PathBuf::new()]),
-                relocate_internal_symlinks: true,
+                symlink_relocation: SymlinkRelocation::Owned,
                 private_output: true,
                 ..EnvArchiveOptions::default()
             },
@@ -2156,7 +2270,7 @@ mod tests {
             EnvArchiveOptions {
                 sqlite_content_roots: BTreeSet::from([PathBuf::new()]),
                 should_exclude_path: replace_observed_link_parent,
-                relocate_internal_symlinks: true,
+                symlink_relocation: SymlinkRelocation::Owned,
                 private_output: true,
                 ..EnvArchiveOptions::default()
             },
@@ -2239,7 +2353,11 @@ mod tests {
                 },
                 snapshot_sqlite_files: true,
                 should_exclude_path: replace_preserved_file_parent,
-                relocate_internal_symlinks: include_state,
+                symlink_relocation: if include_state {
+                    SymlinkRelocation::Owned
+                } else {
+                    SymlinkRelocation::Keep
+                },
                 private_output: include_state,
                 ..EnvArchiveOptions::default()
             };
@@ -2432,7 +2550,8 @@ mod tests {
             .write_all(&vec![b'b'; 1024])
             .unwrap();
         let archive_path = root.path().join("archive.tar");
-        let mut builder = tar::Builder::new(File::create(&archive_path).unwrap());
+        let mut builder =
+            tar::Builder::new(super::ArchiveOutput(File::create(&archive_path).unwrap()));
         assert!(
             super::append_bounded_file(&mut builder, Path::new("log"), &mut file, &metadata)
                 .is_ok()
@@ -2463,7 +2582,9 @@ mod tests {
         let mut file = File::open(&source).unwrap();
         let metadata = file.metadata().unwrap();
         fs::write(&source, b"short").unwrap();
-        let mut builder = tar::Builder::new(File::create(root.path().join("short.tar")).unwrap());
+        let mut builder = tar::Builder::new(super::ArchiveOutput(
+            File::create(root.path().join("short.tar")).unwrap(),
+        ));
         assert!(matches!(
             super::append_bounded_file(&mut builder, Path::new("log"), &mut file, &metadata),
             Err(super::EnvArchiveWriteError::EntryDisappeared(_))

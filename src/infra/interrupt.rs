@@ -1,5 +1,6 @@
 //! Keep application signal ownership while bounded private commands settle.
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::io;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 
 type Handler = Arc<dyn Fn() -> bool + Send + Sync>;
@@ -347,6 +348,78 @@ impl Drop for CaptureInterrupt {
             std::process::exit(130);
         }
     }
+}
+
+static CANCELLATION_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Register the application signal owner for a command that stops its own work
+/// when SIGINT, SIGTERM or SIGHUP arrives, so the cleanup its error path
+/// already performs still runs. The signal only requests cancellation; the
+/// command's long-running steps observe it through [`cancellation_requested`]
+/// and return an error. A signal that was ignored when OCM started, as under
+/// `nohup` or for a background job, stays ignored.
+pub(crate) fn request_cancellation_on_signal() -> Result<(), String> {
+    let install = || {
+        set_handler(|| {
+            CANCELLATION_REQUESTED.store(true, Ordering::SeqCst);
+            true
+        })
+    };
+    #[cfg(not(unix))]
+    return install();
+    #[cfg(unix)]
+    {
+        let ignored = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP]
+            .into_iter()
+            .map(|signal| signal_action(signal).map(|action| (signal, action)))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|(_, action)| action.sa_sigaction == libc::SIG_IGN)
+            .collect::<Vec<_>>();
+        // Block the ignored signals until their disposition is restored, so
+        // one arriving meanwhile stays pending and is then discarded instead
+        // of reaching the new handler. Threads started meanwhile inherit the
+        // block, which is moot for signals that stay ignored.
+        let mut blocked = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+        let mut previous = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+        // SAFETY: sigemptyset initializes the set before it is read, and
+        // pthread_sigmask writes the previous mask before it is restored.
+        unsafe {
+            libc::sigemptyset(blocked.as_mut_ptr());
+            for (signal, _) in &ignored {
+                libc::sigaddset(blocked.as_mut_ptr(), *signal);
+            }
+            libc::pthread_sigmask(libc::SIG_BLOCK, blocked.as_ptr(), previous.as_mut_ptr());
+        }
+        let result = install().and_then(|()| {
+            ignored
+                .iter()
+                .try_for_each(|(signal, action)| set_signal_action(*signal, action))
+        });
+        // SAFETY: previous was written by the pthread_sigmask call above.
+        unsafe {
+            libc::pthread_sigmask(libc::SIG_SETMASK, previous.as_ptr(), std::ptr::null_mut());
+        }
+        result
+    }
+}
+
+/// Whether a signal has asked the command to stop. Cheap enough to check on
+/// every buffered write of a long copy.
+pub(crate) fn cancellation_requested() -> bool {
+    CANCELLATION_REQUESTED.load(Ordering::SeqCst)
+}
+
+/// [`cancellation_requested`], counting a signal that already reached OCM but
+/// is still being dispatched, for the decision after the work returned.
+pub(crate) fn cancellation_settled() -> bool {
+    settle();
+    cancellation_requested()
+}
+
+/// The error a long-running step returns once cancellation is requested.
+pub(crate) fn cancelled_error() -> io::Error {
+    io::Error::other("interrupted by a signal")
 }
 
 #[cfg(all(test, unix))]

@@ -697,13 +697,27 @@ impl Cli {
         };
         Self::assert_no_extra_args(&args[1..])?;
 
+        // A signal stops the export through its error path, which removes the
+        // staging file and SQLite snapshot copies it created.
+        crate::infra::interrupt::request_cancellation_on_signal()
+            .map_err(|error| format!("failed to install export signal handler: {error}"))?;
         let summary = self.with_progress(format!("Exporting env {name}"), || {
             self.environment_service().export(ExportEnvironmentOptions {
                 include_state,
                 name: name.clone(),
                 output,
             })
-        })?;
+        });
+        // An archive published before the signal took effect stays published.
+        if let Err(error) = &summary
+            && crate::infra::interrupt::cancellation_settled()
+        {
+            // The error itself may be a failure that came before the signal.
+            self.stderr_line(format!("ocm: {error}"));
+            self.stderr_line(format!("ocm: env export {name} interrupted by a signal"));
+            return Ok(130);
+        }
+        let summary = summary?;
 
         if json_flag {
             self.print_json(&summary)?;
@@ -1759,16 +1773,29 @@ impl Cli {
         &self,
         args: Vec<String>,
     ) -> Result<i32, String> {
+        const USAGE: &str = "usage: ocm env set-independent-paths <env> <relative-path>... | none";
         let (args, json, _) = self.consume_human_output_flags(args, "env set-independent-paths")?;
+        // Every leftover token becomes a stored path, so an option such as a
+        // trailing --help must be refused rather than declared. A directory
+        // whose name begins with - is written as ./<name>.
+        if let Some(option) = args.iter().find(|arg| arg.starts_with('-')) {
+            return Err(format!(
+                "env set-independent-paths does not accept option {option}; write a path that begins with - as ./<path>"
+            ));
+        }
         if args.len() < 2 {
-            return Err(
-                "usage: ocm env set-independent-paths <env> <relative-path>... | none".to_string(),
-            );
+            return Err(USAGE.to_string());
         }
         let paths = if args.len() == 2 && args[1] == "none" {
             Vec::new()
         } else {
-            args[1..].iter().map(std::path::PathBuf::from).collect()
+            args[1..]
+                .iter()
+                .map(|arg| {
+                    let path = std::path::Path::new(arg);
+                    path.strip_prefix(".").unwrap_or(path).to_path_buf()
+                })
+                .collect()
         };
         let meta = self
             .environment_service()

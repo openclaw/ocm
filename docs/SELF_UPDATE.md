@@ -48,6 +48,11 @@ the executable. For an executable named `ocm`, that directory is
 When OCM runs through a symlink to its executable, the update, `--check`,
 `--status`, and `--recover` act on the file the symlink resolves to, and the
 journal lives beside that file. The symlink is left unchanged.
+Another spelling of the install directory, such as a symlinked directory, a
+second `PATH` entry, or a case variant, reaches the same journal and receipt.
+Moving or renaming the install directory leaves the receipt naming a path that
+no longer reaches it, so OCM refuses it as misplaced until that path reaches the
+directory again, for example after moving the directory back.
 
 If activation or health checks fail, the helper restores the previous CLI and
 refreshes the daemon back to that version. `rolledBack` means recovery succeeded,

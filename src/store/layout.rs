@@ -23,6 +23,27 @@ pub struct StorePaths {
     pub supervisor_dir: PathBuf,
 }
 
+/// Entries OCM keeps directly in `OCM_HOME`. A new environment root may not
+/// overlap one of them, except as a root inside `envs`, because removing an
+/// environment deletes its root. Add each new top-level store entry here.
+pub(crate) const OCM_HOME_ENTRIES: &[&str] = &[
+    "dev-ui-ports.json",
+    "envs",
+    "envs.json",
+    "envs.lock",
+    "import-staging",
+    "launchers",
+    "locks",
+    "runtimes",
+    "snapshots",
+    "source-watch",
+    "supervisor",
+    "tmp",
+    "toolchains",
+    "upgrade-batches",
+    "upgrade-history",
+];
+
 pub fn display_path(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
@@ -556,6 +577,25 @@ mod tests {
             .unwrap()
             .map(|entry| entry.unwrap().file_name().into_string().unwrap())
             .collect()
+    }
+
+    #[test]
+    fn every_store_directory_is_an_ocm_home_entry() {
+        let mut env = BTreeMap::new();
+        env.insert("OCM_HOME".to_string(), "/ocm-home".to_string());
+        let stores = resolve_store_paths(&env, Path::new("/")).unwrap();
+        for dir in [
+            &stores.envs_dir,
+            &stores.launchers_dir,
+            &stores.runtimes_dir,
+            &stores.snapshots_dir,
+            &stores.upgrade_history_dir,
+            &stores.supervisor_dir,
+            &env_registry_path(&env, Path::new("/")).unwrap(),
+        ] {
+            let name = dir.strip_prefix(&stores.home).unwrap().to_str().unwrap();
+            assert!(OCM_HOME_ENTRIES.contains(&name), "{name}");
+        }
     }
 
     #[test]

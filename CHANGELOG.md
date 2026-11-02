@@ -6,9 +6,11 @@ All notable changes to OCM are documented here.
 
 ### Fixed
 
+- Refuse new environment roots that are `OCM_HOME`, contain it, or overlap one of OCM's store directories there, such as `runtimes`, `launchers` or `snapshots`, so removing that environment can no longer delete other environments' runtimes, launchers or snapshots. Roots inside `envs` and disjoint roots elsewhere under `OCM_HOME` remain valid.
 - Run advertised native isolated-core-startup preflight from prepared upgrade candidates before stopping the source gateway, and leave it running when readiness is blocked or unverified. Preserve cold finalization for packages without the capability.
 - Skip incompatible OS- or architecture-specific plugins when including source extensions in a local runtime build. Refuse explicitly required incompatible plugins without changing the target environment's config, and pack compatible source plugins through native npm paths on Windows.
 - Find the installed npm launcher by default when building and installing runtimes on Windows.
+- Remove the hidden staging file and SQLite snapshot copies when `ocm env export` is stopped by SIGINT, SIGTERM or SIGHUP, and exit with status 130. Signals ignored at startup, as under `nohup`, stay ignored.
 
 ## 0.3.8 - 2026-10-29
 

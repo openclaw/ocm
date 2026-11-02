@@ -151,12 +151,36 @@ fn env_snapshot_refuses_storage_inside_custom_roots_and_preserves_disjoint_roots
             }
             _ => root.child("live"),
         };
+        // New roots may not overlap OCM's store. Register the overlapping
+        // layouts the way earlier OCM versions admitted them.
+        let physical = match layout {
+            "exact" => Some(storage.join("source")),
+            "ancestor" => Some(storage.clone()),
+            #[cfg(unix)]
+            "source-alias" => Some(storage.join("source")),
+            _ => None,
+        };
+        let admitted = if physical.is_some() {
+            root.child("admitted")
+        } else {
+            live.clone()
+        };
         let create = run_ocm(
             root.path(),
             &env,
-            &["env", "create", "source", "--root", &path_string(&live)],
+            &["env", "create", "source", "--root", &path_string(&admitted)],
         );
         assert!(create.status.success(), "{layout}: {}", stderr(&create));
+        if let Some(physical) = physical {
+            if physical.is_dir() {
+                fs::remove_dir(&physical).unwrap();
+            }
+            fs::create_dir_all(physical.parent().unwrap()).unwrap();
+            fs::rename(&admitted, &physical).unwrap();
+            let mut source = get_environment("source", &env, root.path()).unwrap();
+            source.root = path_string(&live);
+            save_environment(source, &env, root.path()).unwrap();
+        }
         #[cfg(unix)]
         if layout == "storage-alias" {
             fs::remove_dir(&storage).unwrap();
@@ -277,6 +301,156 @@ fn env_snapshot_create_captures_the_current_environment_state() {
     assert!(output.contains("for env source"));
     assert!(output.contains("label: before-upgrade"));
     assert!(root.child("ocm-home/snapshots/source").exists());
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn snapshot_commands_reclaim_preparation_left_by_an_interrupted_capture() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let root = TestDir::new("env-snapshot-interrupted-preparation");
+    let mut env = ocm_env(&root);
+    // Service quiescence runs after the capture has prepared its copy. This
+    // manager blocks there while armed, so the signal lands mid-capture.
+    env.insert("OCM_INTERNAL_SERVICE_MANAGER".into(), "systemd-user".into());
+    let manager = root.child("systemctl");
+    write_executable_script(
+        &manager,
+        &format!(
+            "#!/bin/sh\nif [ -f '{armed}' ]; then echo $$ > '{pid}.tmp'; mv '{pid}.tmp' '{pid}'; exec sleep 60; fi\necho unavailable >&2\nexit 1\n",
+            armed = path_string(&root.child("armed")),
+            pid = path_string(&root.child("manager.pid")),
+        ),
+    );
+    env.insert("OCM_INTERNAL_SYSTEMCTL_BIN".into(), path_string(&manager));
+    let create = run_ocm(root.path(), &env, &["env", "create", "source"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    write_text(
+        &root.child("ocm-home/envs/source/.openclaw/workspace/notes.txt"),
+        "captured state",
+    );
+    let snapshot_dir = root.child("ocm-home/snapshots/source");
+    let preparations = || -> Vec<PathBuf> {
+        fs::read_dir(&snapshot_dir)
+            .map(|entries| {
+                entries
+                    .map(|entry| entry.unwrap().path())
+                    .filter(|path| {
+                        path.file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .starts_with(".checkpoint-preparation-")
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let snapshot_ids = || -> Vec<String> {
+        let list = run_ocm(
+            root.path(),
+            &env,
+            &["env", "snapshot", "list", "source", "--json"],
+        );
+        assert!(list.status.success(), "{}", stderr(&list));
+        serde_json::from_slice::<Value>(&list.stdout)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|snapshot| snapshot["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let interrupt_capture = || {
+        let daemon_state = root.child("ocm-home/supervisor/state.json");
+        write_text(&daemon_state, "{}");
+        write_text(&root.child("armed"), "armed");
+        let mut capture = Command::new(support::ocm_test_binary_path())
+            .args(["env", "snapshot", "create", "source"])
+            .current_dir(root.path())
+            .env_clear()
+            .envs(&env)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while !root.child("manager.pid").exists() {
+            assert!(
+                capture.try_wait().unwrap().is_none(),
+                "capture exited before quiescence"
+            );
+            assert!(std::time::Instant::now() < deadline, "capture never paused");
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(preparations().len(), 1, "capture had not prepared its copy");
+        assert_eq!(
+            unsafe { libc::kill(capture.id() as libc::pid_t, libc::SIGTERM) },
+            0
+        );
+        assert_eq!(capture.wait().unwrap().signal(), Some(libc::SIGTERM));
+        let manager_pid: libc::pid_t = fs::read_to_string(root.child("manager.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        unsafe { libc::kill(manager_pid, libc::SIGKILL) };
+        for path in [root.child("manager.pid"), root.child("armed"), daemon_state] {
+            fs::remove_file(path).unwrap();
+        }
+        let leftover = preparations();
+        assert_eq!(leftover.len(), 1, "the signal skipped capture cleanup");
+    };
+
+    // Removal reclaims the leftover, so the last removal still removes the directory.
+    let kept = run_ocm(root.path(), &env, &["env", "snapshot", "create", "source"]);
+    assert!(kept.status.success(), "{}", stderr(&kept));
+    let kept_ids = snapshot_ids();
+    assert_eq!(kept_ids.len(), 1);
+    interrupt_capture();
+    assert_eq!(
+        snapshot_ids(),
+        kept_ids,
+        "completed snapshots are untouched"
+    );
+    let removed = run_ocm(
+        root.path(),
+        &env,
+        &["env", "snapshot", "remove", "source", &kept_ids[0]],
+    );
+    assert!(removed.status.success(), "{}", stderr(&removed));
+    assert!(!snapshot_dir.exists(), "{:?}", fs::read_dir(&snapshot_dir));
+
+    // The next capture reclaims the leftover before preparing its own copy.
+    let kept = run_ocm(root.path(), &env, &["env", "snapshot", "create", "source"]);
+    assert!(kept.status.success(), "{}", stderr(&kept));
+    let kept_ids = snapshot_ids();
+    interrupt_capture();
+    let created = run_ocm(root.path(), &env, &["env", "snapshot", "create", "source"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    assert!(preparations().is_empty(), "{:?}", preparations());
+    let ids = snapshot_ids();
+    assert_eq!(ids.len(), 2);
+    assert!(
+        ids.contains(&kept_ids[0]),
+        "completed snapshots are untouched"
+    );
+    assert_eq!(
+        fs::read_to_string(snapshot_dir.join(format!(
+            "{}.checkpoint/.openclaw/workspace/notes.txt",
+            kept_ids[0]
+        )))
+        .unwrap(),
+        "captured state"
+    );
+    for id in &ids {
+        let removed = run_ocm(
+            root.path(),
+            &env,
+            &["env", "snapshot", "remove", "source", id],
+        );
+        assert!(removed.status.success(), "{}", stderr(&removed));
+    }
+    assert!(!snapshot_dir.exists());
 }
 
 #[test]

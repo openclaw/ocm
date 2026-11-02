@@ -416,6 +416,7 @@ does not sandbox repository code.
 - `--scenario all` runs built-in current, clean minimum, and Telegram-configured env shapes as separate simulation clones
 - target runtime installation, checkpoint preflight, and runtime recovery preparation run while the current managed gateway remains available; preparation failure leaves it unchanged
 - prepared candidates declaring `package.json.openclaw.updatePreflightProtocol: 1` run native `update preflight --json --source-root <current-package-root> --timeout 300` before source shutdown, with source profile paths and no update or supervisor authority; OCM bounds capture to six minutes, allowing native cleanup after its five-minute timeout
+- a launcher-bound source's package root comes from `pnpm openclaw` in its checkout, `node <package>/openclaw.mjs`, or an installed `openclaw` executable path that links to `<package>/openclaw.mjs`, such as the global npm install `ocm migrate` records; preflight refuses other launchers as unverified and leaves the source unchanged
 - OCM requires exit zero and a version-matched protocol-1 `ready` receipt with `isolated-core-startup` coverage; blocked, unverified, malformed, and unsupported advertised protocols fail preparation while the source remains running
 - native preflight rehearses core startup on an isolated copy and defers plugin downloads and convergence; it does not establish live model/provider, channel, or complete plugin readiness
 - packages without a preflight capability retain cold finalization and rollback; in-place source-checkout updates retain their existing path because their future candidate is not prepared before shutdown
@@ -553,6 +554,7 @@ Recipes beginning with `source` or `builtin` (including `builtin source`) also r
 Both run as login shells, so tool setup in the profile that `sh -l` reads (`/etc/profile` and `~/.profile`), such as a `PATH` entry for a Node version manager, still applies to the launcher command. After the profile runs, OCM restores the environment's own values for every `OPENCLAW_*` variable and for `OCM_ACTIVE_ENV`/`OCM_ACTIVE_ENV_ROOT`, the same variables it controls for runtime-bound environments and `env exec`. A profile that exports OpenClaw paths or activates another environment therefore cannot redirect a launcher command; the diagnostics variables and `OPENCLAW_INCLUDE_ROOTS` that OCM forwards from your shell are left as the profile sets them.
 Sourcing support and argument forwarding depend on those shells. For example, macOS `/bin/sh` supports `source` and `builtin source` and forwards arguments into the sourced script, while other `sh` implementations may not. For portable argument forwarding, use an executable wrapper that invokes OpenClaw with `"$@"` and register the wrapper path directly.
 Plain executable recipes still run directly under the supervisor.
+OCM forwards OpenClaw arguments, including the service's `gateway run --port <port>`, by adding them shell-quoted to the end of the recipe. On Unix, when a recipe ends in `#` comments, on its last line or on lines of their own, the arguments go right after its last word, before the comments, and a trailing `\` is dropped, so a note such as `pnpm openclaw # my checkout` does not swallow them. Recipes that OCM cannot read reliably this way, such as those using command substitution (`$(...)` or backquotes), here-documents, `$'...'` quoting or line continuations, keep the plain append; for those, drop the trailing comment or put it on a line before the command.
 If a launcher's `--cwd` directory is later moved or deleted, `env run`, `env resolve` and `service install`, `start` and `restart` refuse the launcher with `launcher "<name>" working directory does not exist: <dir>` (or `working directory is not a directory: <path>` when the path is a file), `upgrade simulate` reports the same text in its failed update-plan check, and `env status` and `env doctor` report it as an issue. The service leaves a Gateway it already runs alone; if that Gateway exits, the service keeps retrying it and recovers once the directory is back. To use a new location, add a launcher for it and bind the environment with `ocm env set-launcher <env> <launcher>`.
 
 ### The simple rule
@@ -1134,11 +1136,15 @@ An empty, zero, or out-of-range value is rejected before creating an environment
 
 An explicit OCM `--port` takes precedence over `gateway.port` in the OpenClaw
 configuration. Otherwise, a valid configured port overrides the automatically
-assigned port. OCM reads the effective JSON/JSON5 configuration, including
-`$include` files within the config directory, for both inspection and command
-execution. Missing or invalid configuration falls back to the saved automatic
-port. An active foreground dev session continues to use its captured endpoint
-until stopped, even if the configuration changes.
+assigned port. OCM reads `gateway.port` from the JSON/JSON5 configuration,
+including `$include` files within the config directory, for both inspection and
+command execution. An inline `gateway.port` overrides included values, so other
+include branches, including shared includes outside the config directory, do
+not affect it. A port set only in an include outside the config directory is
+not read, even when `OPENCLAW_INCLUDE_ROOTS` admits that include. A port that
+is missing or cannot be read falls back to the saved automatic port. An active
+foreground dev session continues to use its captured endpoint until stopped,
+even if the configuration changes.
 
 New environment roots must be separate. A root cannot equal, contain, or sit
 inside another registered environment root, including through path aliases.
@@ -1147,6 +1153,14 @@ the new environment, regardless of protection flags. Default sibling roots and
 disjoint custom roots remain valid. This applies to `env create`, `env clone`,
 `env import`, and new environments created by `start`, `setup`, `dev`, `migrate`,
 `adopt import`, or upgrade simulation.
+
+A new root also cannot be `OCM_HOME`, contain it, or overlap one of the store
+entries OCM keeps there, such as `runtimes`, `launchers`, `snapshots`,
+`supervisor`, `upgrade-history` or `locks`, including through path aliases.
+Removing an environment deletes its root, so such a root would take other
+environments' runtimes, launchers or snapshots with it. Custom roots inside
+`envs`, such as `$OCM_HOME/envs/custom`, and disjoint roots elsewhere under
+`OCM_HOME` remain valid.
 
 A registered root remains reserved while its directory is missing. Disjoint
 Unicode roots remain valid; case and normalization aliases of a missing root
@@ -1228,6 +1242,7 @@ Automatic Gateway port selection searches upward from the preferred port through
 
 Clone copies the workspace and env config into a new environment, gives the clone its own gateway port, rewrites env-scoped OpenClaw config paths under the new env root, keeps durable agent auth/settings for the same user, clears copied runtime residue like sessions, logs, and backups, and keeps the background service separate. Configured agent directories inside the environment retain their payloads through clone and ordinary export/import, including custom and nested locations.
 Clone, migration and adoption copy regular files, directories and symlinks. Unix sockets, FIFOs and device files in the copied home or workspaces hold no data and are left out, as in environment export; the source keeps them, and their owning processes recreate them when needed.
+Clone recreates an absolute link into the source environment as a relative link to the same location in the clone, so the clone does not keep reading or writing the source; a link to state the clone clears, such as logs, points at the clone's location. Relative links, links outside the environment and links inside saved skill-library and Skill Workshop revisions keep their targets.
 Clone retains shared managed skills under `.openclaw/skills` and their global ClawHub tracking metadata under `.openclaw/.clawhub`.
 Clone and upgrade simulation preserve supported internal OpenClaw `$include` graphs, including nested absolute directives and shared include arrays. Absolute directives select the copied files; relative directives and source files stay unchanged. Includes must remain inside the configuration directory. Ordinary clone retains its restrictions on include-owned agent workspaces and sandbox origins, while simulation retains its identity overlay.
 Agent directories remain separate from workspaces; external locations and paths reached through symlinks are rejected by these copy operations.
@@ -1254,12 +1269,13 @@ the source home, including symlink escapes, remain rejected.
 The existing restrictions on include-owned agent workspaces and sandbox origins
 still apply.
 
-Migration and adoption give the new environment its own Gateway port. A
-`gateway.port` set in the copied `openclaw.json` or in one of its copied
+Migration, adoption, clone and import give the new environment its own Gateway
+port. A `gateway.port` set in the copied `openclaw.json` or in one of its copied
 `$include` files moves to the port OCM assigned, together with an MCP app
-sandbox port that follows it. When a copied include that sets the port is also
-included elsewhere in the config, the command fails and names the include
-instead of creating an environment that shares a Gateway port.
+sandbox port and loopback sandbox origin that follow it. When a copied include
+that sets the port is also included elsewhere in the config, directly or through
+a symlink, the command fails and names the include instead of creating an
+environment that shares a Gateway port.
 
 Migration and adoption also relocate installed-plugin records authored under either
 the supplied home spelling or its canonical path. This includes internal local
@@ -1437,8 +1453,12 @@ ocm env show mira --json
 ocm env set-independent-paths mira none
 ```
 
-The command replaces the list. Paths are relative to the environment root and
-must name directories in one of these locations:
+The command replaces the list. Apart from the output options `--json`, `--raw`
+and `--color`, it refuses any argument that begins with `-`, such as a trailing
+`--help` or an unknown option, and leaves the list unchanged. A leading `./` is
+accepted and dropped, so write a directory whose name begins with `-` as
+`./<name>`. Paths are relative to the environment root and must name directories
+in one of these locations:
 
 - strictly beneath a configured workspace;
 - the managed-worktree content directory `.openclaw/worktrees`, or beneath it;
@@ -1566,13 +1586,14 @@ its former backing directory is left untouched. Older tree checkpoints whose
 artifact is itself a symlink are refused on restore: they did not retain
 historical contents. Create a new snapshot to protect the current contents.
 
-Checkpoint storage must be outside the environment root being captured. If a
-custom root contains `$OCM_HOME/snapshots/<env>`, including through a path alias,
-snapshot and upgrade checkpoint preparation refuse with `checkpoint storage
-overlaps environment root` before copying or stopping a running gateway. This
-preserves live data and existing snapshots without recursively copying the
-preparation directory. Disjoint custom roots, including roots elsewhere under
-`OCM_HOME`, remain supported.
+Checkpoint storage must be outside the environment root being captured. New
+roots cannot overlap the snapshot store. If an existing custom root contains
+`$OCM_HOME/snapshots/<env>`, including through a path alias, snapshot and upgrade
+checkpoint preparation refuse with `checkpoint storage overlaps environment root`
+before copying or stopping a running gateway. This preserves live data and
+existing snapshots without recursively copying the preparation directory.
+Disjoint custom roots, including roots elsewhere under `OCM_HOME`, remain
+supported.
 
 Unix sockets are transient process endpoints and are omitted from checkpoints,
 including inactive socket files left by stopped processes. Snapshot creation
@@ -1588,6 +1609,16 @@ filesystems require a full metadata-preserving copy. Plan space for checkpoint
 divergence and a temporary restore candidate. These same-disk, secret-bearing
 checkpoints are operational rollback—not off-disk disaster recovery. Legacy tar
 snapshots remain readable.
+
+Snapshot and upgrade checkpoint capture prepare their copy in a hidden
+`.checkpoint-preparation-*` directory under `$OCM_HOME/snapshots/<env>`. A
+failed capture removes it. If OCM is interrupted or killed during capture, the
+next snapshot creation, upgrade checkpoint or snapshot removal for that
+environment removes the leftover directory, so removing the last snapshot also
+removes the environment's snapshot directory. A capture still running in
+another OCM process keeps its directory. Leftovers from OCM versions that did
+not lock their preparation directory are kept; remove them manually when no
+snapshot or upgrade command is running.
 
 Create:
 
@@ -1684,7 +1715,12 @@ directory alias: its own output is excluded from the archived contents. An
 existing output path is refused, including a dangling symlink or a file created
 by another writer while export is preparing the archive. Both export modes
 publish without replacing that entry and clean up only their own staging file
-if writing or publication fails.
+if writing or publication fails. SIGINT (Ctrl-C), SIGTERM or SIGHUP stops an
+export the same way: it removes its staging file and its private SQLite
+snapshot copies in `TMPDIR` and exits with status 130. An archive that was
+already published when the signal arrived stays in place, and the export
+reports success. A signal that OCM was started with ignored, as under `nohup`
+or for a background job, is still ignored.
 
 Export omits `.openclaw/state` by default. Default export keeps shared managed
 skills under `.openclaw/skills` and their global ClawHub tracking metadata under
@@ -1726,7 +1762,12 @@ Other root spellings retain the default export refusal, even when another alias 
 External workspaces, the environment root itself and workspace paths redirected by internal symlinks remain refused.
 
 Within the selected content, ordinary export preserves symlinks, including links
-named `*.sqlite`, without copying their targets. Regular `*.sqlite` files still
+named `*.sqlite`, without copying their targets. An absolute link into the
+environment, including a dangling one, is archived with a relative target to the
+same location, as clone recreates it, so an import does not keep reading or
+writing the source environment; a link to content the archive omits, such as
+logs, points at that location in the imported copy. Relative links keep their
+authored targets. Regular `*.sqlite` files still
 use coherent committed snapshots, including uncheckpointed WAL writes, and omit
 raw database sidecars. If a source parent is replaced during acquisition, export
 retries from its captured root or fails without publishing a partial archive; it

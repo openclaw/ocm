@@ -464,3 +464,150 @@ fn new_roots_cannot_contain_links_to_an_existing_environment() {
         assert!(!parent.join(".openclaw").exists());
     }
 }
+
+#[test]
+fn create_clone_and_import_reject_ocm_store_roots_before_writing_state() {
+    let fixture = TestDir::new("environment-store-root-isolation");
+    let env = ocm_env(&fixture);
+    template(&fixture, &env);
+    let home = fixture.child("ocm-home");
+    let stores = [
+        "envs",
+        "import-staging",
+        "launchers",
+        "locks",
+        "runtimes",
+        "snapshots",
+        "source-watch",
+        "supervisor",
+        "tmp",
+        "toolchains",
+        "upgrade-batches",
+        "upgrade-history",
+    ];
+    let outside = fixture.child("outside");
+    fs::create_dir(&outside).unwrap();
+
+    let mut destinations = vec![
+        home.clone(),
+        fixture.path().to_path_buf(),
+        home.join("envs.json"),
+        home.join("envs.lock"),
+        home.join("dev-ui-ports.json"),
+        home.join("runtimes/new"),
+        home.join("snapshots/template"),
+        home.join("unused/../launchers"),
+    ];
+    destinations.extend(stores.iter().map(|store| home.join(store)));
+    #[cfg(unix)]
+    {
+        let links = fixture.child("links");
+        fs::create_dir(&links).unwrap();
+        let alias = links.join("snapshots");
+        std::os::unix::fs::symlink(home.join("snapshots"), &alias).unwrap();
+        destinations.push(alias.clone());
+        destinations.push(alias.join("new"));
+        let escape = home.join("runtimes/escape");
+        std::os::unix::fs::symlink(&outside, &escape).unwrap();
+        destinations.push(escape);
+    }
+
+    let registry = env_registry_path(&env, fixture.path()).unwrap();
+    let before = fs::read(&registry).unwrap();
+    for destination in destinations {
+        for action in ["create", "clone", "import"] {
+            let rejected = admit(&fixture, &env, action, "blocked", &destination);
+            assert!(!rejected.status.success(), "{action}: {destination:?}");
+            let error = stderr(&rejected);
+            assert!(
+                error.contains("overlaps OCM store") || error.contains("overlaps the OCM home"),
+                "{action}: {destination:?}: {error}"
+            );
+            assert_eq!(fs::read(&registry).unwrap(), before);
+            for store in stores {
+                assert!(!home.join(store).join(".openclaw").exists(), "{store}");
+            }
+            assert!(!home.join("runtimes/new").exists());
+            assert!(!home.join("unused").exists());
+            assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+        }
+    }
+
+    // Disjoint custom roots under OCM_HOME and custom roots inside envs stay valid.
+    for action in ["create", "clone", "import"] {
+        for (index, destination) in [
+            home.join(format!("custom/{action}")),
+            home.join(format!("envs/custom-{action}")),
+            fixture.child(format!("elsewhere/{action}")),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let name = format!("{action}-valid-{index}");
+            let accepted = admit(&fixture, &env, action, &name, &destination);
+            assert!(accepted.status.success(), "{}", stderr(&accepted));
+            assert!(destination.join(".openclaw/workspace").is_dir());
+        }
+    }
+}
+
+#[test]
+fn existing_case_variants_of_store_names_follow_filesystem_identity() {
+    let fixture = TestDir::new("environment-store-root-case");
+    let env = ocm_env(&fixture);
+    template(&fixture, &env);
+    let home = fixture.child("ocm-home");
+    fs::create_dir_all(home.join("runtimes")).unwrap();
+    let variant = home.join("RUNTIMES");
+    // A distinct directory is not the store; an alias of it is.
+    let distinct = fs::create_dir(&variant).is_ok();
+    for action in ["create", "clone", "import"] {
+        let name = format!("variant-{action}");
+        let destination = variant.join(&name);
+        let result = admit(&fixture, &env, action, &name, &destination);
+        if distinct {
+            assert!(result.status.success(), "{}", stderr(&result));
+        } else {
+            assert!(!result.status.success());
+            assert!(
+                stderr(&result).contains("overlaps OCM store"),
+                "{}",
+                stderr(&result)
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn dangling_store_links_reserve_their_target_without_refusing_disjoint_roots() {
+    let fixture = TestDir::new("environment-store-root-dangling");
+    let env = ocm_env(&fixture);
+    template(&fixture, &env);
+    let home = fixture.child("ocm-home");
+    let external = fixture.child("external");
+    fs::create_dir(&external).unwrap();
+    let storage = external.join("missing-toolchains");
+    let _ = fs::remove_dir_all(home.join("toolchains"));
+    std::os::unix::fs::symlink(&storage, home.join("toolchains")).unwrap();
+
+    // Possible aliases of the missing storage are reserved too.
+    for destination in [
+        storage.clone(),
+        storage.join("nested"),
+        external.join("MISSING-TOOLCHAINS"),
+        external.clone(),
+    ] {
+        let rejected = admit(&fixture, &env, "create", "blocked", &destination);
+        assert!(!rejected.status.success(), "{destination:?}");
+        assert!(
+            stderr(&rejected).contains("overlaps OCM store"),
+            "{}",
+            stderr(&rejected)
+        );
+        assert!(!storage.exists());
+    }
+    let disjoint = external.join("custom");
+    let accepted = admit(&fixture, &env, "create", "disjoint", &disjoint);
+    assert!(accepted.status.success(), "{}", stderr(&accepted));
+}
