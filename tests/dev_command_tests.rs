@@ -6672,10 +6672,11 @@ fn dev_destroy_stops_the_recorded_watch_before_removing_state() {
         let refused = run_ocm(&cwd, &env, &["env", "remove", "demo", "--force"]);
         assert!(!refused.status.success());
         assert!(
-            stderr(&refused).contains("unfinished ownership"),
+            stderr(&refused).contains("run `ocm dev stop demo` before removing its state"),
             "{}",
             stderr(&refused)
         );
+        assert!(!stderr(&refused).contains("--acknowledge-stopped-processes"));
         // Prune's preview and apply agree that the watched env is blocked.
         for args in [
             vec!["env", "prune", "--older-than", "1", "--json"],
@@ -9264,6 +9265,17 @@ fn dev_watch_force_stops_the_entire_stubborn_process_tree() {
         !run_ocm(&cwd, &env, &["env", "destroy", "demo", "--yes"])
             .status
             .success()
+    );
+    // Repeating a plain stop cannot clear unverified cleanup, so the refusal
+    // must name the acknowledgement that can.
+    let removed = run_ocm(&cwd, &env, &["env", "remove", "demo", "--force"]);
+    assert!(!removed.status.success());
+    assert!(
+        stderr(&removed).contains(
+            "run `ocm dev stop demo --acknowledge-stopped-processes` before removing its state"
+        ),
+        "{}",
+        stderr(&removed)
     );
 }
 

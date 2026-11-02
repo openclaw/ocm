@@ -18,6 +18,7 @@ All notable changes to OCM are documented here.
 - Keep the Gateway running when `ocm service restart` is run again within seconds of a previous restart. The daemon no longer counts a restart handoff that `ocm service restart` requested toward its clean-exit restart loop guard, which left the Gateway stopped while the command waited 30 seconds and exited 0. A Gateway that keeps exiting with a handoff on its own is still stopped.
 - Keep `~/...` config paths outside `~/.openclaw`, such as local plugin, extra skills, agent directory and session or cron store paths, pointing at the same location after `migrate` and `adopt import`, instead of letting them resolve under the new environment root. Other config text is left unchanged.
 - Name the environments whose Gateway port families hold a retained dev UI port when `ocm dev` refuses it, and offer `--no-ui`, instead of asking the user to release a port that no command can release. A port bound by a process keeps the existing "occupied or reserved" wording.
+- Name `ocm dev stop <env> --acknowledge-stopped-processes`, not the plain `ocm dev stop <env>` that cannot succeed there, when `env remove` or `env prune` refuses an environment whose dev source process died from a signal and left unverified cleanup. Live dev sessions keep the plain hint.
 
 ## 0.3.8 - 2026-10-29
 
