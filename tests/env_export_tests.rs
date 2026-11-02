@@ -692,6 +692,17 @@ fn env_import_relocates_absolute_links_into_the_source_environment_in_both_modes
     symlink(state.join("logs"), workspace.join("logs-link")).unwrap();
     symlink("shared", workspace.join("rel-dir")).unwrap();
     symlink(&external, workspace.join("ext-dir")).unwrap();
+    symlink(workspace.join("future.txt"), workspace.join("dangling")).unwrap();
+    symlink(
+        workspace.join("ext-dir/data.txt"),
+        workspace.join("via-ext"),
+    )
+    .unwrap();
+    // A relative path through another link keeps following that link.
+    fs::create_dir_all(workspace.join("versions/v1")).unwrap();
+    fs::create_dir_all(workspace.join("versions/v2")).unwrap();
+    symlink("versions/v1", workspace.join("current")).unwrap();
+    symlink("current/../v2", workspace.join("selected")).unwrap();
 
     let mut imported = Vec::new();
     for include_state in [false, true] {
@@ -728,6 +739,20 @@ fn env_import_relocates_absolute_links_into_the_source_environment_in_both_modes
         assert_eq!(fs::read_link(copied.join("ext-dir")).unwrap(), external);
         if !include_state {
             assert!(!copied.join("logs-link/gateway.log").exists());
+            // State-inclusive archives keep dangling and external targets and
+            // name owned ones; ordinary archives map absolute targets as clone
+            // does and keep relative links as authored.
+            for (link, expected) in [
+                ("dangling", "future.txt"),
+                ("via-ext", "ext-dir/data.txt"),
+                ("selected", "current/../v2"),
+            ] {
+                assert_eq!(
+                    fs::read_link(copied.join(link)).unwrap(),
+                    std::path::Path::new(expected),
+                    "{name}: {link}"
+                );
+            }
         }
 
         for path in [copied.join("abs-dir/data.txt"), copied.join("abs-file")] {

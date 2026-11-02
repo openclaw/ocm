@@ -1727,10 +1727,12 @@ Other root spellings retain the default export refusal, even when another alias 
 External workspaces, the environment root itself and workspace paths redirected by internal symlinks remain refused.
 
 Within the selected content, ordinary export preserves symlinks, including links
-named `*.sqlite`, without copying their targets. As in state-inclusive export,
-an absolute link into the environment is archived with a relative target, so an
-import does not keep reading or writing the source environment; a link to content
-the archive omits, such as logs, points at that location in the imported copy. Regular `*.sqlite` files still
+named `*.sqlite`, without copying their targets. An absolute link into the
+environment, including a dangling one, is archived with a relative target to the
+same location, as clone recreates it, so an import does not keep reading or
+writing the source environment; a link to content the archive omits, such as
+logs, points at that location in the imported copy. Relative links keep their
+authored targets. Regular `*.sqlite` files still
 use coherent committed snapshots, including uncheckpointed WAL writes, and omit
 raw database sidecars. If a source parent is replaced during acquisition, export
 retries from its captured root or fails without publishing a partial archive; it

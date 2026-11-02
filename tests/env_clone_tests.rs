@@ -1047,6 +1047,20 @@ fn env_clone_relocates_absolute_links_into_the_source_environment() {
     symlink(state.join("logs"), workspace.join("logs-link")).unwrap();
     // A link outside the state directory is mapped from the environment root.
     symlink(workspace.join("shared"), source_root.join("root-link")).unwrap();
+    // Dangling targets are named in the clone, including ones that cannot
+    // resolve, rather than aliasing the source or failing the clone.
+    symlink(workspace.join("future.txt"), workspace.join("dangling")).unwrap();
+    // A path through an in-environment link keeps following the copy's link.
+    symlink(
+        workspace.join("ext-dir/data.txt"),
+        workspace.join("via-ext"),
+    )
+    .unwrap();
+    symlink(
+        workspace.join("missing/../shared/data.txt"),
+        workspace.join("dangling-parent"),
+    )
+    .unwrap();
     symlink("shared", workspace.join("rel-dir")).unwrap();
     symlink(&external, workspace.join("ext-dir")).unwrap();
 
@@ -1061,6 +1075,9 @@ fn env_clone_relocates_absolute_links_into_the_source_environment() {
         (copied.join("skills/team"), "../shared"),
         (copied.join("logs-link"), "../logs"),
         (target_root.join("root-link"), ".openclaw/workspace/shared"),
+        (copied.join("dangling"), "future.txt"),
+        (copied.join("via-ext"), "ext-dir/data.txt"),
+        (copied.join("dangling-parent"), "missing/../shared/data.txt"),
         (copied.join("rel-dir"), "shared"),
     ] {
         assert_eq!(
