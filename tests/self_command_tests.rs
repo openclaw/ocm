@@ -1034,3 +1034,12 @@ fn interrupted_self_update_download_removes_its_temporary_directory_on_sigterm()
         libc::SIGTERM,
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn interrupted_self_update_download_removes_its_temporary_directory_on_sighup() {
+    assert_interrupted_download_removes_its_temporary_directory(
+        "self-update-interrupt-sighup",
+        libc::SIGHUP,
+    );
+}

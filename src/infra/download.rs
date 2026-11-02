@@ -135,6 +135,14 @@ pub fn download_to_file(url: &str, destination: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Downloads into a destination the caller already opened, for a caller that
+/// must not create any path once the request is under way.
+pub fn download_to_writer(url: &str, destination: &mut dyn io::Write) -> Result<(), String> {
+    let mut reader = open_url_reader(url, None, false)?;
+    copy_capped(&mut reader, destination, MAX_DOWNLOAD_BYTES).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 fn copy_capped<R: io::Read + ?Sized, W: io::Write + ?Sized>(
     reader: &mut R,
     writer: &mut W,
