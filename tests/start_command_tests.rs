@@ -1118,6 +1118,43 @@ fn start_keeps_an_inline_gateway_port_beside_admitted_external_includes() {
 }
 
 #[test]
+fn start_keeps_a_gateway_port_from_a_hard_linked_internal_include() {
+    let root = TestDir::new("start-hard-linked-port-include");
+    let cwd = root.child("cwd");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    for args in [
+        vec!["launcher", "add", "stable", "--command", "openclaw"],
+        vec!["env", "create", "demo", "--launcher", "stable"],
+    ] {
+        let result = run_ocm(&cwd, &env, &args);
+        assert!(result.status.success(), "{}", stderr(&result));
+    }
+    let state = root.child("ocm-home/envs/demo/.openclaw");
+    fs::write(state.join("port.json5"), "{gateway:{port:28541}}\n").unwrap();
+    fs::hard_link(state.join("port.json5"), state.join("port-alias.json5")).unwrap();
+    let config_path = state.join("openclaw.json");
+    let config = serde_json::json!({
+        "$include": "./port.json5",
+        "gateway": {"mode": "local", "bind": "loopback"},
+        "agents": {"defaults": {"workspace": path_string(&state.join("workspace"))}}
+    });
+    fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+
+    let status = run_ocm(&cwd, &env, &["env", "status", "demo", "--json"]);
+    assert!(status.status.success(), "{}", stderr(&status));
+    let status: Value = serde_json::from_str(&stdout(&status)).unwrap();
+    assert_eq!(status["gatewayPort"], 28541);
+    assert_eq!(status["gatewayPortSource"], "config");
+    let started = run_ocm(&cwd, &env, &["start", "demo", "--no-service", "--json"]);
+    assert!(started.status.success(), "{}", stderr(&started));
+    let summary: Value = serde_json::from_str(&stdout(&started)).unwrap();
+    assert_eq!(summary["gatewayPort"], 28541);
+    let raw: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    assert_eq!(raw["gateway"]["port"], 28541);
+}
+
+#[test]
 fn start_uses_admitted_launcher_include_roots_and_refuses_unknown_required_settings() {
     let root = TestDir::new("start-admitted-includes");
     let cwd = root.child("cwd");
