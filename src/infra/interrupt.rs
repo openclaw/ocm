@@ -182,77 +182,49 @@ pub(crate) fn set_handler(
 }
 
 /// Register the owner like `set_handler`, keeping each of SIGINT, SIGTERM and
-/// SIGHUP that the process inherited as ignored, as `nohup` leaves SIGHUP. The
-/// owner then sees only the signals the caller allowed to stop OCM. Call it
-/// before OCM starts other threads: the signals stay pending on this thread
-/// while the owner is installed, and restoring an ignore discards a pending
-/// signal instead of handing it to the owner.
+/// SIGHUP that was ignored when OCM started, as under `nohup` or for a
+/// background job, ignored. Call it before OCM starts other threads, so an
+/// ignored signal arriving during installation cannot reach the owner.
 pub(crate) fn set_handler_keeping_ignored(
     handler: impl Fn() -> bool + Send + Sync + 'static,
 ) -> Result<(), String> {
+    #[cfg(not(unix))]
+    return set_handler(handler);
     #[cfg(unix)]
     {
-        let unblocked = block_dispatched_signals()?;
-        let installed = install_keeping_ignored(handler);
-        let restored = set_signal_mask(&unblocked);
-        installed.and(restored)
-    }
-    #[cfg(not(unix))]
-    set_handler(handler)
-}
-
-#[cfg(unix)]
-fn install_keeping_ignored(
-    handler: impl Fn() -> bool + Send + Sync + 'static,
-) -> Result<(), String> {
-    let mut ignored = Vec::new();
-    for (signal, _) in &FORWARD_HANDLERS {
-        let action = signal_action(*signal)?;
-        if action.sa_sigaction == libc::SIG_IGN {
-            ignored.push((*signal, action));
+        let ignored = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP]
+            .into_iter()
+            .map(|signal| signal_action(signal).map(|action| (signal, action)))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|(_, action)| action.sa_sigaction == libc::SIG_IGN)
+            .collect::<Vec<_>>();
+        // Block the ignored signals until their disposition is restored, so
+        // one arriving meanwhile stays pending and is then discarded instead
+        // of reaching the new handler. Threads started meanwhile inherit the
+        // block, which is moot for signals that stay ignored.
+        let mut blocked = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+        let mut previous = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+        // SAFETY: sigemptyset initializes the set before it is read, and
+        // pthread_sigmask writes the previous mask before it is restored.
+        unsafe {
+            libc::sigemptyset(blocked.as_mut_ptr());
+            for (signal, _) in &ignored {
+                libc::sigaddset(blocked.as_mut_ptr(), *signal);
+            }
+            libc::pthread_sigmask(libc::SIG_BLOCK, blocked.as_ptr(), previous.as_mut_ptr());
         }
-    }
-    set_handler(handler)?;
-    for (signal, action) in &ignored {
-        set_signal_action(*signal, action)?;
-    }
-    Ok(())
-}
-
-/// Blocks the dispatched signals on this thread and returns the previous mask.
-#[cfg(unix)]
-fn block_dispatched_signals() -> Result<libc::sigset_t, String> {
-    let mut blocked = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
-    let mut previous = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
-    // SAFETY: sigemptyset initializes the set before sigaddset and
-    // pthread_sigmask read it; pthread_sigmask initializes previous on success.
-    unsafe {
-        libc::sigemptyset(blocked.as_mut_ptr());
-        for (signal, _) in &FORWARD_HANDLERS {
-            libc::sigaddset(blocked.as_mut_ptr(), *signal);
+        let result = set_handler(handler).and_then(|()| {
+            ignored
+                .iter()
+                .try_for_each(|(signal, action)| set_signal_action(*signal, action))
+        });
+        // SAFETY: previous was written by the pthread_sigmask call above.
+        unsafe {
+            libc::pthread_sigmask(libc::SIG_SETMASK, previous.as_ptr(), std::ptr::null_mut());
         }
-        let error = libc::pthread_sigmask(libc::SIG_BLOCK, blocked.as_ptr(), previous.as_mut_ptr());
-        if error != 0 {
-            return Err(format!(
-                "failed blocking signals: {}",
-                std::io::Error::from_raw_os_error(error)
-            ));
-        }
-        Ok(previous.assume_init())
+        result
     }
-}
-
-#[cfg(unix)]
-fn set_signal_mask(mask: &libc::sigset_t) -> Result<(), String> {
-    // SAFETY: mask came from a successful pthread_sigmask query.
-    let error = unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, mask, std::ptr::null_mut()) };
-    if error != 0 {
-        return Err(format!(
-            "failed restoring the signal mask: {}",
-            std::io::Error::from_raw_os_error(error)
-        ));
-    }
-    Ok(())
 }
 
 fn dispatch() {
@@ -359,49 +331,10 @@ static CANCELLATION_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// and return an error. A signal that was ignored when OCM started, as under
 /// `nohup` or for a background job, stays ignored.
 pub(crate) fn request_cancellation_on_signal() -> Result<(), String> {
-    let install = || {
-        set_handler(|| {
-            CANCELLATION_REQUESTED.store(true, Ordering::SeqCst);
-            true
-        })
-    };
-    #[cfg(not(unix))]
-    return install();
-    #[cfg(unix)]
-    {
-        let ignored = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP]
-            .into_iter()
-            .map(|signal| signal_action(signal).map(|action| (signal, action)))
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .filter(|(_, action)| action.sa_sigaction == libc::SIG_IGN)
-            .collect::<Vec<_>>();
-        // Block the ignored signals until their disposition is restored, so
-        // one arriving meanwhile stays pending and is then discarded instead
-        // of reaching the new handler. Threads started meanwhile inherit the
-        // block, which is moot for signals that stay ignored.
-        let mut blocked = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
-        let mut previous = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
-        // SAFETY: sigemptyset initializes the set before it is read, and
-        // pthread_sigmask writes the previous mask before it is restored.
-        unsafe {
-            libc::sigemptyset(blocked.as_mut_ptr());
-            for (signal, _) in &ignored {
-                libc::sigaddset(blocked.as_mut_ptr(), *signal);
-            }
-            libc::pthread_sigmask(libc::SIG_BLOCK, blocked.as_ptr(), previous.as_mut_ptr());
-        }
-        let result = install().and_then(|()| {
-            ignored
-                .iter()
-                .try_for_each(|(signal, action)| set_signal_action(*signal, action))
-        });
-        // SAFETY: previous was written by the pthread_sigmask call above.
-        unsafe {
-            libc::pthread_sigmask(libc::SIG_SETMASK, previous.as_ptr(), std::ptr::null_mut());
-        }
-        result
-    }
+    set_handler_keeping_ignored(|| {
+        CANCELLATION_REQUESTED.store(true, Ordering::SeqCst);
+        true
+    })
 }
 
 /// Whether a signal has asked the command to stop. Cheap enough to check on
