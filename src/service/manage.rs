@@ -292,6 +292,40 @@ pub fn restart_service(
         }
     }
 
+    // Tell the daemon this handoff is requested, so the replacement does not
+    // count toward its clean-exit restart loop guard.
+    let supervisor = SupervisorService::new(env, cwd);
+    let handoff_request = before
+        .child_pid
+        .map(|pid| supervisor.request_handoff_restart(name, pid))
+        .transpose()?;
+    let restarted = restart_through_handoff(name, before.child_pid, env, cwd);
+    let Some(request_id) = handoff_request else {
+        return restarted.map(|(summary, _)| summary);
+    };
+    // The daemon takes the request when the Gateway exits. A restart scheduled
+    // from inside the Gateway returns before that exit, so leave it there.
+    if matches!(&restarted, Ok((_, false))) {
+        return restarted.map(|(summary, _)| summary);
+    }
+    let clear_result = supervisor.clear_handoff_restart_request(name, &request_id);
+    let (mut summary, _) = restarted?;
+    if let Err(error) = clear_result {
+        summary.warnings.push(format!(
+            "failed to clear the restart handoff request: {error}"
+        ));
+    }
+    Ok(summary)
+}
+
+/// Ask OpenClaw to hand off a restart of the running Gateway. The flag is
+/// whether this command waited for the Gateway's replacement.
+fn restart_through_handoff(
+    name: &str,
+    previous_pid: Option<u32>,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<(ServiceActionSummary, bool), String> {
     let mut helper = spawn_recovery_aware_restart(name, env, cwd)?;
 
     if restart_originates_inside_gateway(name, env) {
@@ -304,12 +338,12 @@ pub fn restart_service(
             warnings
                 .push("gateway is already transitioning to its replacement process".to_string());
         }
-        return Ok(service_action_summary("restart", summary, warnings));
+        return Ok((service_action_summary("restart", summary, warnings), false));
     }
 
     let status = wait_for_restart_action_summary_with_timeout(
         name,
-        before.child_pid,
+        previous_pid,
         Duration::from_secs(30),
         env,
         cwd,
@@ -322,7 +356,10 @@ pub fn restart_service(
                 .to_string(),
         );
     }
-    Ok(service_action_summary("restart", status.summary, warnings))
+    Ok((
+        service_action_summary("restart", status.summary, warnings),
+        true,
+    ))
 }
 
 fn restart_running_service_directly(

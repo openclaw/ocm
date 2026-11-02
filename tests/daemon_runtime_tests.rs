@@ -6903,6 +6903,82 @@ fn daemon_stops_repeated_quick_clean_exit_after_restart_handoff() {
 }
 
 #[test]
+fn back_to_back_service_restarts_keep_a_handoff_gateway_running() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("daemon-back-to-back-restarts");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    install_fake_service_manager(&root, &mut env);
+    let service = SupervisorService::new(&env, &cwd);
+    let runtime_path = root.child("ocm-home/supervisor/runtime.json");
+
+    // A protocol v1 Gateway that runs until `gateway restart` hands it off,
+    // then exits cleanly, as OpenClaw does for `ocm service restart`.
+    let intent = root.child("restart-intent.txt");
+    let current = root.child("gateway.pid");
+    let script = root.child("bin/openclaw.mjs");
+    write_executable_script(
+        &script,
+        &format!(
+            "#!/bin/sh\n{protocol}if [ \"${{1:-}}\" = gateway ] && [ \"${{2:-}}\" = restart ]; then\n  pid=$(cat '{current}')\n  printf '%s\\n' \"$pid\" > '{intent}'\n  kill -TERM \"$pid\"\n  exit 0\nfi\nprintf '%s\\n' \"$$\" > '{current}'\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1 & wait $!; done\n",
+            protocol = restart_handoff_protocol_shell_snippet(&intent),
+            current = path_string(&current),
+            intent = path_string(&intent),
+        ),
+    );
+
+    let launcher = run_ocm(
+        &cwd,
+        &env,
+        &["launcher", "add", "dev", "--command", &path_string(&script)],
+    );
+    assert!(launcher.status.success(), "{}", stderr(&launcher));
+    let created = run_ocm(&cwd, &env, &["env", "create", "demo", "--launcher", "dev"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    set_service_enabled(&cwd, &env, "demo", true);
+    service.sync().unwrap();
+    service.install_daemon().unwrap();
+
+    let mut daemon = spawn_daemon_process(&cwd, &env);
+    // Always settle the owned daemon, including on a failed assertion.
+    let result = std::panic::catch_unwind(|| {
+        let runtime =
+            wait_for_runtime_children(&runtime_path, 1, Some("demo"), Duration::from_secs(10))
+                .expect("daemon did not start the Gateway");
+        let mut previous_pid = runtime_child_pid(&runtime, "demo").unwrap();
+        assert_eq!(runtime["services"][0]["restartHandoff"], "protocol-v1");
+
+        // Each restart replaces a Gateway that is seconds old, which is quick
+        // by the clean-exit loop guard's measure.
+        for attempt in 1..=3 {
+            let restarted = run_ocm(&cwd, &env, &["service", "restart", "demo", "--json"]);
+            assert!(
+                restarted.status.success(),
+                "restart {attempt}: {}",
+                stderr(&restarted)
+            );
+            let body: Value = serde_json::from_slice(&restarted.stdout).unwrap();
+            assert_eq!(body["running"], true, "restart {attempt}: {body}");
+            assert_eq!(body["gatewayState"], "running", "restart {attempt}: {body}");
+            assert_eq!(
+                body["warnings"],
+                Value::Array(Vec::new()),
+                "restart {attempt}"
+            );
+            let pid = runtime_child_pid(&read_persisted_service_state(&runtime_path), "demo")
+                .expect("restart left no running Gateway");
+            assert_ne!(pid, previous_pid, "restart {attempt} kept the old Gateway");
+            previous_pid = pid;
+        }
+    });
+    stop_process(&mut daemon);
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
+}
+
+#[test]
 fn live_runtime_changes_recreate_missing_supervisor_state() {
     let _guard = daemon_runtime_test_lock();
     let root = TestDir::new("daemon-runtime-recovers-missing-state");
