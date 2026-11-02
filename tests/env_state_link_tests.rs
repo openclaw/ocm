@@ -345,6 +345,21 @@ esac
         assert!(upgrade.status.success(), "{}", stderr(&upgrade));
         assert!(finalized.exists());
         assert_eq!(binding(), "new");
+        if layout == "directory" {
+            // Rollback takes its own safety checkpoint before switching back.
+            let recorded = snapshots();
+            fs::rename(&state, &external).unwrap();
+            symlink(&external, &state).unwrap();
+            let rollback = run_ocm(root.path(), &env, &["upgrade", "rollback", "demo"]);
+            assert!(!rollback.status.success(), "rollback accepted state link");
+            assert!(
+                stderr(&rollback).contains("resolves outside the environment root"),
+                "{}",
+                stderr(&rollback)
+            );
+            assert_eq!(binding(), "new");
+            assert_eq!(snapshots(), recorded);
+        }
         return;
     }
 

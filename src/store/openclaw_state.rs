@@ -1444,14 +1444,20 @@ fn rewrite_session_location_fields(
     Ok(output)
 }
 
-pub(crate) fn validate_nonportable_runtime_state_paths(paths: &EnvPaths) -> Result<(), String> {
-    // Check parents before descendants, including dangling links. These are the
-    // directories cleanup opens directly rather than reaching via typed entries.
-    for path in [
+/// State directories that copies and checkpoints treat as OpenClaw's own,
+/// parents before descendants.
+fn runtime_state_directories(paths: &EnvPaths) -> [PathBuf; 3] {
+    [
         paths.state_dir.clone(),
         paths.state_dir.join("agents"),
         paths.state_dir.join("extensions"),
-    ] {
+    ]
+}
+
+pub(crate) fn validate_nonportable_runtime_state_paths(paths: &EnvPaths) -> Result<(), String> {
+    // Check parents before descendants, including dangling links. These are the
+    // directories cleanup opens directly rather than reaching via typed entries.
+    for path in runtime_state_directories(paths) {
         match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.is_dir() => {}
             Ok(_) => {
@@ -1472,11 +1478,7 @@ pub(crate) fn validate_nonportable_runtime_state_paths(paths: &EnvPaths) -> Resu
 /// Links that stay inside the root are captured together with their targets.
 pub(crate) fn validate_runtime_state_inside_root(paths: &EnvPaths) -> Result<(), String> {
     let root = fs::canonicalize(&paths.root).map_err(|error| error.to_string())?;
-    for path in [
-        paths.state_dir.clone(),
-        paths.state_dir.join("agents"),
-        paths.state_dir.join("extensions"),
-    ] {
+    for path in runtime_state_directories(paths) {
         match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.file_type().is_symlink() => {}
             Ok(_) => continue,

@@ -1668,7 +1668,7 @@ fn check_snapshot_residue_preserves_source(root_link: bool, borrowed: bool) {
         linked.join(".openclaw")
     };
     // New snapshots refuse a state directory linked outside the root, so
-    // capture before linking it; restore must still not follow the live link.
+    // capture before linking it.
     let state_snapshot =
         (!root_link).then(|| fixture.run_ok(&["env", "snapshot", "create", "linked", "--json"]));
     fs::remove_dir_all(&link).unwrap();
@@ -1676,7 +1676,7 @@ fn check_snapshot_residue_preserves_source(root_link: bool, borrowed: bool) {
     let residue = if root_link {
         source.join(".openclaw")
     } else {
-        source
+        source.clone()
     };
     write_text(&residue.join("Cargo.lock"), "authored source lock\n");
     write_text(&residue.join("run/keep"), "authored source data\n");
@@ -1684,6 +1684,21 @@ fn check_snapshot_residue_preserves_source(root_link: bool, borrowed: bool) {
     let snapshot = state_snapshot
         .unwrap_or_else(|| fixture.run_ok(&["env", "snapshot", "create", "linked", "--json"]));
     let snapshot: Value = serde_json::from_str(&stdout(&snapshot)).unwrap();
+    if !root_link {
+        // Older checkpoints captured this link itself. Rebuild that artifact
+        // so restore's residue cleanup still meets the captured link.
+        let artifact = ocm::store::get_env_snapshot(
+            "linked",
+            snapshot["id"].as_str().unwrap(),
+            &fixture.env,
+            fixture.root.path(),
+        )
+        .unwrap()
+        .archive_path;
+        let captured_state = PathBuf::from(artifact).join(".openclaw");
+        fs::remove_dir_all(&captured_state).unwrap();
+        symlink(&source, &captured_state).unwrap();
+    }
     fixture.run_ok(&[
         "env",
         "snapshot",
