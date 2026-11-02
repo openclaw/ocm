@@ -202,13 +202,16 @@ pub(crate) fn rewrite_openclaw_config_for_new_environment(
     )
 }
 
+/// `source_home` is the home a plain install expands `~` against.
 pub(crate) fn rewrite_openclaw_config_for_migration(
     target_paths: &EnvPaths,
+    source_home: &Path,
     source_state_root: &Path,
     canonical_source_state_root: &Path,
     gateway_port: Option<u32>,
     sandbox_origin: Option<&str>,
 ) -> Result<OpenClawConfigRewriteOutcome, String> {
+    expand_migrated_home_relative_paths(target_paths, source_home)?;
     rewrite_migrated_plugin_load_paths(
         target_paths,
         source_state_root,
@@ -220,6 +223,217 @@ pub(crate) fn rewrite_openclaw_config_for_migration(
         gateway_port,
         SandboxOriginPolicy::NewEnvironment(sandbox_origin),
     )
+}
+
+/// A plain install expands `~` against its home, but the environment runs
+/// with `OPENCLAW_HOME` set to its root, which OpenClaw expands `~` against
+/// instead. Values under `~/.openclaw` already name the copied state
+/// directory; every other home-relative path setting is spelled out against
+/// the source home so it keeps naming the same location. Absolute values
+/// inside the source state directory are then relocated by the later rewrites.
+fn expand_migrated_home_relative_paths(
+    target: &EnvPaths,
+    source_home: &Path,
+) -> Result<(), String> {
+    if !source_home.is_absolute() {
+        return Ok(());
+    }
+    let Some(effective) = load_effective_openclaw_config(&target.config_path)? else {
+        return Ok(());
+    };
+    let mut scopes = effective.include_scopes;
+    scopes.insert(target.config_path.clone(), BTreeSet::from([Vec::new()]));
+    for (path, scopes) in scopes {
+        let Some(value) = read_config_value(&path)? else {
+            continue;
+        };
+        let mut rewritten = None;
+        for scope in scopes {
+            // Include scopes are typed as object keys: a recorded index cannot
+            // be told apart from a digit-only key, so a value in an include
+            // placed at a list position keeps its spelling (openclaw/ocm#972).
+            let mut scope = scope.into_iter().map(ConfigSegment::Key).collect();
+            let mut candidate = value.clone();
+            expand_home_relative_paths_in_scope(&mut candidate, &mut scope, source_home);
+            if rewritten
+                .as_ref()
+                .is_some_and(|previous| previous != &candidate)
+            {
+                return Err(format!(
+                    "cannot safely expand home-relative paths in shared OpenClaw include {}; give path settings their own include before migration",
+                    display_path(&path)
+                ));
+            }
+            rewritten = Some(candidate);
+        }
+        if let Some(rewritten) = rewritten.filter(|rewritten| *rewritten != value) {
+            write_copied_config_value(&path, &target.state_dir, &rewritten)?;
+        }
+    }
+    Ok(())
+}
+
+/// One step from the config root to a value: an object key or a list entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ConfigSegment {
+    Key(String),
+    Entry,
+}
+
+/// Expands the home-relative path settings in a config fragment included at
+/// `scope`. `$include` directives keep their own relocation.
+fn expand_home_relative_paths_in_scope(
+    value: &mut Value,
+    scope: &mut Vec<ConfigSegment>,
+    home: &Path,
+) -> bool {
+    match value {
+        Value::String(raw) => {
+            let Some(trims) = home_relative_path_setting(scope) else {
+                return false;
+            };
+            let Some(expanded) = expand_home_relative_path(raw, home, trims) else {
+                return false;
+            };
+            *raw = expanded;
+            true
+        }
+        Value::Array(values) => {
+            let mut changed = false;
+            for nested in values {
+                scope.push(ConfigSegment::Entry);
+                changed |= expand_home_relative_paths_in_scope(nested, scope, home);
+                scope.pop();
+            }
+            changed
+        }
+        Value::Object(values) => {
+            let mut changed = false;
+            for (key, nested) in values.iter_mut().filter(|(key, _)| *key != "$include") {
+                scope.push(ConfigSegment::Key(key.clone()));
+                changed |= expand_home_relative_paths_in_scope(nested, scope, home);
+                scope.pop();
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+/// Settings whose own OpenClaw consumers expand `~` against `OPENCLAW_HOME`
+/// with OpenClaw's shared resolver although its runtime config rule does
+/// not, with whether the consumer trims the value first. `*` stands for any
+/// one object key and `[]` for a list entry. Derived from the consumers at
+/// OpenClaw a7fe06b17a9. Settings their consumers expand against the OS home
+/// (string `memory.search.extraPaths` entries, `messages.usageTemplate`, the
+/// voice-call store and the file-transfer path lists) keep their meaning,
+/// because `HOME` is unchanged in the environment. Not rewritten yet
+/// (openclaw/ocm#972): `nodeHost.workerRuns.folders`, whose consumer resolves
+/// links before `..`, unlike the lexical expansion used here, and the trust
+/// roots `skills.load.allowSymlinkTargets` and
+/// `security.installPolicy.exec.trustedDirs`, which keep failing closed.
+const CONSUMER_HOME_PATH_SETTINGS: &[(&[&str], bool)] = &[
+    // src/skills/loading/workspace-skill-sources.ts, symlink-targets.ts
+    (&["skills", "load", "extraDirs", "[]"], true),
+    // src/hooks/workspace.ts
+    (&["hooks", "internal", "load", "extraDirs", "[]"], true),
+    // src/config/sessions/paths.ts expands `~` without trimming first.
+    (&["session", "store"], false),
+    // src/cron/store/paths.ts
+    (&["cron", "store"], true),
+    // src/agents/agent-scope-config.ts
+    (&["agents", "defaults", "cwd"], true),
+    (&["agents", "entries", "*", "cwd"], true),
+    (&["agents", "list", "[]", "cwd"], true),
+];
+
+/// Whether OpenClaw expands a leading `~` in the string setting at `scope`,
+/// and whether it trims the value first. OpenClaw's runtime config
+/// (`materializeRuntimeConfig` in `src/config/materialize.ts`) expands keys
+/// ending in `dir`, `path`, `paths`, `file`, `root` or `workspace`, the keys
+/// `paths` and `pathPrepend`, and the direct entries of `paths` and
+/// `pathPrepend` lists; [`CONSUMER_HOME_PATH_SETTINGS`] lists the settings
+/// that are expanded by their own consumers. Other strings, such as message
+/// text, stay as written.
+fn home_relative_path_setting(scope: &[ConfigSegment]) -> Option<bool> {
+    if let Some((_, trims)) = CONSUMER_HOME_PATH_SETTINGS
+        .iter()
+        .find(|(pattern, _)| config_scope_matches(scope, pattern))
+    {
+        return Some(*trims);
+    }
+    const PATH_LISTS: [&str; 2] = ["paths", "pathPrepend"];
+    const PATH_KEY_SUFFIXES: [&str; 6] = ["dir", "path", "paths", "file", "root", "workspace"];
+    match scope {
+        [.., ConfigSegment::Key(list), ConfigSegment::Entry] => {
+            PATH_LISTS.contains(&list.as_str()).then_some(true)
+        }
+        [.., ConfigSegment::Key(key)] => {
+            let lower = key.to_ascii_lowercase();
+            (PATH_LISTS.contains(&key.as_str())
+                || PATH_KEY_SUFFIXES
+                    .iter()
+                    .any(|suffix| lower.ends_with(suffix)))
+            .then_some(true)
+        }
+        _ => None,
+    }
+}
+
+fn config_scope_matches(scope: &[ConfigSegment], pattern: &[&str]) -> bool {
+    scope.len() == pattern.len()
+        && scope
+            .iter()
+            .zip(pattern)
+            .all(|(segment, expected)| match (segment, *expected) {
+                (ConfigSegment::Entry, "[]") => true,
+                (ConfigSegment::Key(_), "*") => true,
+                (ConfigSegment::Key(key), expected) => key == expected,
+                _ => false,
+            })
+}
+
+/// The characters JavaScript's `String.prototype.trim` removes: its white
+/// space (tab, vertical tab, form feed, BOM and the `Zs` space separators)
+/// and line terminators. Rust's `str::trim` differs, for example on U+0085.
+fn is_ecmascript_whitespace(c: char) -> bool {
+    matches!(
+        c,
+        '\t' | '\n' | '\u{b}' | '\u{c}' | '\r' | ' ' | '\u{a0}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200a}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202f}'
+                | '\u{205f}'
+                | '\u{3000}'
+                | '\u{feff}'
+    )
+}
+
+fn expand_home_relative_path(raw: &str, home: &Path, trims: bool) -> Option<String> {
+    let value = if trims {
+        raw.trim_matches(is_ecmascript_whitespace)
+    } else {
+        raw
+    };
+    if value != "~" && !value.starts_with("~/") && !value.starts_with("~\\") {
+        return None;
+    }
+    // OpenClaw substitutes `${VAR}` before resolving `..`, which the lexical
+    // expansion here cannot reproduce; leave such values as written for now
+    // (openclaw/ocm#972).
+    if value.contains("${") {
+        return None;
+    }
+    // Expand as OpenClaw does: replace the leading `~`, then resolve `.` and
+    // `..` lexically, so later rewrites cannot follow links OpenClaw ignores.
+    let mut expanded = home.as_os_str().to_os_string();
+    expanded.push(&value[1..]);
+    let expanded = clean_path(Path::new(&expanded));
+    if expanded.starts_with(home.join(".openclaw")) {
+        return None;
+    }
+    expanded.to_str().map(str::to_string)
 }
 
 /// Moves a Gateway port that a copied `$include` supplies to `gateway_port`,
@@ -2723,6 +2937,119 @@ mod tests {
     use time::OffsetDateTime;
 
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_home_expansion_follows_openclaw_tilde_rules() {
+        let home = Path::new("/home/alice");
+        let expand = |raw| expand_home_relative_path(raw, home, true);
+        assert_eq!(expand("~/dev/p").as_deref(), Some("/home/alice/dev/p"));
+        assert_eq!(expand(" ~/dev/p ").as_deref(), Some("/home/alice/dev/p"));
+        // Trimmed as JavaScript trims: BOM yes, U+0085 no.
+        assert_eq!(
+            expand("\u{feff}~/dev/p").as_deref(),
+            Some("/home/alice/dev/p")
+        );
+        assert_eq!(expand("\u{85}~/ready"), None);
+        assert_eq!(expand("~").as_deref(), Some("/home/alice"));
+        assert_eq!(
+            expand("~/a/./../dev/p").as_deref(),
+            Some("/home/alice/dev/p")
+        );
+        assert_eq!(
+            expand("~/.openclaw/../dev/p").as_deref(),
+            Some("/home/alice/dev/p")
+        );
+        assert_eq!(
+            expand("~/.openclawish/p").as_deref(),
+            Some("/home/alice/.openclawish/p")
+        );
+        // Values under `~/.openclaw` already name the environment's copy.
+        assert_eq!(expand("~/.openclaw/extensions/x"), None);
+        assert_eq!(expand("~/x/../.openclaw/y"), None);
+        // OpenClaw replaces the `~` of `~\` too; on POSIX the rest stays one name.
+        assert_eq!(expand("~\\dev").as_deref(), Some("/home/alice\\dev"));
+        for unchanged in [
+            "~alice/dev",
+            "dev/~/p",
+            "/abs/~/p",
+            "~~/p",
+            "~/${UP}/../shared",
+        ] {
+            assert_eq!(expand(unchanged), None, "{unchanged}");
+        }
+        // A setting that does not trim keeps its whitespace semantics.
+        assert_eq!(expand_home_relative_path(" ~/s.json", home, false), None);
+        assert_eq!(
+            expand_home_relative_path("~/s.json ", home, false).as_deref(),
+            Some("/home/alice/s.json ")
+        );
+    }
+
+    #[test]
+    fn migration_home_expansion_selects_the_settings_openclaw_expands() {
+        let setting = |scope: &[&str]| {
+            let scope = scope
+                .iter()
+                .map(|segment| match *segment {
+                    "[]" => ConfigSegment::Entry,
+                    key => ConfigSegment::Key(key.to_string()),
+                })
+                .collect::<Vec<_>>();
+            home_relative_path_setting(&scope)
+        };
+        for path in [
+            &["plugins", "load", "paths", "[]"][..],
+            &["plugins", "load", "paths"],
+            &["tools", "exec", "pathPrepend", "[]"],
+            &["plugins", "entries", "demo", "config", "pathPrepend"],
+            &["skills", "load", "extraDirs", "[]"],
+            &["hooks", "internal", "load", "extraDirs", "[]"],
+            &["agents", "list", "[]", "agentDir"],
+            &["agents", "defaults", "cwd"],
+            &["agents", "entries", "main", "cwd"],
+            &["agents", "list", "[]", "cwd"],
+            &["gateway", "tls", "caPath"],
+            &["logging", "file"],
+            &["plugins", "entries", "demo", "config", "rootDir"],
+            &["agents", "defaults", "workspace"],
+            &["cron", "store"],
+        ] {
+            assert_eq!(setting(path), Some(true), "{path:?}");
+        }
+        assert_eq!(setting(&["session", "store"]), Some(false));
+        for text in [
+            &["messages", "responsePrefix"][..],
+            &["messages", "usageTemplate"],
+            // Expanded against the OS home, which the environment keeps.
+            &["memory", "search", "extraPaths", "[]"],
+            &["plugins", "entries", "voice-call", "config", "store"],
+            &[
+                "plugins",
+                "entries",
+                "file-transfer",
+                "config",
+                "nodes",
+                "n1",
+                "allowReadPaths",
+                "[]",
+            ],
+            // Trust roots keep failing closed (openclaw/ocm#972).
+            &["skills", "load", "allowSymlinkTargets", "[]"],
+            &["security", "installPolicy", "exec", "trustedDirs", "[]"],
+            // Resolved through links before `..`.
+            &["nodeHost", "workerRuns", "folders", "[]"],
+            &["agents", "list", "[]", "identity", "name"],
+            &["plugins", "entries", "demo", "config", "dirs", "[]"],
+            // A digit-only key is an object key, not a list entry.
+            &["plugins", "entries", "demo", "config", "paths", "0"],
+            &["memory", "store"],
+            &["agents", "defaults", "cwd", "[]"],
+            &[],
+        ] {
+            assert_eq!(setting(text), None, "{text:?}");
+        }
+    }
 
     fn meta(name: &str, root: &str, gateway_port: Option<u32>) -> EnvMeta {
         EnvMeta {

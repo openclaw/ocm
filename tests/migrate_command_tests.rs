@@ -5072,3 +5072,345 @@ fn migrate_moves_a_port_include_and_keeps_an_inline_port_over_its_include() {
         assert_eq!(fs::read_to_string(source.join(include)).unwrap(), contents);
     }
 }
+
+fn migrate_or_adopt_args<'a>(adopt: bool, name: &'a str, source: &'a Path) -> Vec<&'a str> {
+    if adopt {
+        vec!["adopt", "import", "--name", name, source.to_str().unwrap()]
+    } else {
+        vec!["migrate", name, source.to_str().unwrap()]
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn migrate_and_adopt_keep_home_relative_paths_outside_the_state_dir_pointing_at_the_same_location()
+{
+    for adopt in [false, true] {
+        let root = TestDir::new("migrate-home-relative-paths");
+        let env = ocm_env(&root);
+        let home = root.child("home");
+        let source = home.join(".openclaw");
+        fs::create_dir_all(source.join("extensions/inner")).unwrap();
+        fs::create_dir_all(source.join("deep")).unwrap();
+        fs::create_dir_all(home.join("dev/my-plugin")).unwrap();
+        fs::create_dir_all(home.join("shared-skills")).unwrap();
+        fs::create_dir_all(home.join("ext-agent/agent")).unwrap();
+        // OpenClaw resolves `..` lexically, so this names `~/dev/my-plugin`,
+        // not the state directory the link points into.
+        std::os::unix::fs::symlink(source.join("deep"), home.join("hop")).unwrap();
+        let home_path = home.to_str().unwrap();
+        let config = serde_json::json!({
+            "gateway": {"port": 18789},
+            "agents": {
+                "list": [{"id": "main", "agentDir": "~/ext-agent/agent", "cwd": "~/dev/repo"}]
+            },
+            "hooks": {"internal": {"load": {"extraDirs": ["~/hooks"]}}},
+            "nodeHost": {"workerRuns": {"folders": ["~/work"]}},
+            "memory": {"search": {"extraPaths": ["~/notes"]}},
+            "session": {"store": "~/ext-state/{agentId}/sessions.json"},
+            "cron": {"store": "~/ext-state/cron.json"},
+            "logging": {"file": "~/logs/openclaw.log"},
+            // Not a path setting: OpenClaw keeps it as literal text.
+            "messages": {"responsePrefix": "~/ready"},
+            "plugins": {"load": {"$include": "./plugin-load.json"}},
+            "skills": {
+                "load": {"extraDirs": ["~/shared-skills", " ~/spaced-skills", "~/trailing-skills "]}
+            },
+        });
+        support::write_text(&source.join("openclaw.json"), &config.to_string());
+        let include = serde_json::json!({
+            "paths": [
+                "~/.openclaw/extensions/inner",
+                "~/dev/my-plugin",
+                "~/.openclaw/../dev/my-plugin",
+                "~/hop/../dev/my-plugin",
+                format!("{home_path}/dev/my-plugin"),
+            ]
+        })
+        .to_string();
+        support::write_text(&source.join("plugin-load.json"), &include);
+
+        let imported = run_ocm(
+            root.path(),
+            &env,
+            &migrate_or_adopt_args(adopt, "copied", &source),
+        );
+        assert!(imported.status.success(), "{}", stderr(&imported));
+
+        let target = root.child("ocm-home/envs/copied/.openclaw");
+        let copied: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(target.join("openclaw.json")).unwrap())
+                .unwrap();
+        let plugin = format!("{home_path}/dev/my-plugin");
+        let copied_include: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(target.join("plugin-load.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            copied_include["paths"],
+            serde_json::json!([
+                "~/.openclaw/extensions/inner",
+                plugin,
+                plugin,
+                plugin,
+                plugin
+            ]),
+            "adopt={adopt}"
+        );
+        assert_eq!(copied["plugins"]["load"]["$include"], "./plugin-load.json");
+        assert_eq!(
+            copied["skills"]["load"]["extraDirs"],
+            // OpenClaw trims these entries before expanding them.
+            serde_json::json!([
+                format!("{home_path}/shared-skills"),
+                format!("{home_path}/spaced-skills"),
+                format!("{home_path}/trailing-skills"),
+            ])
+        );
+        assert_eq!(
+            copied["agents"]["list"][0]["agentDir"],
+            format!("{home_path}/ext-agent/agent")
+        );
+        assert_eq!(
+            copied["session"]["store"],
+            format!("{home_path}/ext-state/{{agentId}}/sessions.json")
+        );
+        assert_eq!(
+            copied["cron"]["store"],
+            format!("{home_path}/ext-state/cron.json")
+        );
+        assert_eq!(copied["messages"]["responsePrefix"], "~/ready");
+        assert_eq!(
+            copied["agents"]["list"][0]["cwd"],
+            format!("{home_path}/dev/repo")
+        );
+        assert_eq!(
+            copied["hooks"]["internal"]["load"]["extraDirs"],
+            serde_json::json!([format!("{home_path}/hooks")])
+        );
+        // These consumers expand `~` against the OS home or resolve links
+        // first, so the values already keep their meaning.
+        assert_eq!(
+            copied["nodeHost"]["workerRuns"]["folders"],
+            serde_json::json!(["~/work"])
+        );
+        assert_eq!(
+            copied["memory"]["search"]["extraPaths"],
+            serde_json::json!(["~/notes"])
+        );
+        assert_eq!(
+            copied["logging"]["file"],
+            format!("{home_path}/logs/openclaw.log")
+        );
+        assert_eq!(
+            fs::read_to_string(source.join("openclaw.json")).unwrap(),
+            config.to_string()
+        );
+        assert_eq!(
+            fs::read_to_string(source.join("plugin-load.json")).unwrap(),
+            include
+        );
+    }
+}
+
+#[test]
+fn migrate_and_adopt_expand_home_relative_paths_of_a_custom_named_state_dir_against_the_user_home()
+{
+    for adopt in [false, true] {
+        let root = TestDir::new("migrate-home-relative-custom-state-dir");
+        let env = ocm_env(&root);
+        let home = root.child("home");
+        let source = root.child("legacy/openclaw");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(home.join("dev/my-plugin")).unwrap();
+        let config = serde_json::json!({
+            "plugins": {"load": {"paths": ["~/dev/my-plugin", "~/.openclaw/extensions/inner"]}},
+        });
+        support::write_text(&source.join("openclaw.json"), &config.to_string());
+
+        let imported = run_ocm(
+            root.path(),
+            &env,
+            &migrate_or_adopt_args(adopt, "copied", &source),
+        );
+        assert!(imported.status.success(), "{}", stderr(&imported));
+
+        let target = root.child("ocm-home/envs/copied/.openclaw");
+        let copied: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(target.join("openclaw.json")).unwrap())
+                .unwrap();
+        // The state directory was not `<home>/.openclaw`, so `~` named the
+        // user's home, not the state directory's parent.
+        assert_eq!(
+            copied["plugins"]["load"]["paths"],
+            serde_json::json!([
+                home.join("dev/my-plugin").to_str().unwrap(),
+                "~/.openclaw/extensions/inner",
+            ]),
+            "adopt={adopt}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn migrate_and_adopt_expand_home_relative_paths_against_the_user_home_through_a_state_dir_alias() {
+    for (adopt, through_parent) in [(false, false), (true, false), (false, true), (true, true)] {
+        let root = TestDir::new("migrate-home-relative-alias");
+        let env = ocm_env(&root);
+        let home = root.child("home");
+        let own = home.join(".openclaw");
+        fs::create_dir_all(&own).unwrap();
+        fs::create_dir_all(home.join("dev/my-plugin")).unwrap();
+        let alias = root.child("import/.openclaw");
+        fs::create_dir_all(alias.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&own, &alias).unwrap();
+        // `elsewhere/hop/../.openclaw` reaches the user's `~/.openclaw` only
+        // through the link; removing `..` lexically names a missing
+        // `elsewhere/.openclaw`.
+        fs::create_dir_all(home.join("deep")).unwrap();
+        fs::create_dir_all(root.child("elsewhere")).unwrap();
+        std::os::unix::fs::symlink(home.join("deep"), root.child("elsewhere/hop")).unwrap();
+        let source = if through_parent {
+            root.child("elsewhere/hop/../.openclaw")
+        } else {
+            alias.clone()
+        };
+        let config = serde_json::json!({"plugins": {"load": {"paths": ["~/dev/my-plugin"]}}});
+        support::write_text(&own.join("openclaw.json"), &config.to_string());
+
+        let imported = run_ocm(
+            root.path(),
+            &env,
+            &migrate_or_adopt_args(adopt, "copied", &source),
+        );
+        assert!(imported.status.success(), "{}", stderr(&imported));
+
+        let target = root.child("ocm-home/envs/copied/.openclaw");
+        let copied: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(target.join("openclaw.json")).unwrap())
+                .unwrap();
+        // The alias leads to the user's own `~/.openclaw`, so `~` is the
+        // user's home, not the alias's parent.
+        assert_eq!(
+            copied["plugins"]["load"]["paths"],
+            serde_json::json!([home.join("dev/my-plugin").to_str().unwrap()]),
+            "adopt={adopt}, through_parent={through_parent}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn migrate_and_adopt_expand_home_relative_paths_against_the_physical_home_of_an_aliased_source() {
+    for adopt in [false, true] {
+        let root = TestDir::new("migrate-home-relative-physical-home");
+        let env = ocm_env(&root);
+        let other_home = root.child("other-home");
+        let source = other_home.join(".openclaw");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(other_home.join("dev/my-plugin")).unwrap();
+        let alias = root.child("import-source");
+        std::os::unix::fs::symlink(&source, &alias).unwrap();
+        let config = serde_json::json!({"plugins": {"load": {"paths": ["~/dev/my-plugin"]}}});
+        support::write_text(&source.join("openclaw.json"), &config.to_string());
+
+        let imported = run_ocm(
+            root.path(),
+            &env,
+            &migrate_or_adopt_args(adopt, "copied", &alias),
+        );
+        assert!(imported.status.success(), "{}", stderr(&imported));
+
+        let target = root.child("ocm-home/envs/copied/.openclaw");
+        let copied: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(target.join("openclaw.json")).unwrap())
+                .unwrap();
+        // `import-source` leads to another home's `.openclaw`, so `~` is that
+        // home, not the alias's parent or the migrating user's home.
+        assert_eq!(
+            copied["plugins"]["load"]["paths"],
+            serde_json::json!([fs::canonicalize(&other_home)
+                .unwrap()
+                .join("dev/my-plugin")
+                .to_str()
+                .unwrap()]),
+            "adopt={adopt}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn migrate_and_adopt_resolve_parent_traversal_from_the_supplied_home_spelling() {
+    for adopt in [false, true] {
+        let root = TestDir::new("migrate-home-relative-spelling");
+        let env = ocm_env(&root);
+        // Bob's home is spelled through a link at a different depth than its
+        // physical directory, so `~/..` names different places.
+        let physical = root.child("srv/bob");
+        let spelled = root.child("aliases/bob");
+        fs::create_dir_all(physical.join(".openclaw")).unwrap();
+        fs::create_dir_all(spelled.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&physical, &spelled).unwrap();
+        let config = serde_json::json!({"skills": {"load": {"extraDirs": ["~/../shared"]}}});
+        support::write_text(
+            &physical.join(".openclaw/openclaw.json"),
+            &config.to_string(),
+        );
+
+        let source = spelled.join(".openclaw");
+        let imported = run_ocm(
+            root.path(),
+            &env,
+            &migrate_or_adopt_args(adopt, "copied", &source),
+        );
+        assert!(imported.status.success(), "{}", stderr(&imported));
+
+        let target = root.child("ocm-home/envs/copied/.openclaw");
+        let copied: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(target.join("openclaw.json")).unwrap())
+                .unwrap();
+        // OpenClaw resolves `..` lexically from the home as it was spelled.
+        assert_eq!(
+            copied["skills"]["load"]["extraDirs"],
+            serde_json::json!([root.child("aliases/shared").to_str().unwrap()]),
+            "adopt={adopt}"
+        );
+    }
+}
+
+#[test]
+fn migrate_and_adopt_keep_home_relative_paths_in_an_include_at_a_list_entry_as_written() {
+    for adopt in [false, true] {
+        let root = TestDir::new("migrate-home-relative-list-include");
+        let env = ocm_env(&root);
+        let home = root.child("home");
+        let source = home.join(".openclaw");
+        fs::create_dir_all(&source).unwrap();
+        let config = serde_json::json!({
+            "skills": {"load": {"extraDirs": [{"$include": "./skills-dir.json"}]}}
+        });
+        support::write_text(&source.join("openclaw.json"), &config.to_string());
+        let include = "\"~/shared-skills\"";
+        support::write_text(&source.join("skills-dir.json"), include);
+
+        let imported = run_ocm(
+            root.path(),
+            &env,
+            &migrate_or_adopt_args(adopt, "copied", &source),
+        );
+        assert!(imported.status.success(), "{}", stderr(&imported));
+
+        let target = root.child("ocm-home/envs/copied/.openclaw");
+        let copied: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(target.join("skills-dir.json")).unwrap())
+                .unwrap();
+        // A recorded include index cannot be told apart from a digit-only
+        // key, so the value keeps its spelling (openclaw/ocm#972).
+        assert_eq!(copied, "~/shared-skills", "adopt={adopt}");
+        assert_eq!(
+            fs::read_to_string(source.join("skills-dir.json")).unwrap(),
+            include
+        );
+    }
+}

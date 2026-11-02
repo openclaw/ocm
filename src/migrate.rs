@@ -545,6 +545,39 @@ pub(crate) fn with_rollback_error(
     }
 }
 
+/// The home a plain install expands `~` against. The user's own
+/// `~/.openclaw`, through any spelling, expands against the user's home.
+/// Otherwise OpenClaw keeps its state in `<home>/.openclaw`: the supplied
+/// spelling's parent is that home, or the physical directory's parent when
+/// only it has that name. A state directory with any other name was selected
+/// separately, so `~` still names the user's home.
+fn plain_install_home(source_state_dir: &Path, env: &BTreeMap<String, String>) -> PathBuf {
+    let user_home = clean_path(&resolve_user_home(env));
+    // Compare identities through the supplied spelling: removing `..`
+    // lexically can name another directory once a link precedes it.
+    let canonical = fs::canonicalize(source_state_dir).ok();
+    if canonical.is_some()
+        && canonical.as_deref()
+            == fs::canonicalize(user_home.join(".openclaw"))
+                .ok()
+                .as_deref()
+    {
+        return user_home;
+    }
+    let state_home = |state_dir: &Path| {
+        state_dir
+            .file_name()
+            .is_some_and(|name| name == ".openclaw")
+            .then(|| state_dir.parent().map(Path::to_path_buf))
+            .flatten()
+    };
+    // Prefer the supplied spelling: OpenClaw resolves `~/..` lexically from
+    // the home as it was spelled.
+    state_home(&clean_path(source_state_dir))
+        .or_else(|| canonical.as_deref().and_then(state_home))
+        .unwrap_or(user_home)
+}
+
 fn complete_migration_import(
     created: crate::env::EnvMeta,
     target_paths: &crate::store::EnvPaths,
@@ -590,6 +623,7 @@ fn complete_migration_import(
     reject_include_owned_sandbox_origin(&target_paths.config_path)?;
     let config_rewrite = rewrite_openclaw_config_for_migration(
         target_paths,
+        &plain_install_home(source_home, env),
         source_home,
         &canonical_source_home,
         created.gateway_port,
