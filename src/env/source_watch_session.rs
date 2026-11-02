@@ -582,12 +582,21 @@ impl<'a> EnvironmentService<'a> {
     }
 
     pub(crate) fn ensure_source_watch_stopped(&self, env_name: &str) -> Result<(), String> {
-        if self
+        if let Some(session) = self
             .source_watch_session(env_name)?
-            .is_some_and(|session| !session.closed)
+            .filter(|session| !session.closed)
         {
+            // Repeating a plain stop cannot clear unverified cleanup; only
+            // the operator's acknowledgement can.
+            let recovery = if session.unsafe_cleanup_error().is_some() {
+                format!(
+                    "once every source process has stopped, run `ocm dev stop {env_name} --acknowledge-stopped-processes`"
+                )
+            } else {
+                format!("run `ocm dev stop {env_name}`")
+            };
             return Err(format!(
-                "source watch for env {env_name} has unfinished ownership; run `ocm dev stop {env_name}` before removing its state"
+                "source watch for env {env_name} has unfinished ownership; {recovery} before removing its state"
             ));
         }
         if !matches!(
@@ -920,6 +929,8 @@ mod tests {
             "uncertain spawn cannot recover"
         );
         write_json(&paths.session, &session).unwrap();
+        let live = service.ensure_source_watch_stopped("demo").unwrap_err();
+        assert!(live.contains("run `ocm dev stop demo` before"), "{live}");
         fs::write(&paths.request, b"incomplete request").unwrap();
         assert!(
             paths
@@ -938,6 +949,11 @@ mod tests {
             Some("unverified output EOF")
         );
         assert!(!retained.can_reclaim_without_restoration().unwrap());
+        let wedged = service.ensure_source_watch_stopped("demo").unwrap_err();
+        assert!(
+            wedged.contains("run `ocm dev stop demo --acknowledge-stopped-processes` before"),
+            "{wedged}"
+        );
         let before = fs::read(&paths.session).unwrap();
         assert!(
             paths
