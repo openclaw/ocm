@@ -14,6 +14,7 @@ All notable changes to OCM are documented here.
 - Find the installed npm launcher by default when building and installing runtimes on Windows.
 - Remove the hidden staging file and SQLite snapshot copies when `ocm env export` is stopped by SIGINT, SIGTERM or SIGHUP, and exit with status 130. Signals ignored at startup, as under `nohup`, stay ignored.
 - Keep `~/...` config paths outside `~/.openclaw`, such as local plugin, extra skills, agent directory and session or cron store paths, pointing at the same location after `migrate` and `adopt import`, instead of letting them resolve under the new environment root. Other config text is left unchanged.
+- Name the environments whose Gateway port families hold a retained dev UI port when `ocm dev` refuses it, and offer `--no-ui`, instead of asking the user to release a port that no command can release. A port bound by a process keeps the existing "occupied or reserved" wording.
 
 ## 0.3.8 - 2026-10-29
 
