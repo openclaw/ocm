@@ -849,11 +849,15 @@ fn upgrade_batch_continue_keeps_gateway_refused_before_cutover() {
 
     // `refused` advertises the native preflight, which blocks startup before
     // cutover. `broken` is a legacy package whose cold finalization fails after
-    // the source gateway was stopped.
+    // the source gateway was stopped, with a diagnostic long enough that the
+    // batch note must be bounded after the stop line is appended.
     let finalize = "    if [ \"$2\" = \"finalize\" ]; then\n";
     let broken_script = fixture_openclaw_script("2026.8.15").replacen(
         finalize,
-        &format!("{finalize}      printf 'synthetic finalize failure\\n' >&2\n      exit 23\n"),
+        &format!(
+            "{finalize}      printf 'synthetic finalize failure\\n' >&2\n      i=0\n      while [ \"$i\" -lt 20 ]; do printf 'finalize detail %s\\n' \"$i\" >&2; i=$((i + 1)); done\n      printf '%s\\n' \"{}\" >&2\n      exit 23\n",
+            "x".repeat(6_000)
+        ),
         1,
     );
     assert_ne!(broken_script, fixture_openclaw_script("2026.8.15"));
@@ -1018,9 +1022,15 @@ fn upgrade_batch_continue_keeps_gateway_refused_before_cutover() {
     assert!(demo["snapshotId"].is_string(), "{demo}");
     let note = demo["note"].as_str().unwrap();
     assert!(
+        note.contains("upgrade failed and rollback was disabled"),
+        "{note}"
+    );
+    assert!(
         note.contains("failure policy left the gateway stopped for external recovery"),
         "{note}"
     );
+    assert!(note.lines().count() <= 12, "{note}");
+    assert!(note.chars().count() <= 4_096, "{note}");
     let peer = result(&failed, "peer");
     assert_eq!(peer["rollback"], "disabled", "{peer}");
     let note = peer["note"].as_str().unwrap();
