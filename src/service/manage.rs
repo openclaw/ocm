@@ -299,17 +299,15 @@ pub fn restart_service(
         .child_pid
         .map(|pid| supervisor.request_handoff_restart(name, pid))
         .transpose()?;
-    let restarted = restart_through_handoff(name, before.child_pid, env, cwd);
-    let Some(request_id) = handoff_request else {
-        return restarted.map(|(summary, _)| summary);
-    };
+    let inside_gateway = restart_originates_inside_gateway(name, env);
+    let restarted = restart_through_handoff(name, before.child_pid, inside_gateway, env, cwd);
     // The daemon takes the request when the Gateway exits. A restart scheduled
     // from inside the Gateway returns before that exit, so leave it there.
-    if matches!(&restarted, Ok((_, false))) {
-        return restarted.map(|(summary, _)| summary);
-    }
+    let Some(request_id) = handoff_request.filter(|_| !inside_gateway) else {
+        return restarted;
+    };
     let clear_result = supervisor.clear_handoff_restart_request(name, &request_id);
-    let (mut summary, _) = restarted?;
+    let mut summary = restarted?;
     if let Err(error) = clear_result {
         summary.warnings.push(format!(
             "failed to clear the restart handoff request: {error}"
@@ -318,17 +316,17 @@ pub fn restart_service(
     Ok(summary)
 }
 
-/// Ask OpenClaw to hand off a restart of the running Gateway. The flag is
-/// whether this command waited for the Gateway's replacement.
+/// Ask OpenClaw to hand off a restart of the running Gateway.
 fn restart_through_handoff(
     name: &str,
     previous_pid: Option<u32>,
+    inside_gateway: bool,
     env: &BTreeMap<String, String>,
     cwd: &Path,
-) -> Result<(ServiceActionSummary, bool), String> {
+) -> Result<ServiceActionSummary, String> {
     let mut helper = spawn_recovery_aware_restart(name, env, cwd)?;
 
-    if restart_originates_inside_gateway(name, env) {
+    if inside_gateway {
         let mut warnings = vec![
             "recovery-aware restart was scheduled without waiting because the request originated inside the target gateway; OpenClaw will preserve and resume eligible interrupted work after restart"
                 .to_string(),
@@ -338,7 +336,7 @@ fn restart_through_handoff(
             warnings
                 .push("gateway is already transitioning to its replacement process".to_string());
         }
-        return Ok((service_action_summary("restart", summary, warnings), false));
+        return Ok(service_action_summary("restart", summary, warnings));
     }
 
     let status = wait_for_restart_action_summary_with_timeout(
@@ -356,10 +354,7 @@ fn restart_through_handoff(
                 .to_string(),
         );
     }
-    Ok((
-        service_action_summary("restart", status.summary, warnings),
-        true,
-    ))
+    Ok(service_action_summary("restart", status.summary, warnings))
 }
 
 fn restart_running_service_directly(
