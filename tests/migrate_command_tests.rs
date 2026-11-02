@@ -5187,9 +5187,10 @@ fn migrate_and_adopt_keep_home_relative_paths_outside_the_state_dir_pointing_at_
             copied["hooks"]["internal"]["load"]["extraDirs"],
             serde_json::json!([format!("{home_path}/hooks")])
         );
+        // Kept as written and named in a warning; see the worker-folder test.
         assert_eq!(
             copied["nodeHost"]["workerRuns"]["folders"],
-            serde_json::json!([format!("{home_path}/work")])
+            serde_json::json!(["~/work"])
         );
         // Expanded against the OS home, which the environment keeps.
         assert_eq!(
@@ -5501,7 +5502,7 @@ fn migrate_and_adopt_expand_home_relative_paths_with_placeholders_before_substit
 
 #[cfg(unix)]
 #[test]
-fn migrate_and_adopt_expand_worker_folders_without_resolving_parent_traversal() {
+fn migrate_and_adopt_keep_worker_folders_and_name_them() {
     for adopt in [false, true] {
         let root = TestDir::new("migrate-home-relative-worker-folders");
         let env = ocm_env(&root);
@@ -5509,25 +5510,20 @@ fn migrate_and_adopt_expand_worker_folders_without_resolving_parent_traversal() 
         let source = home.join(".openclaw");
         fs::create_dir_all(source.join("wf")).unwrap();
         fs::create_dir_all(home.join("data/deep")).unwrap();
-        fs::create_dir_all(home.join("data/work")).unwrap();
         fs::create_dir_all(home.join("work")).unwrap();
-        // OpenClaw resolves `hop` before `..`, so `~/hop/../work` names
-        // `~/data/work`, not `~/work`.
         std::os::unix::fs::symlink(home.join("data/deep"), home.join("hop")).unwrap();
-        // `~/.openclaw/../../shared` names the missing `<root>/shared` in the
-        // plain install; kept as written it would name this directory.
-        fs::create_dir_all(root.child("ocm-home/envs/shared")).unwrap();
+        let home_path = home.to_str().unwrap();
+        let folders = serde_json::json!([
+            "~/work",
+            "~/hop/../work",
+            "~/.openclaw/wf",
+            "~/${SUB}/work",
+            // OpenClaw does not trim, so this is not home-relative.
+            " ~/work",
+            format!("{home_path}/work"),
+        ]);
         let config = serde_json::json!({
-            "nodeHost": {"workerRuns": {"enabled": true, "folders": [
-                "~/work",
-                "~/hop/../work",
-                "~/.openclaw/wf",
-                "~/.openclaw/../work",
-                // `missing` does not exist, so OpenClaw rejects this entry.
-                "~/.openclaw/missing/../wf",
-                "~/.openclaw/../../shared",
-                " ~/work",
-            ]}}
+            "nodeHost": {"workerRuns": {"enabled": true, "folders": folders}}
         });
         support::write_text(&source.join("openclaw.json"), &config.to_string());
 
@@ -5542,37 +5538,18 @@ fn migrate_and_adopt_expand_worker_folders_without_resolving_parent_traversal() 
         let copied: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(target.join("openclaw.json")).unwrap())
                 .unwrap();
-        let home_path = home.to_str().unwrap();
-        let folders = &copied["nodeHost"]["workerRuns"]["folders"];
+        // OpenClaw resolves these to real paths and grants workers access to
+        // them, so migration keeps them as written and names the setting.
         assert_eq!(
-            folders,
-            &serde_json::json!([
-                format!("{home_path}/work"),
-                format!("{home_path}/hop/../work"),
-                // Already names the environment's copy.
-                "~/.openclaw/wf",
-                // Leaves the state directory, so the relocation of copied
-                // state paths keeps it.
-                format!("{home_path}/.openclaw/../work"),
-                // Kept, so it still names a missing directory in the copy
-                // instead of being resolved to the copied `wf`.
-                "~/.openclaw/missing/../wf",
-                format!("{home_path}/.openclaw/../../shared"),
-                // OpenClaw does not trim, so this is not home-relative.
-                " ~/work",
-            ]),
+            copied["nodeHost"]["workerRuns"]["folders"], folders,
             "adopt={adopt}"
-        );
-        assert_eq!(
-            fs::canonicalize(folders[1].as_str().unwrap()).unwrap(),
-            fs::canonicalize(home.join("data/work")).unwrap()
         );
         let warnings = stderr(&imported);
         assert_eq!(
             warnings
                 .lines()
                 .filter(|line| line.starts_with(
-                    "warning: env copied keeps the ~/ entries of nodeHost.workerRuns.folders[] whose .. leads into ~/.openclaw as written"
+                    "warning: env copied keeps the ~/ entries of nodeHost.workerRuns.folders[] as written"
                 ))
                 .count(),
             1,
@@ -5581,24 +5558,16 @@ fn migrate_and_adopt_expand_worker_folders_without_resolving_parent_traversal() 
     }
 }
 
-#[cfg(unix)]
 #[test]
-fn migrate_and_adopt_keep_worker_folders_resolved_through_an_imported_workspace() {
+fn migrate_and_adopt_do_not_name_absolute_worker_folders() {
     for adopt in [false, true] {
-        let root = TestDir::new("migrate-home-relative-worker-workspace");
+        let root = TestDir::new("migrate-home-relative-worker-folders-absolute");
         let env = ocm_env(&root);
         let home = root.child("home");
         let source = home.join(".openclaw");
-        fs::create_dir_all(source.join("wf")).unwrap();
-        fs::create_dir_all(home.join("external/deep")).unwrap();
-        fs::create_dir_all(home.join("external/wf")).unwrap();
-        // OpenClaw resolves `workspace/../wf` to `~/external/wf`. Migration
-        // imports the linked workspace, so the copied state no longer has
-        // that link and the same entry would name the copied `wf`.
-        std::os::unix::fs::symlink(home.join("external/deep"), source.join("workspace")).unwrap();
+        fs::create_dir_all(&source).unwrap();
         let config = serde_json::json!({
-            "agents": {"defaults": {"workspace": "~/.openclaw/workspace"}},
-            "nodeHost": {"workerRuns": {"folders": ["~/.openclaw/workspace/../wf"]}}
+            "nodeHost": {"workerRuns": {"folders": ["/srv/work", " ~/work"]}}
         });
         support::write_text(&source.join("openclaw.json"), &config.to_string());
 
@@ -5608,20 +5577,8 @@ fn migrate_and_adopt_keep_worker_folders_resolved_through_an_imported_workspace(
             &migrate_or_adopt_args(adopt, "copied", &source),
         );
         assert!(imported.status.success(), "{}", stderr(&imported));
-
-        let target = root.child("ocm-home/envs/copied/.openclaw");
-        let copied: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(target.join("openclaw.json")).unwrap())
-                .unwrap();
-        assert_eq!(
-            copied["nodeHost"]["workerRuns"]["folders"],
-            serde_json::json!(["~/.openclaw/workspace/../wf"]),
-            "adopt={adopt}"
-        );
         assert!(
-            stderr(&imported).lines().any(|line| line.starts_with(
-                "warning: env copied keeps the ~/ entries of nodeHost.workerRuns.folders[] whose .. leads into ~/.openclaw as written"
-            )),
+            !stderr(&imported).contains("nodeHost.workerRuns.folders"),
             "adopt={adopt}: {}",
             stderr(&imported)
         );

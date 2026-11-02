@@ -265,8 +265,8 @@ impl Cli {
                 crate::store::KeptHomeRelativeReason::Placeholder => format!(
                     "warning: env {env_name} keeps the ~/ entries of {setting} that contain a ${{VAR}} placeholder and point into ~/.openclaw as written; if a placeholder leads them outside ~/.openclaw, they now resolve under the env root instead of the source home. Replace such entries with absolute paths"
                 ),
-                crate::store::KeptHomeRelativeReason::StateDirTraversal => format!(
-                    "warning: env {env_name} keeps the ~/ entries of {setting} whose .. leads into ~/.openclaw as written; OpenClaw now resolves them through the env's copy of ~/.openclaw, whose links and directories can differ from the source, so they may name a different directory than before. Check them and replace them with absolute paths if needed"
+                crate::store::KeptHomeRelativeReason::WorkerFolder => format!(
+                    "warning: env {env_name} keeps the ~/ entries of {setting} as written; OpenClaw now resolves them against the env root, so workers may be allowed or refused different folders than before. Replace them with absolute paths to keep the original folders"
                 ),
             });
         }

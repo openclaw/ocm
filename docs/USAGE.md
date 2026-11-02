@@ -1275,8 +1275,8 @@ still apply.
 Migration and adoption also spell out home-relative config paths. A plain
 install expands `~` against its home, but the new environment runs with
 `OPENCLAW_HOME` set to its root, so OpenClaw expands `~` against the environment
-root instead. Every setting OpenClaw expands `~` in that names a location outside
-`~/.openclaw`, such as a local plugin in `plugins.load.paths`, a
+root instead. Every setting OpenClaw expands `~` in that names a location
+outside `~/.openclaw`, such as a local plugin in `plugins.load.paths`, a
 `skills.load.extraDirs` entry, an agent directory or a session or cron store, is
 therefore rewritten in `openclaw.json` and its copied includes to the absolute
 path it named in the source home. These are the settings OpenClaw's runtime
@@ -1289,27 +1289,27 @@ handling and lexical `.` and `..` resolution as its OpenClaw consumer. Settings
 OpenClaw expands against the OS home keep their meaning without a rewrite,
 because the environment keeps your `HOME`. Other strings, such as message text,
 stay as written. Path values in an include placed at a list position are
-rewritten like any other. In a value containing a `${VAR}` placeholder, only
-the directories before the first placeholder are resolved; OpenClaw
-substitutes the placeholder and resolves the rest, as it would for the same
-value spelled from your home, so a placeholder that itself leads into
-`~/.openclaw` names the source's state directory. A placeholder value under
-`~/.openclaw` stays as written, and migration prints a warning naming its
-setting, because its placeholder may still lead outside `~/.openclaw`.
-`nodeHost.workerRuns.folders` entries, which OpenClaw resolves through
-symlinks, only have their leading `~` replaced, so a link before `..` still
-decides where they lead. An entry whose `..` or placeholder leads into
-`~/.openclaw` stays as written instead, and migration prints a warning naming
-its setting: OpenClaw then resolves it through the environment's copy of
-`~/.openclaw`, whose links and directories can differ from the source, for
-example after a linked workspace is imported. The trust roots
+rewritten like any other. In a value containing a `${VAR}` placeholder, only the
+directories before the first placeholder are resolved; OpenClaw substitutes the
+placeholder and resolves the rest, as it would for the same value spelled from
+your home, so a placeholder that itself leads into `~/.openclaw` names the
+source's state directory. A placeholder value under `~/.openclaw` stays as
+written, and migration prints a warning naming its setting, because its
+placeholder may still lead outside `~/.openclaw`. `nodeHost.workerRuns.folders`
+entries are not rewritten: OpenClaw resolves them to real paths, through
+symlinks, and grants workers access to the result, and migration can change the
+links and directories they resolve through (for example when it imports a linked
+workspace), so no spelling is known to keep the same folder. Their `~/...`
+entries now resolve under the environment root, and migration prints a warning
+naming the setting. Replace them with absolute paths to keep the original
+folders ([#972](https://github.com/openclaw/ocm/issues/972)). The trust roots
 `skills.load.allowSymlinkTargets` and `security.installPolicy.exec.trustedDirs`
 are not rewritten, because that would change what the new environment trusts:
 their `~/...` entries outside `~/.openclaw` now resolve under the environment
 root, and migration prints a warning naming each such setting. Replace those
-entries with absolute paths to keep trusting the original directories. In
-these warnings, `[]` in a setting name stands for a list entry. The source home
-is your home directory when the migrated directory is your own `~/.openclaw`,
+entries with absolute paths to keep trusting the original directories. In these
+warnings, `[]` in a setting name stands for a list entry. The source home is
+your home directory when the migrated directory is your own `~/.openclaw`,
 through any path that leads to it; otherwise it is the directory that contains
 the migrated `.openclaw` as you spelled it, or as it is stored when only that
 path is named `.openclaw`, or your home directory for a state directory with

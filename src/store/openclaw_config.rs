@@ -59,10 +59,11 @@ pub(crate) enum KeptHomeRelativeReason {
     /// A value under `~/.openclaw` with a `${VAR}` placeholder, which may
     /// lead outside the state directory once substituted.
     Placeholder,
-    /// A value resolved through links whose `..` passes through
-    /// `~/.openclaw`, where the copied state's links and directories decide
-    /// where it leads.
-    StateDirTraversal,
+    /// A node worker folder. OpenClaw resolves it to a real path and grants
+    /// workers access to it, and migration can change the links and
+    /// directories it resolves through, so no spelling is known to keep the
+    /// same folder.
+    WorkerFolder,
 }
 
 pub(crate) fn audit_openclaw_config(
@@ -236,14 +237,7 @@ pub(crate) fn rewrite_openclaw_config_for_migration(
     gateway_port: Option<u32>,
     sandbox_origin: Option<&str>,
 ) -> Result<OpenClawConfigRewriteOutcome, String> {
-    let kept = expand_migrated_home_relative_paths(
-        target_paths,
-        &HomeExpansion {
-            home: source_home,
-            source_state_dir: source_state_root,
-            target_state_dir: &target_paths.state_dir,
-        },
-    )?;
+    let kept = expand_migrated_home_relative_paths(target_paths, source_home)?;
     rewrite_migrated_plugin_load_paths(
         target_paths,
         source_state_root,
@@ -269,10 +263,10 @@ pub(crate) fn rewrite_openclaw_config_for_migration(
 /// although they may now resolve elsewhere.
 fn expand_migrated_home_relative_paths(
     target: &EnvPaths,
-    expansion: &HomeExpansion<'_>,
+    source_home: &Path,
 ) -> Result<BTreeSet<KeptHomeRelativeSetting>, String> {
     let mut kept = BTreeSet::new();
-    if !expansion.home.is_absolute() {
+    if !source_home.is_absolute() {
         return Ok(kept);
     }
     let Some(effective) = load_effective_openclaw_config(&target.config_path)? else {
@@ -287,7 +281,7 @@ fn expand_migrated_home_relative_paths(
         let mut rewritten = None;
         for mut scope in scopes {
             let mut candidate = value.clone();
-            expand_home_relative_paths_in_scope(&mut candidate, &mut scope, expansion, &mut kept);
+            expand_home_relative_paths_in_scope(&mut candidate, &mut scope, source_home, &mut kept);
             if rewritten
                 .as_ref()
                 .is_some_and(|previous| previous != &candidate)
@@ -306,24 +300,15 @@ fn expand_migrated_home_relative_paths(
     Ok(kept)
 }
 
-/// The home `~` named in the plain install, and the state directory the
-/// later relocation moves absolute values from and to.
-struct HomeExpansion<'a> {
-    home: &'a Path,
-    source_state_dir: &'a Path,
-    target_state_dir: &'a Path,
-}
-
 /// Expands the home-relative path settings in a config fragment included at
 /// `scope`, and records the settings it keeps as written although they may
 /// now resolve elsewhere. `$include` directives keep their own relocation.
 fn expand_home_relative_paths_in_scope(
     value: &mut Value,
     scope: &mut Vec<ConfigSegment>,
-    expansion: &HomeExpansion<'_>,
+    home: &Path,
     kept: &mut BTreeSet<KeptHomeRelativeSetting>,
 ) -> bool {
-    let home = expansion.home;
     match value {
         Value::String(raw) => {
             let Some(rule) = home_relative_path_setting(scope) else {
@@ -340,12 +325,12 @@ fn expand_home_relative_paths_in_scope(
                         None => return false,
                     }
                 }
-                HomePathRule::Physical => {
-                    match expand_physical_home_relative_path(raw, expansion) {
-                        Ok(Some(expanded)) => Ok(expanded),
-                        Ok(None) => return false,
-                        Err(reason) => Err(reason),
+                HomePathRule::WorkerFolder => {
+                    // OpenClaw does not trim these.
+                    if !is_home_relative(raw) {
+                        return false;
                     }
+                    Err(KeptHomeRelativeReason::WorkerFolder)
                 }
                 HomePathRule::TrustRoot => {
                     if expand_home_relative_path(raw, home, true).is_none()
@@ -374,7 +359,7 @@ fn expand_home_relative_paths_in_scope(
             let mut changed = false;
             for (index, nested) in values.iter_mut().enumerate() {
                 scope.push(ConfigSegment::Index(index));
-                changed |= expand_home_relative_paths_in_scope(nested, scope, expansion, kept);
+                changed |= expand_home_relative_paths_in_scope(nested, scope, home, kept);
                 scope.pop();
             }
             changed
@@ -383,7 +368,7 @@ fn expand_home_relative_paths_in_scope(
             let mut changed = false;
             for (key, nested) in values.iter_mut().filter(|(key, _)| *key != "$include") {
                 scope.push(ConfigSegment::Key(key.clone()));
-                changed |= expand_home_relative_paths_in_scope(nested, scope, expansion, kept);
+                changed |= expand_home_relative_paths_in_scope(nested, scope, home, kept);
                 scope.pop();
             }
             changed
@@ -398,9 +383,9 @@ enum HomePathRule {
     /// The leading `~` is replaced, after trimming when `trims` is set, and
     /// the path is resolved lexically.
     Lexical { trims: bool },
-    /// The leading `~` is replaced and the path is resolved through links
-    /// (`realpath`), so a link before `..` decides where it leads.
-    Physical,
+    /// A node worker folder, resolved to a real path and used as a
+    /// permission boundary. It stays as written and is reported.
+    WorkerFolder,
     /// A trust root. Spelling it out would change what the environment
     /// trusts, so it stays as written and is reported.
     TrustRoot,
@@ -463,10 +448,11 @@ const CONSUMER_HOME_PATH_SETTINGS: &[(&[&str], HomePathRule)] = &[
         HomePathRule::Lexical { trims: true },
     ),
     // src/node-host/node-worker-device-folder.ts: `expandHomePrefix`, then
-    // `fs.realpathSync.native`, without trimming.
+    // `fs.realpathSync.native`, without trimming, to decide which folders
+    // workers may use.
     (
         &["nodeHost", "workerRuns", "folders", "[]"],
-        HomePathRule::Physical,
+        HomePathRule::WorkerFolder,
     ),
     // src/skills/loading/symlink-targets.ts and src/security/install-policy.ts
     (
@@ -599,64 +585,6 @@ fn expand_home_relative_path(raw: &str, home: &Path, trims: bool) -> Option<Stri
         rest = rest.strip_prefix(std::path::is_separator).unwrap_or(rest);
     }
     Some(format!("{expanded}{rest}"))
-}
-
-/// Expands a setting OpenClaw resolves through links. Only the leading `~`
-/// is replaced: the consumer follows each link before the `..` after it,
-/// which removing `..` here would change. Returns `Ok(None)` for a value
-/// that keeps its meaning as written, such as one under `~/.openclaw` with
-/// no `..`, which already names the copied state directory. The later
-/// relocation of absolute state paths would move a spelled-out entry whose
-/// `..` or placeholder leads into the state directory to the copied state,
-/// whose links and directories migration may have changed (an imported
-/// workspace, for example), so it would no longer follow the source's links.
-/// Such an entry stays as written and is reported instead, as is a
-/// placeholder value under `~/.openclaw`.
-fn expand_physical_home_relative_path(
-    raw: &str,
-    expansion: &HomeExpansion<'_>,
-) -> Result<Option<String>, KeptHomeRelativeReason> {
-    let home = expansion.home;
-    if !is_home_relative(raw) {
-        return Ok(None);
-    }
-    let (literal, rest) = split_before_placeholder(raw);
-    let mut literal_path = home.as_os_str().to_os_string();
-    literal_path.push(&literal[1..]);
-    let literal_path = Path::new(&literal_path);
-    let has_parent = |path: &Path| {
-        path.components()
-            .any(|component| component == std::path::Component::ParentDir)
-    };
-    if literal_path.starts_with(home.join(".openclaw")) {
-        if !rest.is_empty() {
-            return Err(KeptHomeRelativeReason::Placeholder);
-        }
-        if !has_parent(literal_path) {
-            return Ok(None);
-        }
-    }
-    let Some(home_text) = home.to_str() else {
-        return Ok(None);
-    };
-    let expanded = format!("{home_text}{}", &raw[1..]);
-    // Probe a scratch copy with the same relocation that runs later: an
-    // entry it leaves alone keeps following the source's own links.
-    let mut relocated = expanded.clone();
-    if (has_parent(Path::new(&expanded)) || !rest.is_empty())
-        && rewrite_env_root_string(
-            &mut relocated,
-            expansion.source_state_dir,
-            expansion.target_state_dir,
-        )
-    {
-        return Err(if rest.is_empty() {
-            KeptHomeRelativeReason::StateDirTraversal
-        } else {
-            KeptHomeRelativeReason::Placeholder
-        });
-    }
-    Ok(Some(expanded))
 }
 
 /// Moves a Gateway port that a copied `$include` supplies to `gateway_port`,
@@ -3278,7 +3206,7 @@ mod tests {
         );
         assert_eq!(
             setting(&["nodeHost", "workerRuns", "folders", "[]"]),
-            Some(HomePathRule::Physical)
+            Some(HomePathRule::WorkerFolder)
         );
         assert_eq!(
             setting(&["skills", "load", "allowSymlinkTargets", "[]"]),
@@ -3315,61 +3243,6 @@ mod tests {
         ] {
             assert_eq!(setting(text), None, "{text:?}");
         }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn migration_home_expansion_keeps_link_traversal_for_physical_settings() {
-        let expansion = HomeExpansion {
-            home: Path::new("/home/alice"),
-            source_state_dir: Path::new("/home/alice/.openclaw"),
-            target_state_dir: Path::new("/envs/copied/.openclaw"),
-        };
-        let expand = |raw| expand_physical_home_relative_path(raw, &expansion).unwrap();
-        assert_eq!(expand("~/work").as_deref(), Some("/home/alice/work"));
-        assert_eq!(expand("~").as_deref(), Some("/home/alice"));
-        // `..` stays for the consumer to resolve after following `hop`.
-        assert_eq!(
-            expand("~/hop/../work").as_deref(),
-            Some("/home/alice/hop/../work")
-        );
-        // `..` that leaves the state directory is not moved into the copy.
-        assert_eq!(
-            expand("~/.openclaw/../work").as_deref(),
-            Some("/home/alice/.openclaw/../work")
-        );
-        assert_eq!(
-            expand("~/.openclaw/../../shared").as_deref(),
-            Some("/home/alice/.openclaw/../../shared")
-        );
-        // The relocation would resolve these through the copied state.
-        for traversal in ["~/.openclaw/missing/../wf", "~/.openclaw/a/../wf"] {
-            assert_eq!(
-                expand_physical_home_relative_path(traversal, &expansion),
-                Err(KeptHomeRelativeReason::StateDirTraversal),
-                "{traversal}"
-            );
-        }
-        assert_eq!(
-            expand("~/${SUB}/work").as_deref(),
-            Some("/home/alice/${SUB}/work")
-        );
-        // The consumer does not trim.
-        assert_eq!(expand(" ~/work"), None);
-        for copied in ["~/.openclaw", "~/.openclaw/wf"] {
-            assert_eq!(expand(copied), None, "{copied}");
-        }
-        for placeholder in ["~/.openclaw/${SUB}", "~/.openclaw/a/../${SUB}"] {
-            assert_eq!(
-                expand_physical_home_relative_path(placeholder, &expansion),
-                Err(KeptHomeRelativeReason::Placeholder),
-                "{placeholder}"
-            );
-        }
-        assert_eq!(
-            expand("~/.openclawish").as_deref(),
-            Some("/home/alice/.openclawish")
-        );
     }
 
     #[test]
