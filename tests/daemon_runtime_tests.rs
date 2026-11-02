@@ -6979,6 +6979,88 @@ fn back_to_back_service_restarts_keep_a_handoff_gateway_running() {
 }
 
 #[test]
+fn rejected_restart_inside_the_gateway_keeps_no_handoff_request() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("daemon-inside-gateway-restart-request");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    install_fake_service_manager(&root, &mut env);
+    let service = SupervisorService::new(&env, &cwd);
+    let runtime_path = root.child("ocm-home/supervisor/runtime.json");
+    let state_path = root.child("ocm-home/supervisor/state.json");
+
+    // `gateway restart` either rejects the request or accepts it for later,
+    // leaving the Gateway running, as OpenClaw does for a deferred restart.
+    let intent = root.child("restart-intent.txt");
+    let control = root.child("restart-control.txt");
+    let script = root.child("bin/openclaw.mjs");
+    write_executable_script(
+        &script,
+        &format!(
+            "#!/bin/sh\n{protocol}if [ \"${{1:-}}\" = gateway ] && [ \"${{2:-}}\" = restart ]; then\n  [ \"$(cat '{control}')\" = reject ] && exit 23\n  exit 0\nfi\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1 & wait $!; done\n",
+            protocol = restart_handoff_protocol_shell_snippet(&intent),
+            control = path_string(&control),
+        ),
+    );
+
+    let launcher = run_ocm(
+        &cwd,
+        &env,
+        &["launcher", "add", "dev", "--command", &path_string(&script)],
+    );
+    assert!(launcher.status.success(), "{}", stderr(&launcher));
+    let created = run_ocm(&cwd, &env, &["env", "create", "demo", "--launcher", "dev"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    set_service_enabled(&cwd, &env, "demo", true);
+    service.sync().unwrap();
+    service.install_daemon().unwrap();
+
+    let mut daemon = spawn_daemon_process(&cwd, &env);
+    // Always settle the owned daemon, including on a failed assertion.
+    let result = std::panic::catch_unwind(|| {
+        let runtime =
+            wait_for_runtime_children(&runtime_path, 1, Some("demo"), Duration::from_secs(10))
+                .expect("daemon did not start the Gateway");
+        let pid = runtime_child_pid(&runtime, "demo").unwrap();
+        assert_eq!(runtime["services"][0]["restartHandoff"], "protocol-v1");
+        let mut inside = env.clone();
+        inside.insert("OCM_ACTIVE_ENV".to_string(), "demo".to_string());
+        inside.insert("OPENCLAW_SERVICE_KIND".to_string(), "gateway".to_string());
+        let pending_requests = || {
+            read_persisted_service_state(&state_path)["handoffRestartRequests"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        };
+        let restart = |mode: &str| {
+            fs::write(&control, mode).unwrap();
+            run_ocm(&cwd, &inside, &["service", "restart", "demo", "--json"])
+        };
+
+        let rejected = restart("reject");
+        assert!(!rejected.status.success(), "{}", stdout(&rejected));
+        assert!(stderr(&rejected).contains("rejected the recovery-aware restart"));
+        assert!(pending_requests().is_empty());
+
+        let scheduled = restart("defer");
+        assert!(scheduled.status.success(), "{}", stderr(&scheduled));
+        let pending = pending_requests();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0]["pid"], pid);
+
+        // A rejected retry clears only its own request, not the scheduled one.
+        let retried = restart("reject");
+        assert!(!retried.status.success(), "{}", stdout(&retried));
+        assert_eq!(pending_requests(), pending);
+    });
+    stop_process(&mut daemon);
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
+}
+
+#[test]
 fn live_runtime_changes_recreate_missing_supervisor_state() {
     let _guard = daemon_runtime_test_lock();
     let root = TestDir::new("daemon-runtime-recovers-missing-state");

@@ -5394,6 +5394,25 @@ mod tests {
     }
 
     #[test]
+    fn handoff_restart_requests_keep_the_saved_plan_compatible() {
+        // A plan saved before handoff requests existed still loads.
+        let mut saved = serde_json::to_value(supervisor_state(Vec::new())).unwrap();
+        assert!(saved.get("handoffRestartRequests").is_none());
+        let loaded: SupervisorState = serde_json::from_value(saved.clone()).unwrap();
+        assert!(loaded.handoff_restart_requests.is_empty());
+
+        // A pending request is one optional field beside the existing ones,
+        // which a reader without the field ignores like any unknown field.
+        saved["handoffRestartRequests"] =
+            serde_json::json!([{"envName": "demo", "requestId": "r", "pid": 41}]);
+        let loaded: SupervisorState = serde_json::from_value(saved.clone()).unwrap();
+        assert_eq!(loaded.handoff_restart_requests.len(), 1);
+        saved["fieldFromANewerRelease"] = serde_json::json!(true);
+        let loaded: SupervisorState = serde_json::from_value(saved).unwrap();
+        assert_eq!(loaded.children, supervisor_state(Vec::new()).children);
+    }
+
+    #[test]
     fn plan_rewrites_keep_pending_handoff_restart_requests() {
         let root = unique_test_root("handoff-restart-request-rewrite");
         fs::create_dir_all(&root).unwrap();

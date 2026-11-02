@@ -300,10 +300,15 @@ pub fn restart_service(
         .map(|pid| supervisor.request_handoff_restart(name, pid))
         .transpose()?;
     let inside_gateway = restart_originates_inside_gateway(name, env);
-    let restarted = restart_through_handoff(name, before.child_pid, inside_gateway, env, cwd);
+    let helper = spawn_recovery_aware_restart(name, env, cwd);
     // The daemon takes the request when the Gateway exits. A restart scheduled
-    // from inside the Gateway returns before that exit, so leave it there.
-    let Some(request_id) = handoff_request.filter(|_| !inside_gateway) else {
+    // from inside the Gateway returns before that exit, so leave it there; one
+    // OpenClaw rejected or never started is cleared like any other.
+    let scheduled_inside_gateway = inside_gateway && helper.is_ok();
+    let restarted = helper.and_then(|helper| {
+        restart_through_handoff(name, before.child_pid, inside_gateway, helper, env, cwd)
+    });
+    let Some(request_id) = handoff_request.filter(|_| !scheduled_inside_gateway) else {
         return restarted;
     };
     let clear_result = supervisor.clear_handoff_restart_request(name, &request_id);
@@ -316,16 +321,15 @@ pub fn restart_service(
     Ok(summary)
 }
 
-/// Ask OpenClaw to hand off a restart of the running Gateway.
+/// Finish a restart handoff once OpenClaw's restart helper has started.
 fn restart_through_handoff(
     name: &str,
     previous_pid: Option<u32>,
     inside_gateway: bool,
+    mut helper: Child,
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<ServiceActionSummary, String> {
-    let mut helper = spawn_recovery_aware_restart(name, env, cwd)?;
-
     if inside_gateway {
         let mut warnings = vec![
             "recovery-aware restart was scheduled without waiting because the request originated inside the target gateway; OpenClaw will preserve and resume eligible interrupted work after restart"
