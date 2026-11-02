@@ -1035,6 +1035,14 @@ fn upgrade_batch_continue_keeps_gateway_refused_before_cutover() {
     assert_eq!(peer["rollback"], "disabled", "{peer}");
     let note = peer["note"].as_str().unwrap();
     assert!(!note.contains("left the gateway stopped"), "{note}");
+    let registry: Value = serde_json::from_slice(&fs::read(&registry_path).unwrap()).unwrap();
+    let peer_entry = registry["envs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "peer")
+        .unwrap();
+    assert_eq!(peer_entry["serviceEnabled"], false, "{peer_entry}");
     assert_eq!(desired_running(), false);
     let history = run_ocm(&cwd, &env, &["upgrade", "history", "demo", "--json"]);
     assert!(history.status.success(), "{}", stderr(&history));
