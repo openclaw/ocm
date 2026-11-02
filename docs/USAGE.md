@@ -1254,6 +1254,17 @@ the source home, including symlink escapes, remain rejected.
 The existing restrictions on include-owned agent workspaces and sandbox origins
 still apply.
 
+Migration and adoption also spell out home-relative config values. A plain
+install expands `~` against your home, but the new environment runs with
+`OPENCLAW_HOME` set to its root, so OpenClaw expands `~` against the environment
+root instead. A `~/...` value outside `~/.openclaw`, such as a local plugin in
+`plugins.load.paths`, a `skills.load.extraDirs` entry, an agent directory or a
+session or cron store, is therefore rewritten in `openclaw.json` and its copied
+includes to the absolute path it named in the source home. Values under
+`~/.openclaw` already name the environment's copied state and stay as written,
+as does a bare `~`. Clone and archive import keep `~/...` values unchanged,
+because their source already expands `~` against an environment root.
+
 Migration and adoption give the new environment its own Gateway port. A
 `gateway.port` set in the copied `openclaw.json` or in one of its copied
 `$include` files moves to the port OCM assigned, together with an MCP app

@@ -209,6 +209,7 @@ pub(crate) fn rewrite_openclaw_config_for_migration(
     gateway_port: Option<u32>,
     sandbox_origin: Option<&str>,
 ) -> Result<OpenClawConfigRewriteOutcome, String> {
+    expand_migrated_home_relative_paths(target_paths, source_state_root)?;
     rewrite_migrated_plugin_load_paths(
         target_paths,
         source_state_root,
@@ -223,6 +224,74 @@ pub(crate) fn rewrite_openclaw_config_for_migration(
         gateway_port,
         SandboxOriginPolicy::NewEnvironment(sandbox_origin),
     )
+}
+
+/// A plain install expands `~` against the user's home, but the environment
+/// runs with `OPENCLAW_HOME` set to its root, which OpenClaw expands `~`
+/// against instead. Values under `~/.openclaw` already name the copied state
+/// directory; every other `~/` value is spelled out against the source home so
+/// it keeps naming the same location. Absolute values inside the source state
+/// directory are then relocated by the later rewrites.
+fn expand_migrated_home_relative_paths(
+    target: &EnvPaths,
+    source_state_root: &Path,
+) -> Result<(), String> {
+    let source_state_root = clean_path(source_state_root);
+    let Some(source_home) = source_state_root.parent() else {
+        return Ok(());
+    };
+    let expand = |value: &mut Value| expand_home_relative_paths(value, source_home);
+    if let Some(mut value) = read_config_value(&target.config_path)?
+        && expand(&mut value)
+    {
+        write_config_value(&target.config_path, &value)?;
+    }
+    rewrite_openclaw_config_includes_with_path_rewriter(
+        &target.config_path,
+        &target.state_dir,
+        expand,
+    )?;
+    Ok(())
+}
+
+/// Expands `~/` string values against `home`. `$include` directives keep
+/// their own relocation.
+fn expand_home_relative_paths(value: &mut Value, home: &Path) -> bool {
+    match value {
+        Value::String(raw) => {
+            let Some(expanded) = expand_home_relative_path(raw, home) else {
+                return false;
+            };
+            *raw = expanded;
+            true
+        }
+        Value::Array(values) => values.iter_mut().fold(false, |changed, nested| {
+            expand_home_relative_paths(nested, home) || changed
+        }),
+        Value::Object(values) => values
+            .iter_mut()
+            .filter(|(key, _)| key.as_str() != "$include")
+            .fold(false, |changed, (_, nested)| {
+                expand_home_relative_paths(nested, home) || changed
+            }),
+        _ => false,
+    }
+}
+
+fn expand_home_relative_path(raw: &str, home: &Path) -> Option<String> {
+    let trimmed = raw.trim();
+    // A bare `~` is left alone: it is also an ordinary non-path setting value.
+    if !trimmed.starts_with("~/") && !trimmed.starts_with("~\\") {
+        return None;
+    }
+    // Expand as OpenClaw does, by replacing the leading `~`.
+    let mut expanded = home.as_os_str().to_os_string();
+    expanded.push(&trimmed[1..]);
+    let expanded = PathBuf::from(expanded);
+    if clean_path(&expanded).starts_with(home.join(".openclaw")) {
+        return None;
+    }
+    expanded.to_str().map(str::to_string)
 }
 
 /// Moves a Gateway port that a copied `$include` supplies to `gateway_port`,

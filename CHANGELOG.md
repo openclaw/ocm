@@ -9,6 +9,7 @@ All notable changes to OCM are documented here.
 - Run advertised native isolated-core-startup preflight from prepared upgrade candidates before stopping the source gateway, and leave it running when readiness is blocked or unverified. Preserve cold finalization for packages without the capability.
 - Skip incompatible OS- or architecture-specific plugins when including source extensions in a local runtime build. Refuse explicitly required incompatible plugins without changing the target environment's config, and pack compatible source plugins through native npm paths on Windows.
 - Find the installed npm launcher by default when building and installing runtimes on Windows.
+- Keep `~/...` config paths outside `~/.openclaw`, such as local plugin, extra skills, agent directory and session or cron store paths, pointing at the same location after `migrate` and `adopt import`, instead of letting them resolve under the new environment root.
 
 ## 0.3.8 - 2026-10-29
 
