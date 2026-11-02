@@ -740,6 +740,9 @@ directory modes under a private environment root and leaves it stopped;
 export leaves the source unchanged.
 Archive ownership and extended ACLs are not transferred; the private root
 prevents broader access when those restrictions cannot be reproduced.
+Clone, ordinary archive import, `migrate` and `adopt import` keep each copied
+directory's mode rather than the invoking shell's umask, so a private (0700)
+`.openclaw` or workspace directory stays private in the copy.
 An explicit `env import --sandbox-origin` still replaces that setting.
 
 Export JSON reports `includeState`; its human summary also reports whether
