@@ -127,8 +127,12 @@ fn skip_double_quotes(bytes: &[u8], start: usize) -> Option<usize> {
 
 /// The offset just past the `${...}` expansion opening at `start`, or `None`
 /// unless it closes before any quote, `$`, backquote, backslash, brace or
-/// newline.
+/// newline. Bash 5.3 reads `${ command; }` and `${| command; }` as command
+/// substitutions, so a blank or `|` after `${` also returns `None`.
 fn skip_parameter(bytes: &[u8], start: usize) -> Option<usize> {
+    if matches!(bytes.get(start + 2), Some(b' ' | b'\t' | b'\n' | b'|')) {
+        return None;
+    }
     let offset = bytes[start + 2..].iter().position(|&byte| {
         matches!(
             byte,
