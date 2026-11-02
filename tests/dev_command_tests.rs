@@ -2664,7 +2664,7 @@ fn dev_ui_claims_an_address_before_the_listener_starts() {
     let message = stderr(&rejected);
     assert!(
         message.contains(&format!(
-            "retained UI port {second_port} for env second is claimed by env claimer's Gateway port"
+            "retained UI port {second_port} for env second is claimed by the Gateway port family of env claimer"
         )) && message.contains("--no-ui")
             && !message.contains("occupied or reserved"),
         "{message}"

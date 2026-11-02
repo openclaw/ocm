@@ -267,16 +267,25 @@ mod tests {
         let claimed = refusal(&[alpha.clone(), other.clone()]);
         assert!(
             claimed.contains(&format!(
-                "retained UI port {port} for env alpha is claimed by env other's Gateway port family"
+                "retained UI port {port} for env alpha is claimed by the Gateway port family of env other"
             )) && claimed.contains("--no-ui")
                 && !claimed.contains("occupied or reserved"),
             "{claimed}"
         );
 
+        // Every claimer is named, so removing one is not promised to free the port.
+        let mut another = other.clone();
+        another.name = "another".to_string();
+        let both = refusal(&[alpha.clone(), other.clone(), another]);
+        assert!(
+            both.contains("Gateway port family of env another, other;"),
+            "{both}"
+        );
+
         // The environment's own family cannot be released by removing it.
         let mut own = alpha.clone();
         own.gateway_port = Some(port - 1);
-        let own_claim = refusal(&[own]);
+        let own_claim = refusal(&[own.clone(), other.clone()]);
         assert!(
             own_claim.contains("is inside its own Gateway port family")
                 && own_claim.contains("--no-ui")

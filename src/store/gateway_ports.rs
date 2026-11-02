@@ -210,25 +210,34 @@ pub(super) fn choose_source_ui_port(
         if !(1..=u16::MAX as u32).contains(&port) {
             return Err(format!("env {} has an invalid retained UI port", meta.name));
         }
-        let gateway_owner = |own: bool| {
+        let gateway_claims = |own: bool| {
             gateway_ports
                 .iter()
                 .filter(|(name, _)| (**name == meta.name) == own)
-                .find_map(|(name, base)| {
+                .filter_map(|(name, base)| {
                     let (start, end) = openclaw_port_family_range(*base.as_ref().ok()?);
-                    (start..=end).contains(&port).then_some((name, start, end))
+                    (start..=end)
+                        .contains(&port)
+                        .then_some((name.as_str(), start, end))
                 })
+                .collect::<Vec<_>>()
         };
-        if let Some((owner, start, end)) = gateway_owner(false) {
-            return Err(format!(
-                "retained UI port {port} for env {} is claimed by env {owner}'s Gateway port family {start}..={end}; remove env {owner} to release it, or start with --no-ui",
-                meta.name,
-            ));
-        }
-        if let Some((_, start, end)) = gateway_owner(true) {
+        // Removing other envs never frees an address the env's own family holds.
+        if let Some((_, start, end)) = gateway_claims(true).first() {
             return Err(format!(
                 "retained UI port {port} for env {} is inside its own Gateway port family {start}..={end}; start with --no-ui",
                 meta.name,
+            ));
+        }
+        let claimers: Vec<_> = gateway_claims(false)
+            .into_iter()
+            .map(|(name, _, _)| name)
+            .collect();
+        if !claimers.is_empty() {
+            return Err(format!(
+                "retained UI port {port} for env {} is claimed by the Gateway port family of env {}; remove every claiming env to release it, or start with --no-ui",
+                meta.name,
+                claimers.join(", "),
             ));
         }
         if !available(port) {
