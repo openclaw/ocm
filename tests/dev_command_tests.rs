@@ -10328,16 +10328,18 @@ fn dev_reaches_envs_named_like_its_commands_after_a_separator() {
     let help = run_ocm(&cwd, &env, &["dev", "help"]);
     assert!(help.status.success(), "{}", stderr(&help));
     assert!(stdout(&help).starts_with("Development envs"));
-    let named = run_ocm(&cwd, &env, &["dev", "status", "stop"]);
-    assert!(!named.status.success());
-    assert!(
-        stderr(&named).contains("environment \"stop\" is not a dev env"),
-        "{}",
-        stderr(&named)
-    );
-    assert!(
-        !stderr(&named).contains("was read as"),
-        "{}",
-        stderr(&named)
-    );
+    for target in ["stop", " stop "] {
+        let named = run_ocm(&cwd, &env, &["dev", "status", target]);
+        assert!(!named.status.success());
+        assert!(
+            stderr(&named).contains("environment \"stop\" is not a dev env"),
+            "{target:?}: {}",
+            stderr(&named)
+        );
+        assert!(
+            !stderr(&named).contains("was read as"),
+            "{target:?}: {}",
+            stderr(&named)
+        );
+    }
 }

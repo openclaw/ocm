@@ -10688,29 +10688,26 @@ fn upgrade_reaches_envs_named_like_its_commands_after_a_separator() {
         "{}",
         stderr(&rollback)
     );
-    let fleet = run_ocm(
-        root.path(),
-        &env,
-        &[
-            "upgrade",
-            "batch",
-            "--runtime",
-            "manual",
-            "--envs",
-            "mira,status",
-        ],
-    );
-    assert!(!fleet.status.success());
-    assert!(
-        stderr(&fleet).contains("--accept-fleet-outage"),
-        "{}",
-        stderr(&fleet)
-    );
-    assert!(
-        !stderr(&fleet).contains("was read as"),
-        "{}",
-        stderr(&fleet)
-    );
+    for selection in [
+        vec!["--envs", "mira,status"],
+        vec!["--envs", " mira , status "],
+        vec!["--envs=mira,status"],
+    ] {
+        let mut args = vec!["upgrade", "batch", "--runtime", "manual"];
+        args.extend(selection);
+        let fleet = run_ocm(root.path(), &env, &args);
+        assert!(!fleet.status.success(), "{args:?}");
+        assert!(
+            stderr(&fleet).contains("--accept-fleet-outage"),
+            "{args:?}: {}",
+            stderr(&fleet)
+        );
+        assert!(
+            !stderr(&fleet).contains("was read as"),
+            "{args:?}: {}",
+            stderr(&fleet)
+        );
+    }
     let help = run_ocm(root.path(), &env, &["upgrade", "help"]);
     assert!(help.status.success(), "{}", stderr(&help));
     assert!(stdout(&help).starts_with("Upgrade environments"));
