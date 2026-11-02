@@ -896,11 +896,6 @@ fn assert_interrupted_download_removes_its_temporary_directory(
         }
     }
 
-    // The update keeps signals it inherits as ignored, so start it from the
-    // default dispositions whatever this test runner inherited.
-    for default in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
-        unsafe { libc::signal(default, libc::SIG_DFL) };
-    }
     let root = TestDir::new(label);
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
@@ -956,27 +951,27 @@ fn assert_interrupted_download_removes_its_temporary_directory(
 
     let output_path = root.child("update.out");
     let output = fs::File::create(&output_path).unwrap();
-    let update_args = ["self", "update", "--version", "9.9.9", "--raw"];
-    let mut command = match inherited_ignored {
-        // As `nohup` starts it: the shell's ignored disposition survives exec.
-        Some(ignored) => {
-            // An absolute shell keeps std on posix_spawn; a forked child would
-            // hold other tests' freshly copied binaries open (ETXTBSY).
-            let mut command = Command::new("/bin/sh");
-            command
-                .arg("-c")
-                .arg(format!("trap '' {ignored}; exec \"$0\" \"$@\""))
-                .arg(&copied_binary)
-                .args(update_args);
-            command
-        }
-        None => {
-            let mut command = Command::new(&copied_binary);
-            command.args(update_args);
-            command
-        }
+    // The update keeps signals it inherits as ignored, so start it from the
+    // default dispositions whatever this test runner inherited, ignoring only
+    // `inherited_ignored` as `nohup` would. An absolute launcher keeps std on
+    // posix_spawn; a forked child would hold other tests' freshly copied
+    // binaries open for writing (ETXTBSY).
+    let ignored = match inherited_ignored {
+        Some(libc::SIGHUP) => "HUP",
+        Some(other) => panic!("unsupported inherited ignored signal {other}"),
+        None => "",
     };
+    let mut command = Command::new("/usr/bin/perl");
     command
+        .args([
+            "-e",
+            "my $ignored = shift; $SIG{$_} = 'DEFAULT' for qw(INT TERM HUP); \
+             $SIG{$ignored} = 'IGNORE' if length $ignored; \
+             exec { $ARGV[0] } @ARGV or die \"exec: $!\";",
+            ignored,
+        ])
+        .arg(&copied_binary)
+        .args(["self", "update", "--version", "9.9.9", "--raw"])
         .current_dir(&cwd)
         .env_clear()
         .envs(&env)
