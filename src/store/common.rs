@@ -262,8 +262,10 @@ pub(crate) fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()
 }
 
 /// Source directory modes an environment copy keeps. Each directory the copy
-/// creates takes its source mode once populated, except that its owner keeps
-/// full access until the operation that owns the copy finishes writing into it.
+/// creates takes its source mode before any entry is copied into it, except
+/// that its owner keeps full access until the operation that owns the copy
+/// finishes writing into it.
+#[must_use = "restore the copied directory modes once the copy is complete"]
 #[derive(Default)]
 pub(crate) struct CopiedDirectoryModes(Vec<(PathBuf, fs::Permissions)>);
 
@@ -284,10 +286,13 @@ impl CopiedDirectoryModes {
         Ok(())
     }
 
-    /// Apply the owner restrictions after the last write into the copy. Children
-    /// were recorded before their parents, so traversal access lasts until needed.
+    /// Apply the owner restrictions after the last write into the copy, deepest
+    /// first: a restricted parent can withhold the access its children need,
+    /// including children a later overlay copied into it.
     pub(crate) fn restore(self) -> Result<(), String> {
-        for (path, permissions) in self.0 {
+        let mut directories = self.0;
+        directories.sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
+        for (path, permissions) in directories {
             match fs::symlink_metadata(&path) {
                 Ok(metadata) if metadata.is_dir() => {
                     fs::set_permissions(&path, permissions).map_err(|error| error.to_string())?
@@ -609,6 +614,15 @@ fn copy_dir_recursive_inner(
     } else {
         ensure_dir(destination)?;
     }
+    if let Some(modes) = modes.as_deref_mut().filter(|_| created) {
+        // Restrict other users before any entry is copied in.
+        modes.keep(
+            destination,
+            fs::metadata(source)
+                .map_err(|error| error.to_string())?
+                .permissions(),
+        )?;
+    }
 
     let entries = fs::read_dir(source)
         .map_err(|error| error.to_string())?
@@ -710,13 +724,6 @@ fn copy_dir_recursive_inner(
             .map_err(|error| error.to_string())?
             .permissions();
         fs::set_permissions(destination, permissions).map_err(|error| error.to_string())?;
-    } else if let Some(modes) = modes.filter(|_| created) {
-        modes.keep(
-            destination,
-            fs::metadata(source)
-                .map_err(|error| error.to_string())?
-                .permissions(),
-        )?;
     }
     Ok(())
 }
@@ -1020,6 +1027,38 @@ pub(crate) fn load_json_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
 #[cfg(test)]
 mod tests {
     use super::{copy_dir_recursive, copy_dir_with_sqlite_snapshots, write_file_replacing_path};
+
+    #[cfg(unix)]
+    #[test]
+    fn copied_directory_modes_restore_children_before_their_parents() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode =
+            |path: &std::path::Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("parent");
+        let child = parent.join("child");
+        fs::create_dir_all(&child).unwrap();
+        let mut modes = super::CopiedDirectoryModes::default();
+        // A later overlay records the child after its parent; once the parent
+        // loses search access, the child could no longer be restored.
+        modes
+            .keep(&parent, fs::Permissions::from_mode(0o400))
+            .unwrap();
+        modes
+            .keep(&child, fs::Permissions::from_mode(0o555))
+            .unwrap();
+        assert_eq!(mode(&parent), 0o700);
+        assert_eq!(mode(&child), 0o755);
+
+        modes.restore().unwrap();
+        assert_eq!(
+            fs::symlink_metadata(&parent).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(mode(&child), 0o555);
+        fs::set_permissions(&child, fs::Permissions::from_mode(0o755)).unwrap();
+    }
 
     use std::fs;
     use std::path::PathBuf;
@@ -1460,7 +1499,10 @@ mod tests {
             writers.push(db);
         }
 
-        copy_dir_with_sqlite_snapshots(&source, &target, &source).unwrap();
+        copy_dir_with_sqlite_snapshots(&source, &target, &source)
+            .unwrap()
+            .restore()
+            .unwrap();
         for relative in [
             "skill-workshop/proposals/example/support/data.sqlite",
             "audit/system-agent.jsonl.migrated.2",
@@ -1573,7 +1615,10 @@ mod tests {
             fs::write(storage.join("fixture.sqlite-wal"), b"opaque sidecar").unwrap();
             let target = fixture.path().join("target");
 
-            copy_dir_with_sqlite_snapshots(&source, &target, &state).unwrap();
+            copy_dir_with_sqlite_snapshots(&source, &target, &state)
+                .unwrap()
+                .restore()
+                .unwrap();
 
             for (path, (main, wal)) in paths.iter().zip(originals) {
                 let copied = target.join(path.strip_prefix(&source).unwrap());
@@ -1634,7 +1679,10 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
         symlink("missing", source.join("broken.sqlite")).unwrap();
         symlink("memory/main.sqlite", source.join("linked.sqlite")).unwrap();
-        copy_dir_with_sqlite_snapshots(&source, &target, &source).unwrap();
+        copy_dir_with_sqlite_snapshots(&source, &target, &source)
+            .unwrap()
+            .restore()
+            .unwrap();
         assert_eq!(
             fs::metadata(target.join("memory/main.sqlite"))
                 .unwrap()

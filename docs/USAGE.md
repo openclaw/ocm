@@ -1813,7 +1813,8 @@ export leaves the source unchanged.
 Archive ownership and extended ACLs are not transferred; the private root
 prevents broader access when those restrictions cannot be reproduced.
 Ordinary archive import, `migrate` and `adopt import` keep each copied
-directory's mode as clone does, without making the environment root private.
+directory's mode as clone does, without making the environment root private;
+an existing empty `--root` keeps its own mode.
 An explicit `env import --sandbox-origin` still replaces that setting.
 
 Export JSON reports `includeState`; its human summary also reports whether
