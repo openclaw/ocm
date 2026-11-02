@@ -789,9 +789,20 @@ fn option_shaped_arguments_never_replace_declared_paths() {
         serde_json::json!([declared])
     );
 
-    // A directory whose name begins with - remains declarable as ./<name>.
+    // A directory whose name begins with - remains declarable as ./<name>,
+    // and a leading ./ on any path is dropped before it is stored.
     fs::create_dir_all(fixture.state.parent().unwrap().join("-odd")).unwrap();
-    let dotted = fixture.run(&["env", "set-independent-paths", "demo", "./-odd", declared]);
+    let bare = fixture.run(&["env", "set-independent-paths", "demo", "-odd"]);
+    assert!(!bare.status.success(), "bare -odd was accepted");
+    assert_eq!(declared_paths(&fixture), serde_json::json!([declared]));
+    let dotted_declared = format!("./{declared}");
+    let dotted = fixture.run(&[
+        "env",
+        "set-independent-paths",
+        "demo",
+        "./-odd",
+        &dotted_declared,
+    ]);
     assert!(dotted.status.success(), "{}", stderr(&dotted));
     assert_eq!(
         declared_paths(&fixture),
