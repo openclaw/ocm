@@ -1228,6 +1228,7 @@ Automatic Gateway port selection searches upward from the preferred port through
 
 Clone copies the workspace and env config into a new environment, gives the clone its own gateway port, rewrites env-scoped OpenClaw config paths under the new env root, keeps durable agent auth/settings for the same user, clears copied runtime residue like sessions, logs, and backups, and keeps the background service separate. Configured agent directories inside the environment retain their payloads through clone and ordinary export/import, including custom and nested locations.
 Clone, migration and adoption copy regular files, directories and symlinks. Unix sockets, FIFOs and device files in the copied home or workspaces hold no data and are left out, as in environment export; the source keeps them, and their owning processes recreate them when needed.
+Clone recreates an absolute link into the source environment as a relative link to the same location in the clone, so the clone does not keep reading or writing the source; a link to state the clone clears, such as logs, points at the clone's location. Relative links, links outside the environment and links inside saved skill-library and Skill Workshop revisions keep their targets.
 Clone retains shared managed skills under `.openclaw/skills` and their global ClawHub tracking metadata under `.openclaw/.clawhub`.
 Clone and upgrade simulation preserve supported internal OpenClaw `$include` graphs, including nested absolute directives and shared include arrays. Absolute directives select the copied files; relative directives and source files stay unchanged. Includes must remain inside the configuration directory. Ordinary clone retains its restrictions on include-owned agent workspaces and sandbox origins, while simulation retains its identity overlay.
 Agent directories remain separate from workspaces; external locations and paths reached through symlinks are rejected by these copy operations.
@@ -1726,7 +1727,12 @@ Other root spellings retain the default export refusal, even when another alias 
 External workspaces, the environment root itself and workspace paths redirected by internal symlinks remain refused.
 
 Within the selected content, ordinary export preserves symlinks, including links
-named `*.sqlite`, without copying their targets. Regular `*.sqlite` files still
+named `*.sqlite`, without copying their targets. An absolute link into the
+environment, including a dangling one, is archived with a relative target to the
+same location, as clone recreates it, so an import does not keep reading or
+writing the source environment; a link to content the archive omits, such as
+logs, points at that location in the imported copy. Relative links keep their
+authored targets. Regular `*.sqlite` files still
 use coherent committed snapshots, including uncheckpointed WAL writes, and omit
 raw database sidecars. If a source parent is replaced during acquisition, export
 retries from its captured root or fails without publishing a partial archive; it

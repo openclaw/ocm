@@ -11,7 +11,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use super::openclaw_state::{OpenClawSqliteCopy, is_sqlite_database};
-use super::openclaw_workspaces::canonicalize_path_allow_missing;
+use crate::infra::archive::{relative_link_target, root_relative_link_target};
 use crate::infra::file_identity::{FileIdentity, file_identity};
 use crate::infra::sqlite_snapshot::create_sqlite_snapshot;
 
@@ -361,12 +361,15 @@ pub(crate) fn remove_owned_tree(path: &Path) -> Result<(), String> {
 
 // Clone and migration opt in; package, archive restore, and checkpoint callers
 // retain the raw copy contract. Protected historical payloads remain byte copies.
+// A clone must not keep reading or writing its source through absolute links.
 pub(crate) fn copy_dir_with_sqlite_snapshots(
     source: &Path,
     destination: &Path,
     state_root: &Path,
 ) -> Result<(), String> {
-    OpenClawDirectoryCopy::new(state_root, source)?.copy(source, destination)
+    let mut copying = OpenClawDirectoryCopy::new(state_root, source)?;
+    copying.relocate_internal_links(source, destination)?;
+    copying.copy(source, destination)
 }
 
 // One operation retains destination ownership through every migration overlay.
@@ -385,66 +388,9 @@ pub(crate) struct OpenClawDirectoryCopy<'a> {
 struct InternalLinkRoots {
     source: PathBuf,
     destination: PathBuf,
-}
-
-impl InternalLinkRoots {
-    // Match the home prefix as spelled (including aliases of the home) so
-    // in-home link chains and links through in-home external links keep
-    // their meaning. Fall back to full resolution for external aliases.
-    fn source_relative(&self, target: &Path) -> Result<Option<PathBuf>, String> {
-        for ancestor in target.ancestors().collect::<Vec<_>>().into_iter().rev() {
-            if !fs::canonicalize(ancestor).is_ok_and(|resolved| resolved == self.source) {
-                continue;
-            }
-            let remainder = target
-                .strip_prefix(ancestor)
-                .map_err(|error| error.to_string())?;
-            if remainder
-                .components()
-                .all(|component| matches!(component, std::path::Component::Normal(_)))
-            {
-                return Ok(Some(remainder.to_path_buf()));
-            }
-            // Parent components follow links; only full resolution is exact.
-            let resolved = canonicalize_path_allow_missing(target).map_err(|error| {
-                format!(
-                    "cannot relocate a link into the source home: {}: {error}",
-                    target.display()
-                )
-            })?;
-            return Ok(resolved
-                .strip_prefix(&self.source)
-                .ok()
-                .map(Path::to_path_buf));
-        }
-        Ok(canonicalize_path_allow_missing(target)
-            .ok()
-            .and_then(|resolved| {
-                resolved
-                    .strip_prefix(&self.source)
-                    .ok()
-                    .map(Path::to_path_buf)
-            }))
-    }
-}
-
-fn relative_link_target(link_parent: &Path, target: &Path) -> PathBuf {
-    let common = link_parent
-        .components()
-        .zip(target.components())
-        .take_while(|(left, right)| left == right)
-        .count();
-    let mut relative = PathBuf::new();
-    for _ in link_parent.components().skip(common) {
-        relative.push("..");
-    }
-    for part in target.components().skip(common) {
-        relative.push(part);
-    }
-    if relative.as_os_str().is_empty() {
-        relative.push(".");
-    }
-    relative
+    // Resolved state root, which protected history is measured from. It is
+    // the copied root for migration and inside it for clone.
+    state: PathBuf,
 }
 
 impl<'a> OpenClawDirectoryCopy<'a> {
@@ -470,6 +416,9 @@ impl<'a> OpenClawDirectoryCopy<'a> {
         self.internal_links = Some(InternalLinkRoots {
             source: fs::canonicalize(source_root).map_err(|error| error.to_string())?,
             destination: destination_root.to_path_buf(),
+            // A missing state root holds no history to exempt.
+            state: fs::canonicalize(self.selection.state_root())
+                .unwrap_or_else(|_| self.selection.state_root().to_path_buf()),
         });
         Ok(())
     }
@@ -505,12 +454,12 @@ impl<'a> OpenClawDirectoryCopy<'a> {
             .map_err(|error| error.to_string())?
             .join(source_link.file_name().ok_or("copied link has no name")?);
         if link_location
-            .strip_prefix(&roots.source)
+            .strip_prefix(&roots.state)
             .is_ok_and(|relative| self.selection.preserves_history(relative))
         {
             return Ok(None);
         }
-        let Some(inside) = roots.source_relative(target)? else {
+        let Some(inside) = root_relative_link_target(&roots.source, target) else {
             return Ok(None);
         };
         // A copy that contains the target keeps its own copy self-contained,
@@ -1690,7 +1639,7 @@ mod archive_privacy_windows_tests {
             &output,
             EnvArchiveOptions {
                 sqlite_content_roots: BTreeSet::from([PathBuf::new()]),
-                relocate_internal_symlinks: true,
+                symlink_relocation: crate::infra::archive::SymlinkRelocation::Owned,
                 private_output: true,
                 ..EnvArchiveOptions::default()
             },
