@@ -188,6 +188,17 @@ pub struct SupervisorRestartRequest {
     pub request_id: String,
 }
 
+/// A restart handoff `ocm service restart` asked the Gateway with this PID to
+/// perform. The daemon takes it when that Gateway exits with an accepted
+/// handoff, so the requested restart is not counted as a restart loop.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SupervisorHandoffRestartRequest {
+    pub env_name: String,
+    pub request_id: String,
+    pub pid: u32,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SupervisorState {
@@ -199,6 +210,8 @@ pub struct SupervisorState {
     pub skipped_envs: Vec<SkippedSupervisorEnv>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub restart_requests: Vec<SupervisorRestartRequest>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub handoff_restart_requests: Vec<SupervisorHandoffRestartRequest>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1188,6 +1201,53 @@ impl<'a> SupervisorService<'a> {
         Ok(())
     }
 
+    /// Record that this command asks the Gateway with `pid` to hand off a
+    /// restart, before the handoff is requested from OpenClaw.
+    pub fn request_handoff_restart(&self, name: &str, pid: u32) -> Result<String, String> {
+        let request_id = supervisor_restart_request_id()?;
+        let state_path = supervisor_state_path(self.env, self.cwd)?;
+        let _lock = lock_supervisor_state(&state_path)?;
+        let (state_path, mut state) = self.read_persisted_state()?;
+        if active_child_spec(&state, name).is_none() {
+            return Err(format!(
+                "env \"{name}\" is not present in the persisted supervisor state"
+            ));
+        }
+        // A request for an earlier Gateway is stale. One for this Gateway may
+        // still be pending from a restart scheduled inside it; keep it, so a
+        // failed retry clearing its own request cannot revoke that one.
+        state
+            .handoff_restart_requests
+            .retain(|request| request.env_name != name || request.pid == pid);
+        state
+            .handoff_restart_requests
+            .push(SupervisorHandoffRestartRequest {
+                env_name: name.to_string(),
+                request_id: request_id.clone(),
+                pid,
+            });
+        write_json(&state_path, &state)?;
+        Ok(request_id)
+    }
+
+    pub fn clear_handoff_restart_request(
+        &self,
+        name: &str,
+        request_id: &str,
+    ) -> Result<(), String> {
+        let state_path = supervisor_state_path(self.env, self.cwd)?;
+        let _lock = lock_supervisor_state(&state_path)?;
+        let (state_path, mut state) = self.read_persisted_state()?;
+        let previous_len = state.handoff_restart_requests.len();
+        state
+            .handoff_restart_requests
+            .retain(|request| !(request.env_name == name && request.request_id == request_id));
+        if state.handoff_restart_requests.len() != previous_len {
+            write_json(&state_path, &state)?;
+        }
+        Ok(())
+    }
+
     pub fn daemon_status(&self) -> Result<SupervisorDaemonSummary, String> {
         self.daemon_summary("status", false)
     }
@@ -1366,6 +1426,7 @@ impl<'a> SupervisorService<'a> {
             children,
             skipped_envs,
             restart_requests: Vec::new(),
+            handoff_restart_requests: Vec::new(),
         })
     }
 
@@ -1969,6 +2030,8 @@ struct ExitedSupervisorChild {
     restart_count: usize,
     quick_clean_restart_count: usize,
     restart_handoff: RestartHandoffConsumeResult,
+    /// The accepted handoff is one `ocm service restart` requested.
+    requested_restart: bool,
     ran_for: Duration,
 }
 
@@ -2404,6 +2467,7 @@ fn preserve_persisted_restart_requests(state_path: &Path, state: &mut Supervisor
     };
 
     preserve_restart_requests(state, persisted_state.restart_requests);
+    preserve_handoff_restart_requests(state, persisted_state.handoff_restart_requests);
 }
 
 fn merge_targeted_supervisor_state(
@@ -2440,6 +2504,67 @@ fn merge_targeted_supervisor_state(
     fresh_state.skipped_envs = skipped_envs;
 
     preserve_restart_requests(fresh_state, persisted_state.restart_requests);
+    preserve_handoff_restart_requests(fresh_state, persisted_state.handoff_restart_requests);
+}
+
+fn preserve_handoff_restart_requests(
+    state: &mut SupervisorState,
+    requests: impl IntoIterator<Item = SupervisorHandoffRestartRequest>,
+) {
+    for request in requests {
+        if active_child_spec(state, &request.env_name).is_none()
+            || state.handoff_restart_requests.iter().any(|existing| {
+                existing.env_name == request.env_name && existing.request_id == request.request_id
+            })
+        {
+            continue;
+        }
+        state.handoff_restart_requests.push(request);
+    }
+}
+
+/// Take the handoff `ocm service restart` requested from the Gateway with
+/// `pid`, if any. A plan that cannot be read takes nothing, which leaves the
+/// exit to the clean-exit loop guard.
+fn take_handoff_restart_request(state_path: &Path, env_name: &str, pid: u32) -> bool {
+    let requested = |state: &SupervisorState| {
+        state
+            .handoff_restart_requests
+            .iter()
+            .any(|request| request.env_name == env_name && request.pid == pid)
+    };
+    // Decide without the state lock, like plan refreshes: service preparation
+    // can hold it for long, and the daemon loop must never wait for it.
+    match read_json::<SupervisorState>(state_path) {
+        Ok(state) if requested(&state) => {}
+        Ok(_) => return false,
+        Err(error) => {
+            eprintln!(
+                "ocm service: failed reading state for requested restart handoff {}: {}",
+                display_path(state_path),
+                error
+            );
+            return false;
+        }
+    }
+    // Remove it only when the lock is free. Otherwise the requesting command
+    // clears it, and its PID keeps it from matching any later Gateway.
+    if let Ok(Some(_lock)) = try_lock_supervisor_state(state_path)
+        && let Ok(mut state) = read_json::<SupervisorState>(state_path)
+        && requested(&state)
+    {
+        state
+            .handoff_restart_requests
+            .retain(|request| !(request.env_name == env_name && request.pid == pid));
+        if let Err(error) = write_json(state_path, &state) {
+            eprintln!(
+                "ocm service: failed clearing requested restart handoff {}: {}",
+                display_path(state_path),
+                error
+            );
+        }
+    }
+    true
 }
 
 fn preserve_restart_requests(
@@ -2883,12 +3008,15 @@ fn process_exited_children(
         } else {
             RestartHandoffConsumeResult::NotChecked
         };
+        let requested_restart = restart_handoff == RestartHandoffConsumeResult::Accepted
+            && take_handoff_restart_request(state_path, &env_name, running_child.child.id());
         let exited_child = ExitedSupervisorChild {
             env_name: env_name.clone(),
             exit_code: status.code(),
             restart_count: running_child.restart_count,
             quick_clean_restart_count: running_child.quick_clean_restart_count,
             restart_handoff,
+            requested_restart,
             ran_for,
         };
         // Remove each settled child immediately. Later plan reconciliation or
@@ -3049,8 +3177,10 @@ fn exited_child_restart_decision(
             };
         }
 
-        let quick_clean_exit =
-            exited_child.ran_for < Duration::from_millis(SUPERVISOR_STABLE_RUN_MS);
+        // A handoff `ocm service restart` requested is not a restart loop. Like
+        // the direct restart path, it gives the replacement a fresh allowance.
+        let quick_clean_exit = !exited_child.requested_restart
+            && exited_child.ran_for < Duration::from_millis(SUPERVISOR_STABLE_RUN_MS);
         if !same_desired_child || !quick_clean_exit || exited_child.quick_clean_restart_count == 0 {
             return ExitedSupervisorChildDecision {
                 should_restart: true,
@@ -4282,6 +4412,7 @@ mod tests {
             children: vec![child_spec("demo", 19999)],
             skipped_envs: Vec::new(),
             restart_requests,
+            handoff_restart_requests: Vec::new(),
         }
     }
 
@@ -4534,6 +4665,7 @@ mod tests {
             restart_count,
             quick_clean_restart_count,
             restart_handoff,
+            requested_restart: false,
             ran_for,
         }
     }
@@ -5231,6 +5363,110 @@ mod tests {
     }
 
     #[test]
+    fn requested_quick_handoff_restarts_with_a_fresh_allowance() {
+        let mut exited = exited_child_with_handoff_result(
+            Some(0),
+            1,
+            1,
+            RestartHandoffConsumeResult::Accepted,
+            Duration::from_millis(50),
+        );
+        exited.requested_restart = true;
+
+        let decision = exited_child_restart_decision(&exited, true, true);
+
+        assert!(decision.should_restart);
+        assert!(!decision.quick_clean_handoff);
+    }
+
+    #[test]
+    fn handoff_restart_request_is_taken_only_for_its_gateway() {
+        let root = unique_test_root("handoff-restart-request");
+        fs::create_dir_all(&root).unwrap();
+        let state_path = root.join("state.json");
+        let request = |env_name: &str, pid| SupervisorHandoffRestartRequest {
+            env_name: env_name.to_string(),
+            request_id: format!("{env_name}-{pid}"),
+            pid,
+        };
+        let mut state = supervisor_state(Vec::new());
+        state.handoff_restart_requests = vec![request("demo", 41), request("other", 42)];
+        write_json(&state_path, &state).unwrap();
+
+        assert!(!take_handoff_restart_request(&state_path, "demo", 42));
+        assert!(!take_handoff_restart_request(&state_path, "other", 41));
+        assert!(take_handoff_restart_request(&state_path, "demo", 41));
+        assert!(!take_handoff_restart_request(&state_path, "demo", 41));
+
+        let saved: SupervisorState = read_json(&state_path).unwrap();
+        assert_eq!(saved.handoff_restart_requests, vec![request("other", 42)]);
+        assert_eq!(saved.children, state.children);
+
+        // The exit path never waits for a held state lock: it still sees the
+        // request and leaves its removal to the requesting command.
+        let lock = lock_supervisor_state(&state_path).unwrap();
+        assert!(take_handoff_restart_request(&state_path, "other", 42));
+        drop(lock);
+        let saved: SupervisorState = read_json(&state_path).unwrap();
+        assert_eq!(saved.handoff_restart_requests, vec![request("other", 42)]);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn handoff_restart_requests_keep_the_saved_plan_compatible() {
+        // A plan saved before handoff requests existed still loads.
+        let mut saved = serde_json::to_value(supervisor_state(Vec::new())).unwrap();
+        assert!(saved.get("handoffRestartRequests").is_none());
+        let loaded: SupervisorState = serde_json::from_value(saved.clone()).unwrap();
+        assert!(loaded.handoff_restart_requests.is_empty());
+
+        // A pending request is one optional field beside the existing ones,
+        // which a reader without the field ignores like any unknown field.
+        saved["handoffRestartRequests"] =
+            serde_json::json!([{"envName": "demo", "requestId": "r", "pid": 41}]);
+        let loaded: SupervisorState = serde_json::from_value(saved.clone()).unwrap();
+        assert_eq!(loaded.handoff_restart_requests.len(), 1);
+        saved["fieldFromANewerRelease"] = serde_json::json!(true);
+        let loaded: SupervisorState = serde_json::from_value(saved).unwrap();
+        assert_eq!(loaded.children, supervisor_state(Vec::new()).children);
+    }
+
+    #[test]
+    fn plan_rewrites_keep_pending_handoff_restart_requests() {
+        let root = unique_test_root("handoff-restart-request-rewrite");
+        fs::create_dir_all(&root).unwrap();
+        let state_path = root.join("state.json");
+        let request = |env_name: &str, request_id: &str| SupervisorHandoffRestartRequest {
+            env_name: env_name.to_string(),
+            request_id: request_id.to_string(),
+            pid: 41,
+        };
+        let mut persisted = supervisor_state(Vec::new());
+        persisted.handoff_restart_requests = vec![
+            request("demo", "scheduled"),
+            request("demo", "retry"),
+            request("removed", "gone"),
+        ];
+        write_json(&state_path, &persisted).unwrap();
+
+        let mut synced = supervisor_state(Vec::new());
+        preserve_persisted_restart_requests(&state_path, &mut synced);
+        let mut targeted = supervisor_state(Vec::new());
+        merge_targeted_supervisor_state(
+            &mut targeted,
+            persisted,
+            &BTreeSet::from(["demo".to_string()]),
+        );
+
+        let expected = vec![request("demo", "scheduled"), request("demo", "retry")];
+        assert_eq!(synced.handoff_restart_requests, expected);
+        assert_eq!(targeted.handoff_restart_requests, expected);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn previous_crash_retry_does_not_consume_clean_handoff_allowance() {
         let decision = exited_child_restart_decision(
             &exited_child_with_handoff_result(
@@ -5630,6 +5866,7 @@ mod tests {
                 children: vec![original.clone()],
                 skipped_envs: Vec::new(),
                 restart_requests: Vec::new(),
+                handoff_restart_requests: Vec::new(),
             };
             let mut next = active.clone();
             match change {
@@ -5867,6 +6104,7 @@ mod tests {
             children: vec![main.clone(), next_rescue.clone()],
             skipped_envs: Vec::new(),
             restart_requests: Vec::new(),
+            handoff_restart_requests: Vec::new(),
         };
         let mut running = BTreeMap::new();
         let mut pending = BTreeMap::from([
@@ -5977,6 +6215,7 @@ mod tests {
             children: vec![control.clone()],
             skipped_envs: Vec::new(),
             restart_requests: Vec::new(),
+            handoff_restart_requests: Vec::new(),
         };
         let mut running = BTreeMap::new();
         let mut pending = BTreeMap::from([

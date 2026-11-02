@@ -292,9 +292,45 @@ pub fn restart_service(
         }
     }
 
-    let mut helper = spawn_recovery_aware_restart(name, env, cwd)?;
+    // Tell the daemon this handoff is requested, so the replacement does not
+    // count toward its clean-exit restart loop guard.
+    let supervisor = SupervisorService::new(env, cwd);
+    let handoff_request = before
+        .child_pid
+        .map(|pid| supervisor.request_handoff_restart(name, pid))
+        .transpose()?;
+    let inside_gateway = restart_originates_inside_gateway(name, env);
+    let helper = spawn_recovery_aware_restart(name, env, cwd);
+    // The daemon takes the request when the Gateway exits. A restart scheduled
+    // from inside the Gateway returns before that exit, so leave it there; one
+    // OpenClaw rejected or never started is cleared like any other.
+    let scheduled_inside_gateway = inside_gateway && helper.is_ok();
+    let restarted = helper.and_then(|helper| {
+        restart_through_handoff(name, before.child_pid, inside_gateway, helper, env, cwd)
+    });
+    let Some(request_id) = handoff_request.filter(|_| !scheduled_inside_gateway) else {
+        return restarted;
+    };
+    let clear_result = supervisor.clear_handoff_restart_request(name, &request_id);
+    let mut summary = restarted?;
+    if let Err(error) = clear_result {
+        summary.warnings.push(format!(
+            "failed to clear the restart handoff request: {error}"
+        ));
+    }
+    Ok(summary)
+}
 
-    if restart_originates_inside_gateway(name, env) {
+/// Finish a restart handoff once OpenClaw's restart helper has started.
+fn restart_through_handoff(
+    name: &str,
+    previous_pid: Option<u32>,
+    inside_gateway: bool,
+    mut helper: Child,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<ServiceActionSummary, String> {
+    if inside_gateway {
         let mut warnings = vec![
             "recovery-aware restart was scheduled without waiting because the request originated inside the target gateway; OpenClaw will preserve and resume eligible interrupted work after restart"
                 .to_string(),
@@ -309,7 +345,7 @@ pub fn restart_service(
 
     let status = wait_for_restart_action_summary_with_timeout(
         name,
-        before.child_pid,
+        previous_pid,
         Duration::from_secs(30),
         env,
         cwd,
