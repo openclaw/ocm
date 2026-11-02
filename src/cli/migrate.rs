@@ -169,6 +169,10 @@ impl Cli {
             result.sandbox_port,
         );
         self.warn_external_migration_plugins(&result.external_plugin_ids);
+        self.warn_kept_home_relative_settings(
+            &result.summary.name,
+            &result.kept_home_relative_settings,
+        );
         let summary = result.summary;
 
         if json_flag {
@@ -211,6 +215,10 @@ impl Cli {
             result.sandbox_port,
         );
         self.warn_external_migration_plugins(&result.external_plugin_ids);
+        self.warn_kept_home_relative_settings(
+            &result.summary.name,
+            &result.kept_home_relative_settings,
+        );
         let summary = result.summary;
 
         if json_flag {
@@ -240,6 +248,27 @@ impl Cli {
             self.stderr_line(format!(
                 "warning: imported plugin {plugin_id} could not be isolated inside the env state; OCM preserved but did not copy or modify its external location"
             ));
+        }
+    }
+
+    fn warn_kept_home_relative_settings(
+        &self,
+        env_name: &str,
+        settings: &[crate::store::KeptHomeRelativeSetting],
+    ) {
+        for kept in settings {
+            let setting = &kept.setting;
+            self.stderr_line(match kept.reason {
+                crate::store::KeptHomeRelativeReason::TrustRoot => format!(
+                    "warning: env {env_name} keeps the ~/ entries of trust root {setting} as written; they now resolve under the env root instead of the source home, so OCM did not carry that trust over. Replace them with absolute paths to keep trusting the original directories"
+                ),
+                crate::store::KeptHomeRelativeReason::Placeholder => format!(
+                    "warning: env {env_name} keeps the ~/ entries of {setting} that contain a ${{VAR}} placeholder and point into ~/.openclaw as written; if a placeholder leads them outside ~/.openclaw, they now resolve under the env root instead of the source home. Replace such entries with absolute paths"
+                ),
+                crate::store::KeptHomeRelativeReason::WorkerFolder => format!(
+                    "warning: env {env_name} keeps the ~/ entries of {setting} as written; OpenClaw now resolves them against the env root, so workers may be allowed or refused different folders than before. Replace them with absolute paths to keep the original folders"
+                ),
+            });
         }
     }
 
