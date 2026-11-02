@@ -16,11 +16,115 @@ pub fn build_launcher_command(launcher: &LauncherMeta, args: &[String]) -> Strin
         return launcher.command.clone();
     }
 
-    let mut command = launcher.command.clone();
-    let quoted = args.iter().map(|arg| quote_posix(arg)).collect::<Vec<_>>();
-    command.push(' ');
-    command.push_str(&quoted.join(" "));
-    command
+    let command = &launcher.command;
+    let quoted = args
+        .iter()
+        .map(|arg| quote_posix(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    // Appended text would sit inside a trailing comment, or behind a dangling
+    // backslash that escapes the separating space, so join the recipe's last
+    // command there instead. `cmd /C` has neither form.
+    match cfg!(unix).then(|| posix_recipe_tail(command)).flatten() {
+        Some(RecipeTail::Comment(start)) => {
+            let (head, comment) = command.split_at(start);
+            let separator = if head.ends_with(char::is_whitespace) {
+                ""
+            } else {
+                " "
+            };
+            format!("{head}{separator}{quoted} {comment}")
+        }
+        Some(RecipeTail::Backslash(start)) => format!("{} {quoted}", &command[..start]),
+        None => format!("{command} {quoted}"),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RecipeTail {
+    /// Byte offset of a `#` comment that runs to the end of the recipe.
+    Comment(usize),
+    /// Byte offset of an unquoted backslash that ends the recipe.
+    Backslash(usize),
+}
+
+/// Finds a trailing comment or dangling backslash at the top level of a POSIX
+/// shell recipe. A `#` starts a comment only at the start of a token outside
+/// quotes and `${...}`. Constructs this scan does not model (here-documents,
+/// `$'...'`, substitutions inside double quotes that hold quotes of their own,
+/// unterminated quotes) return `None`, so those recipes keep the plain append.
+fn posix_recipe_tail(command: &str) -> Option<RecipeTail> {
+    let bytes = command.as_bytes();
+    let mut index = 0;
+    let mut word_start = true;
+    let mut open_braces = 0usize;
+    while let Some(&byte) = bytes.get(index) {
+        match byte {
+            b'\\' if index + 1 == bytes.len() => {
+                return (open_braces == 0).then_some(RecipeTail::Backslash(index));
+            }
+            b'\\' => {
+                index += 2;
+                word_start = false;
+                continue;
+            }
+            b'\'' | b'"' | b'`' => index += closing_offset(&bytes[index + 1..], byte)? + 1,
+            b'$' if bytes.get(index + 1) == Some(&b'\'') => return None,
+            b'$' if bytes.get(index + 1) == Some(&b'{') => {
+                open_braces += 1;
+                index += 1;
+            }
+            b'}' if open_braces > 0 => open_braces -= 1,
+            b'<' if bytes.get(index + 1) == Some(&b'<') => return None,
+            b'#' if word_start && open_braces == 0 => {
+                match bytes[index..].iter().position(|&byte| byte == b'\n') {
+                    Some(offset) => {
+                        // The comment ends at this newline; scanning resumes there.
+                        index += offset;
+                        continue;
+                    }
+                    None if command[..index].trim().is_empty() => return None,
+                    None => return Some(RecipeTail::Comment(index)),
+                }
+            }
+            _ => {}
+        }
+        // Blanks and operator characters end a token.
+        word_start = matches!(
+            byte,
+            b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b')' | b'<' | b'>'
+        );
+        index += 1;
+    }
+    None
+}
+
+/// Offset of the delimiter that closes a quoted span opened by `delimiter`
+/// (`'`, `"` or a backquote), or `None` when it is unterminated or holds a
+/// substitution that may contain quotes of its own.
+fn closing_offset(rest: &[u8], delimiter: u8) -> Option<usize> {
+    let mut index = 0;
+    while let Some(&byte) = rest.get(index) {
+        if byte == delimiter {
+            return Some(index);
+        }
+        match (delimiter, byte, rest.get(index + 1)) {
+            (b'\'', _, _) => {}
+            (_, b'\\', _) => index += 1,
+            (b'"', b'`', _) | (b'"', b'$', Some(b'(')) => return None,
+            (b'"', b'$', Some(b'{')) => {
+                let end = rest[index..].iter().position(|&byte| byte == b'}')?;
+                let expansion = &rest[index..index + end];
+                if expansion.contains(&b'"') || expansion.contains(&b'\'') {
+                    return None;
+                }
+                index += end;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    None
 }
 
 pub fn resolve_launcher_run_dir(launcher: &LauncherMeta, fallback_cwd: &Path) -> PathBuf {

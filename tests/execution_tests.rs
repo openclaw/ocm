@@ -52,6 +52,78 @@ fn build_launcher_command_quotes_forwarded_arguments() {
     assert_eq!(command, "openclaw 'gateway run' 'it'\"'\"'s-live'");
 }
 
+fn launcher_command(recipe: &str) -> String {
+    let launcher = LauncherMeta {
+        command: recipe.to_string(),
+        ..sample_launcher(None)
+    };
+    build_launcher_command(&launcher, &["gateway".to_string(), "two words".to_string()])
+}
+
+#[cfg(unix)]
+#[test]
+fn build_launcher_command_joins_the_last_command_before_a_trailing_comment_or_backslash() {
+    for (recipe, expected) in [
+        ("openclaw # dev", "openclaw 'gateway' 'two words' # dev"),
+        ("openclaw\t# dev", "openclaw\t'gateway' 'two words' # dev"),
+        (
+            "'/opt/open claw' # it's mine",
+            "'/opt/open claw' 'gateway' 'two words' # it's mine",
+        ),
+        (
+            r#"node "a # b" "${HOME}/x.mjs" $(cat flags) # dev"#,
+            r#"node "a # b" "${HOME}/x.mjs" $(cat flags) 'gateway' 'two words' # dev"#,
+        ),
+        (
+            "cd /src && pnpm openclaw # dev",
+            "cd /src && pnpm openclaw 'gateway' 'two words' # dev",
+        ),
+        (
+            "echo setup # one\nopenclaw # two",
+            "echo setup # one\nopenclaw 'gateway' 'two words' # two",
+        ),
+        // Operators still separate the arguments into a failing command.
+        ("openclaw;# dev", "openclaw; 'gateway' 'two words' # dev"),
+        ("openclaw \\", "openclaw  'gateway' 'two words'"),
+        (
+            "'openclaw' --verbose \\",
+            "'openclaw' --verbose  'gateway' 'two words'",
+        ),
+    ] {
+        assert_eq!(launcher_command(recipe), expected, "{recipe:?}");
+    }
+}
+
+#[test]
+fn build_launcher_command_appends_after_recipes_without_a_trailing_comment() {
+    let mut recipes = vec![
+        "openclaw",
+        "openclaw x#y $# ${HOME#/} ${x:-a # b}",
+        r"openclaw \# literal \\",
+        "openclaw 'a # b' \"a # b\" `echo # x`",
+        "echo setup # one\nopenclaw",
+        "# only a comment",
+        "openclaw;",
+        "openclaw &",
+        "openclaw |",
+        // Unmodelled or unterminated forms keep the plain append.
+        "cat <<EOF # x",
+        "openclaw $'a' # x",
+        r#"node "$(dirname "$0")/x.mjs" # x"#,
+        "openclaw 'unterminated # x",
+    ];
+    if cfg!(windows) {
+        recipes.push("openclaw # dev");
+    }
+    for recipe in recipes {
+        assert_eq!(
+            launcher_command(recipe),
+            format!("{recipe} 'gateway' 'two words'"),
+            "{recipe:?}"
+        );
+    }
+}
+
 #[test]
 fn resolve_launcher_run_dir_prefers_the_launcher_cwd() {
     let launcher = sample_launcher(Some("/tmp/launcher"));

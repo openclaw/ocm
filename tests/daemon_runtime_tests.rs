@@ -5949,6 +5949,9 @@ fn service_start_preserves_builtin_and_plain_executable_launchers() {
         "command",
         "plain",
         "plain-wrapper",
+        "comment",
+        "comment-quoted",
+        "backslash",
     ];
     // macOS /bin/sh supports source/builtin and forwards sourcing arguments.
     // Other sh implementations may not (for example, dash); their portable
@@ -6001,6 +6004,11 @@ fn service_start_preserves_builtin_and_plain_executable_launchers() {
             "builtin-source" => format!("builtin source {}", path_string(&wrapper)),
             "builtin-source-quoted" => format!("builtin source '{}'", path_string(&wrapper)),
             "plain-wrapper" => path_string(&wrapper),
+            // Forwarded arguments must not land in the comment or behind the
+            // backslash.
+            "comment" => format!("{} # dev checkout", path_string(&script)),
+            "comment-quoted" => format!("node '{}' # it's the checkout", path_string(&entry)),
+            "backslash" => format!("{} \\", path_string(&script)),
             _ => path_string(&script),
         };
         let launcher = run_ocm(
