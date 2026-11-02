@@ -5309,30 +5309,33 @@ fn directory_mode(path: &Path) -> u32 {
 }
 
 #[cfg(unix)]
-const COPIED_DIRECTORY_MODES: [(&str, u32); 6] = [
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+}
+
+#[cfg(unix)]
+const COPIED_DIRECTORY_MODES: [(&str, u32); 7] = [
     ("", 0o700),
     ("agents/main/agent", 0o700),
     ("credentials", 0o700),
     ("workspace/secrets", 0o700),
     ("workspace/team", 0o750),
+    ("workspace/shared", 0o1770),
     ("workspace/vendor", 0o555),
 ];
 
 #[cfg(unix)]
 fn write_private_openclaw_state(state: &Path) {
-    use std::os::unix::fs::PermissionsExt;
     write_text(&state.join("agents/main/agent/auth-profiles.json"), "{}");
     write_text(&state.join("credentials/creds.json"), "{}");
     write_text(&state.join("workspace/secrets/plans.txt"), "plans");
     write_text(&state.join("workspace/team/notes.txt"), "notes");
+    write_text(&state.join("workspace/shared/drop.txt"), "drop");
     write_text(&state.join("workspace/vendor/pinned.txt"), "pinned");
-    fs::set_permissions(
-        state.join("agents/main/agent/auth-profiles.json"),
-        fs::Permissions::from_mode(0o600),
-    )
-    .unwrap();
+    set_mode(&state.join("agents/main/agent/auth-profiles.json"), 0o600);
     for (path, mode) in COPIED_DIRECTORY_MODES.iter().rev() {
-        fs::set_permissions(state.join(path), fs::Permissions::from_mode(*mode)).unwrap();
+        set_mode(&state.join(path), *mode);
     }
 }
 
@@ -5340,25 +5343,29 @@ fn write_private_openclaw_state(state: &Path) {
 fn assert_copied_directory_modes(state: &Path, label: &str) {
     for (path, mode) in COPIED_DIRECTORY_MODES {
         // Clone and default import leave out credentials by design.
-        if state.join(path).exists() {
-            assert_eq!(directory_mode(&state.join(path)), mode, "{label} {path}");
+        if path == "credentials" && !state.join(path).exists() {
+            continue;
         }
+        assert_eq!(directory_mode(&state.join(path)), mode, "{label} {path}");
     }
     assert_eq!(
         directory_mode(&state.join("agents/main/agent/auth-profiles.json")),
         0o600,
         "{label}"
     );
+    assert_eq!(
+        fs::read_to_string(state.join("workspace/secrets/plans.txt")).unwrap(),
+        "plans",
+        "{label}"
+    );
 }
 
 #[cfg(unix)]
 fn make_removable(root: &Path) {
-    use std::os::unix::fs::PermissionsExt;
     for entry in fs::read_dir(root).unwrap() {
         let path = entry.unwrap().path();
-        let metadata = fs::symlink_metadata(&path).unwrap();
-        if metadata.is_dir() {
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        if fs::symlink_metadata(&path).unwrap().is_dir() {
+            set_mode(&path, 0o700);
             make_removable(&path);
         }
     }
@@ -5367,7 +5374,6 @@ fn make_removable(root: &Path) {
 #[cfg(unix)]
 #[test]
 fn env_clone_and_default_import_keep_source_directory_modes() {
-    use std::os::unix::fs::PermissionsExt;
     let root = TestDir::new("clone-directory-modes");
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
@@ -5376,7 +5382,7 @@ fn env_clone_and_default_import_keep_source_directory_modes() {
     assert!(create.status.success(), "{}", stderr(&create));
     let source = root.child("ocm-home/envs/source");
     write_private_openclaw_state(&source.join(".openclaw"));
-    fs::set_permissions(&source, fs::Permissions::from_mode(0o710)).unwrap();
+    set_mode(&source, 0o710);
 
     for mask in [0o022, 0o077] {
         let clone_name = format!("clone-{mask:03o}");
@@ -5404,6 +5410,25 @@ fn env_clone_and_default_import_keep_source_directory_modes() {
             assert!(!target.join(".openclaw/credentials").exists(), "{name}");
             assert_copied_directory_modes(&target.join(".openclaw"), &name);
         }
+    }
+
+    // An existing empty root belongs to the caller and keeps its own mode.
+    for (name, args) in [
+        ("given-clone", vec!["env", "clone", "source", "given-clone"]),
+        (
+            "given-import",
+            vec!["env", "import", "default-022.tar", "--name", "given-import"],
+        ),
+    ] {
+        let given = root.child(name);
+        fs::create_dir_all(&given).unwrap();
+        set_mode(&given, 0o770);
+        let mut args = args;
+        args.extend(["--root", given.to_str().unwrap()]);
+        let output = run_ocm_with_umask(&cwd, &env, 0o022, &args);
+        assert!(output.status.success(), "{}", stderr(&output));
+        assert_eq!(directory_mode(&given), 0o770, "{name}");
+        assert_copied_directory_modes(&given.join(".openclaw"), name);
     }
     make_removable(root.path());
 }
@@ -5433,30 +5458,63 @@ fn migrate_and_adopt_import_keep_source_directory_modes() {
 
 #[cfg(unix)]
 #[test]
-fn env_clone_clears_runtime_state_under_a_read_only_state_directory() {
-    use std::os::unix::fs::PermissionsExt;
-    let root = TestDir::new("clone-read-only-state");
+fn copies_finish_under_read_only_source_directories() {
+    let root = TestDir::new("copy-read-only-state");
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
     let env = ocm_env(&root);
     let create = run_ocm(&cwd, &env, &["env", "create", "source"]);
     assert!(create.status.success(), "{}", stderr(&create));
-    let state = root.child("ocm-home/envs/source/.openclaw");
-    write_text(&state.join("workspace/notes.txt"), "notes");
-    write_text(&state.join("logs/gateway.log"), "old");
-    fs::set_permissions(state.join("logs"), fs::Permissions::from_mode(0o555)).unwrap();
-    fs::set_permissions(&state, fs::Permissions::from_mode(0o500)).unwrap();
+    let source = root.child("ocm-home/envs/source/.openclaw");
+    let home = root.child("home/.openclaw");
+    for state in [&source, &home] {
+        // Each copy rewrites this config and clears runtime residue beneath
+        // read-only directories, so the command must write into them.
+        write_text(
+            &state.join("openclaw.json"),
+            &serde_json::json!({"gateway": {"port": 18999}}).to_string(),
+        );
+        write_text(&state.join("workspace/notes.txt"), "notes");
+        write_text(&state.join("logs/gateway.log"), "old");
+        write_text(&state.join("run/gateway.pid"), "123");
+        for directory in ["logs", "run", "workspace"] {
+            set_mode(&state.join(directory), 0o555);
+        }
+        set_mode(state, 0o500);
+    }
 
-    let clone = run_ocm(&cwd, &env, &["env", "clone", "source", "target"]);
+    let clone = run_ocm(&cwd, &env, &["env", "clone", "source", "cloned"]);
     assert!(clone.status.success(), "{}", stderr(&clone));
-    let target = root.child("ocm-home/envs/target/.openclaw");
-    assert_eq!(directory_mode(&target), 0o500);
-    assert!(!target.join("logs").exists());
-    assert_eq!(
-        fs::read_to_string(target.join("workspace/notes.txt")).unwrap(),
-        "notes"
+    let export = run_ocm(
+        &cwd,
+        &env,
+        &["env", "export", "source", "--output", "read-only.tar"],
     );
-    assert!(state.join("logs/gateway.log").exists());
-    assert_eq!(directory_mode(&state), 0o500);
+    assert!(export.status.success(), "{}", stderr(&export));
+    let import = run_ocm(
+        &cwd,
+        &env,
+        &["env", "import", "read-only.tar", "--name", "imported"],
+    );
+    assert!(import.status.success(), "{}", stderr(&import));
+    let migrate = run_ocm(&cwd, &env, &["migrate", "migrated"]);
+    assert!(migrate.status.success(), "{}", stderr(&migrate));
+
+    for name in ["cloned", "imported", "migrated"] {
+        let state = root.child(format!("ocm-home/envs/{name}/.openclaw"));
+        assert_eq!(directory_mode(&state), 0o500, "{name}");
+        assert_eq!(directory_mode(&state.join("workspace")), 0o555, "{name}");
+        assert_eq!(
+            fs::read_to_string(state.join("workspace/notes.txt")).unwrap(),
+            "notes",
+            "{name}"
+        );
+        let config: Value =
+            serde_json::from_slice(&fs::read(state.join("openclaw.json")).unwrap()).unwrap();
+        assert_ne!(config["gateway"]["port"], 18999, "{name}");
+    }
+    assert!(!root.child("ocm-home/envs/cloned/.openclaw/logs").exists());
+    assert!(source.join("logs/gateway.log").exists());
+    assert_eq!(directory_mode(&source), 0o500);
     make_removable(root.path());
 }

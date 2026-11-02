@@ -1241,7 +1241,7 @@ Git repositories whose administrative directories are already contained in retai
 Copied configuration referenced by these repositories survives cleanup without retaining unrelated siblings or acquiring external files.
 Git continues to select conditional includes, and authored predicates, repeated-entry order, comments and unrelated signing/remote settings remain intact.
 Relative values keep Git's containing-file or Git-directory context; external references and inactive missing or invalid includes remain unchanged unless their path maps to copied content.
-Copied directories keep their source modes rather than the invoking shell's umask, so a private (0700) `.openclaw`, credential or workspace directory stays private in the clone.
+Copied directories keep their source modes rather than the invoking shell's umask, so a private (0700) `.openclaw`, credential or workspace directory stays private in the clone; an existing empty `--root` keeps its own mode.
 Config files retain their copied permissions; unsafe ownership, active invalid configuration, required writes into protected history, or configuration locks fail the clone before registration and roll back its target.
 Linked-worktree registrations and other Git storage pointers retain their separate copy handling.
 

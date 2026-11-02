@@ -253,41 +253,107 @@ pub(crate) fn try_lock_file_shared(
 #[derive(Clone, Copy)]
 enum CopyPolicy {
     Ordinary,
-    /// Ordinary entries; each copied directory keeps its source mode.
-    OrdinaryPreservingModes,
     RuntimeAssembly,
     RuntimeRecovery,
 }
 
 pub(crate) fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), String> {
-    copy_dir_recursive_inner(source, destination, None, None, CopyPolicy::Ordinary)
+    copy_dir_recursive_inner(source, destination, None, None, None, CopyPolicy::Ordinary)
+}
+
+/// Source directory modes an environment copy keeps. Each directory the copy
+/// creates takes its source mode once populated, except that its owner keeps
+/// full access until the operation that owns the copy finishes writing into it.
+#[derive(Default)]
+pub(crate) struct CopiedDirectoryModes(Vec<(PathBuf, fs::Permissions)>);
+
+impl CopiedDirectoryModes {
+    fn keep(&mut self, destination: &Path, source: fs::Permissions) -> Result<(), String> {
+        let mut writable = source.clone();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            writable.set_mode(source.mode() | 0o700);
+        }
+        #[cfg(not(unix))]
+        writable.set_readonly(false);
+        fs::set_permissions(destination, writable.clone()).map_err(|error| error.to_string())?;
+        if writable != source {
+            self.0.push((destination.to_path_buf(), source));
+        }
+        Ok(())
+    }
+
+    /// Apply the owner restrictions after the last write into the copy. Children
+    /// were recorded before their parents, so traversal access lasts until needed.
+    pub(crate) fn restore(self) -> Result<(), String> {
+        for (path, permissions) in self.0 {
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_dir() => {
+                    fs::set_permissions(&path, permissions).map_err(|error| error.to_string())?
+                }
+                Ok(_) => {}
+                // Cleanup may remove copied runtime state after copying.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Copy an environment tree whose directories keep their source modes, as
+/// clone and migration copies do, instead of the process umask.
+pub(crate) fn copy_environment_dir(
+    source: &Path,
+    destination: &Path,
+) -> Result<CopiedDirectoryModes, String> {
+    let mut modes = CopiedDirectoryModes::default();
+    copy_dir_recursive_inner(
+        source,
+        destination,
+        None,
+        Some(&mut modes),
+        None,
+        CopyPolicy::Ordinary,
+    )?;
+    Ok(modes)
 }
 
 /// Assemble an owned runtime tree, retaining native junction edges for its
 /// producer to project. Directory modes follow ordinary assembly copying.
 pub(crate) fn copy_runtime_dir(source: &Path, destination: &Path) -> Result<(), String> {
-    copy_dir_recursive_inner(source, destination, None, None, CopyPolicy::RuntimeAssembly)
-}
-
-/// Copy one runtime assembly entry without following a native junction.
-pub(crate) fn copy_runtime_path(source: &Path, destination: &Path) -> Result<(), String> {
-    copy_path_inner(source, destination, None, None, CopyPolicy::RuntimeAssembly)
-}
-
-/// Copy a runtime tree without changing the directory modes in its integrity digest.
-pub(crate) fn copy_dir_preserving_modes(source: &Path, destination: &Path) -> Result<(), String> {
-    copy_dir_recursive_inner(source, destination, None, None, CopyPolicy::RuntimeRecovery)
-}
-
-/// Copy an environment tree whose directories keep their source modes, as
-/// clone and migration copies do, instead of the process umask.
-pub(crate) fn copy_environment_dir(source: &Path, destination: &Path) -> Result<(), String> {
     copy_dir_recursive_inner(
         source,
         destination,
         None,
         None,
-        CopyPolicy::OrdinaryPreservingModes,
+        None,
+        CopyPolicy::RuntimeAssembly,
+    )
+}
+
+/// Copy one runtime assembly entry without following a native junction.
+pub(crate) fn copy_runtime_path(source: &Path, destination: &Path) -> Result<(), String> {
+    copy_path_inner(
+        source,
+        destination,
+        None,
+        None,
+        None,
+        CopyPolicy::RuntimeAssembly,
+    )
+}
+
+/// Copy a runtime tree without changing the directory modes in its integrity digest.
+pub(crate) fn copy_dir_preserving_modes(source: &Path, destination: &Path) -> Result<(), String> {
+    copy_dir_recursive_inner(
+        source,
+        destination,
+        None,
+        None,
+        None,
+        CopyPolicy::RuntimeRecovery,
     )
 }
 
@@ -298,6 +364,7 @@ pub(crate) fn copy_dir_preserving_permissions(
     copy_dir_recursive_inner(
         source,
         destination,
+        None,
         None,
         Some(destination),
         CopyPolicy::Ordinary,
@@ -380,10 +447,11 @@ pub(crate) fn copy_dir_with_sqlite_snapshots(
     source: &Path,
     destination: &Path,
     state_root: &Path,
-) -> Result<(), String> {
+) -> Result<CopiedDirectoryModes, String> {
     let mut copying = OpenClawDirectoryCopy::new(state_root, source)?;
     copying.relocate_internal_links(source, destination)?;
-    copying.copy(source, destination)
+    copying.copy(source, destination)?;
+    Ok(copying.into_directory_modes())
 }
 
 // One operation retains destination ownership through every migration overlay.
@@ -394,6 +462,7 @@ pub(crate) struct OpenClawDirectoryCopy<'a> {
     namespace_links: BTreeMap<PathBuf, (PathBuf, PathBuf)>,
     internal_links: Option<InternalLinkRoots>,
     copy_root: Option<(PathBuf, PathBuf)>,
+    directory_modes: CopiedDirectoryModes,
 }
 
 // A migrated home must not keep reading or writing the home it came from.
@@ -419,6 +488,7 @@ impl<'a> OpenClawDirectoryCopy<'a> {
             namespace_links: BTreeMap::new(),
             internal_links: None,
             copy_root: None,
+            directory_modes: CopiedDirectoryModes::default(),
         })
     }
 
@@ -446,13 +516,22 @@ impl<'a> OpenClawDirectoryCopy<'a> {
             )),
             None => None,
         };
-        copy_dir_recursive_inner(
+        let mut modes = std::mem::take(&mut self.directory_modes);
+        let copied = copy_dir_recursive_inner(
             source,
             destination,
             Some(self),
+            Some(&mut modes),
             None,
-            CopyPolicy::OrdinaryPreservingModes,
-        )
+            CopyPolicy::Ordinary,
+        );
+        self.directory_modes = modes;
+        copied
+    }
+
+    /// The owner restrictions to apply once the operation stops writing into its copies.
+    pub(crate) fn into_directory_modes(self) -> CopiedDirectoryModes {
+        self.directory_modes
     }
 
     // Returns the replacement target and whether it names a directory.
@@ -519,9 +598,12 @@ fn copy_dir_recursive_inner(
     source: &Path,
     destination: &Path,
     mut copying: Option<&mut OpenClawDirectoryCopy<'_>>,
+    mut modes: Option<&mut CopiedDirectoryModes>,
     private_root: Option<&Path>,
     policy: CopyPolicy,
 ) -> Result<(), String> {
+    // A destination that already exists, such as an empty --root, keeps its mode.
+    let created = modes.is_some() && fs::symlink_metadata(destination).is_err();
     if private_root.is_some() {
         ensure_private_dir(destination)?;
     } else {
@@ -613,22 +695,28 @@ fn copy_dir_recursive_inner(
                 &source_path,
                 &destination_path,
                 copying.as_deref_mut(),
+                modes.as_deref_mut(),
                 private_root,
                 policy,
             )?;
         }
     }
 
-    if matches!(
-        policy,
-        CopyPolicy::OrdinaryPreservingModes | CopyPolicy::RuntimeRecovery
-    ) || private_root.is_some_and(|root| root != destination)
+    if matches!(policy, CopyPolicy::RuntimeRecovery)
+        || private_root.is_some_and(|root| root != destination)
     {
         // Populate children before restoring modes, including read-only directories.
         let permissions = fs::metadata(source)
             .map_err(|error| error.to_string())?
             .permissions();
         fs::set_permissions(destination, permissions).map_err(|error| error.to_string())?;
+    } else if let Some(modes) = modes.filter(|_| created) {
+        modes.keep(
+            destination,
+            fs::metadata(source)
+                .map_err(|error| error.to_string())?
+                .permissions(),
+        )?;
     }
     Ok(())
 }
@@ -646,13 +734,14 @@ pub(crate) fn copy_path_recursive(source: &Path, destination: &Path) -> Result<(
 }
 
 pub(crate) fn copy_path(source: &Path, destination: &Path) -> Result<(), String> {
-    copy_path_inner(source, destination, None, None, CopyPolicy::Ordinary)
+    copy_path_inner(source, destination, None, None, None, CopyPolicy::Ordinary)
 }
 
 fn copy_path_inner(
     source: &Path,
     destination: &Path,
     copying: Option<&mut OpenClawDirectoryCopy<'_>>,
+    modes: Option<&mut CopiedDirectoryModes>,
     private_root: Option<&Path>,
     policy: CopyPolicy,
 ) -> Result<(), String> {
@@ -661,10 +750,7 @@ fn copy_path_inner(
 
     if file_type.is_symlink() {
         #[cfg(windows)]
-        if matches!(
-            policy,
-            CopyPolicy::RuntimeAssembly | CopyPolicy::RuntimeRecovery
-        ) {
+        if !matches!(policy, CopyPolicy::Ordinary) {
             if let Some(parent) = destination.parent() {
                 ensure_dir(parent)?;
             }
@@ -699,7 +785,7 @@ fn copy_path_inner(
         );
     }
     if file_type.is_dir() {
-        return copy_dir_recursive_inner(source, destination, copying, private_root, policy);
+        return copy_dir_recursive_inner(source, destination, copying, modes, private_root, policy);
     }
     #[cfg(unix)]
     if file_type.is_socket() {
