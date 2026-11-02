@@ -5067,6 +5067,7 @@ fn migrate_and_adopt_keep_home_relative_paths_outside_the_state_dir_pointing_at_
             },
             "hooks": {"internal": {"load": {"extraDirs": ["~/hooks"]}}},
             "nodeHost": {"workerRuns": {"folders": ["~/work"]}},
+            "memory": {"search": {"extraPaths": ["~/notes"]}},
             "session": {"store": "~/ext-state/{agentId}/sessions.json"},
             "cron": {"store": "~/ext-state/cron.json"},
             "logging": {"file": "~/logs/openclaw.log"},
@@ -5147,9 +5148,15 @@ fn migrate_and_adopt_keep_home_relative_paths_outside_the_state_dir_pointing_at_
             copied["hooks"]["internal"]["load"]["extraDirs"],
             serde_json::json!([format!("{home_path}/hooks")])
         );
+        // These consumers expand `~` against the OS home or resolve links
+        // first, so the values already keep their meaning.
         assert_eq!(
             copied["nodeHost"]["workerRuns"]["folders"],
-            serde_json::json!([format!("{home_path}/work")])
+            serde_json::json!(["~/work"])
+        );
+        assert_eq!(
+            copied["memory"]["search"]["extraPaths"],
+            serde_json::json!(["~/notes"])
         );
         assert_eq!(
             copied["logging"]["file"],
@@ -5329,6 +5336,45 @@ fn migrate_and_adopt_resolve_parent_traversal_from_the_supplied_home_spelling() 
             copied["skills"]["load"]["extraDirs"],
             serde_json::json!([root.child("aliases/shared").to_str().unwrap()]),
             "adopt={adopt}"
+        );
+    }
+}
+
+#[test]
+fn migrate_and_adopt_expand_home_relative_paths_in_an_include_at_a_list_entry() {
+    for adopt in [false, true] {
+        let root = TestDir::new("migrate-home-relative-list-include");
+        let env = ocm_env(&root);
+        let home = root.child("home");
+        let source = home.join(".openclaw");
+        fs::create_dir_all(&source).unwrap();
+        let config = serde_json::json!({
+            "skills": {"load": {"extraDirs": [{"$include": "./skills-dir.json"}]}}
+        });
+        support::write_text(&source.join("openclaw.json"), &config.to_string());
+        let include = "\"~/shared-skills\"";
+        support::write_text(&source.join("skills-dir.json"), include);
+
+        let imported = run_ocm(
+            root.path(),
+            &env,
+            &migrate_or_adopt_args(adopt, "copied", &source),
+        );
+        assert!(imported.status.success(), "{}", stderr(&imported));
+
+        let target = root.child("ocm-home/envs/copied/.openclaw");
+        let copied: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(target.join("skills-dir.json")).unwrap())
+                .unwrap();
+        // The include is a list entry, so it is expanded like an inline entry.
+        assert_eq!(
+            copied,
+            home.join("shared-skills").to_str().unwrap(),
+            "adopt={adopt}"
+        );
+        assert_eq!(
+            fs::read_to_string(source.join("skills-dir.json")).unwrap(),
+            include
         );
     }
 }

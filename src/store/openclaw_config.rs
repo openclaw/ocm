@@ -252,8 +252,7 @@ fn expand_migrated_home_relative_paths(
         };
         let mut rewritten = None;
         for scope in scopes {
-            // Include scopes name object keys; an include is never a list entry.
-            let mut scope = scope.into_iter().map(ConfigSegment::Key).collect();
+            let mut scope = typed_config_scope(&effective.value, scope);
             let mut candidate = value.clone();
             expand_home_relative_paths_in_scope(&mut candidate, &mut scope, source_home);
             if rewritten
@@ -272,6 +271,28 @@ fn expand_migrated_home_relative_paths(
         }
     }
     Ok(())
+}
+
+/// Types an include scope from the resolved config: a segment below a list is
+/// a list entry, any other segment an object key.
+fn typed_config_scope(root: &Value, scope: Vec<String>) -> Vec<ConfigSegment> {
+    let mut current = Some(root);
+    scope
+        .into_iter()
+        .map(|segment| match current {
+            Some(Value::Array(entries)) => {
+                current = segment
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|index| entries.get(index));
+                ConfigSegment::Entry
+            }
+            parent => {
+                current = parent.and_then(|parent| parent.get(&segment));
+                ConfigSegment::Key(segment)
+            }
+        })
+        .collect()
 }
 
 /// One step from the config root to a value: an object key or a list entry.
@@ -322,12 +343,15 @@ fn expand_home_relative_paths_in_scope(
 }
 
 /// Settings whose own OpenClaw consumers expand `~` against `OPENCLAW_HOME`
-/// although OpenClaw's runtime config rule does not, with whether the
-/// consumer trims the value first. `*` stands for any one object key and `[]`
-/// for a list entry. Derived from the consumers at OpenClaw a7fe06b17a9;
-/// settings expanded against the OS home (`messages.usageTemplate`, Feishu
-/// dynamic agent templates) keep their meaning, because `HOME` is unchanged
-/// in the environment.
+/// with OpenClaw's shared resolver although its runtime config rule does
+/// not, with whether the consumer trims the value first. `*` stands for any
+/// one object key and `[]` for a list entry. Derived from the consumers at
+/// OpenClaw a7fe06b17a9. Settings their consumers expand against the OS home
+/// (string `memory.search.extraPaths` entries, `messages.usageTemplate`, the
+/// voice-call store and the file-transfer path lists) keep their meaning,
+/// because `HOME` is unchanged in the environment. `nodeHost.workerRuns.folders`
+/// is left out: its consumer resolves links before `..`, which a rewritten
+/// path cannot reproduce.
 const CONSUMER_HOME_PATH_SETTINGS: &[(&[&str], bool)] = &[
     // src/skills/loading/workspace-skill-sources.ts, symlink-targets.ts
     (&["skills", "load", "extraDirs", "[]"], true),
@@ -342,82 +366,9 @@ const CONSUMER_HOME_PATH_SETTINGS: &[(&[&str], bool)] = &[
     (&["agents", "defaults", "cwd"], true),
     (&["agents", "entries", "*", "cwd"], true),
     (&["agents", "list", "[]", "cwd"], true),
-    // packages/memory-host-sdk/src/host/internal.ts (string entries)
-    (&["memory", "search", "extraPaths", "[]"], true),
-    (
-        &[
-            "agents",
-            "entries",
-            "*",
-            "memory",
-            "search",
-            "extraPaths",
-            "[]",
-        ],
-        true,
-    ),
-    (
-        &[
-            "agents",
-            "list",
-            "[]",
-            "memory",
-            "search",
-            "extraPaths",
-            "[]",
-        ],
-        true,
-    ),
-    // src/node-host/node-worker-device-folder.ts
-    (&["nodeHost", "workerRuns", "folders", "[]"], false),
     // src/security/install-policy.ts
     (
         &["security", "installPolicy", "exec", "trustedDirs", "[]"],
-        true,
-    ),
-    // extensions/voice-call/src/store-path.ts
-    (
-        &["plugins", "entries", "voice-call", "config", "store"],
-        true,
-    ),
-    // extensions/file-transfer/src/shared/policy.ts
-    (
-        &[
-            "plugins",
-            "entries",
-            "file-transfer",
-            "config",
-            "nodes",
-            "*",
-            "denyPaths",
-            "[]",
-        ],
-        true,
-    ),
-    (
-        &[
-            "plugins",
-            "entries",
-            "file-transfer",
-            "config",
-            "nodes",
-            "*",
-            "allowReadPaths",
-            "[]",
-        ],
-        true,
-    ),
-    (
-        &[
-            "plugins",
-            "entries",
-            "file-transfer",
-            "config",
-            "nodes",
-            "*",
-            "allowWritePaths",
-            "[]",
-        ],
         true,
     ),
 ];
@@ -2988,6 +2939,27 @@ mod tests {
     }
 
     #[test]
+    fn migration_home_expansion_types_include_scopes_from_the_resolved_config() {
+        let root = json!({"agents": {"list": [{"id": "main"}]}, "skills": {"load": {}}});
+        assert_eq!(
+            typed_config_scope(&root, vec!["agents".into(), "list".into(), "0".into()]),
+            vec![
+                ConfigSegment::Key("agents".into()),
+                ConfigSegment::Key("list".into()),
+                ConfigSegment::Entry,
+            ]
+        );
+        assert_eq!(
+            typed_config_scope(&root, vec!["skills".into(), "load".into(), "0".into()]),
+            vec![
+                ConfigSegment::Key("skills".into()),
+                ConfigSegment::Key("load".into()),
+                ConfigSegment::Key("0".into()),
+            ]
+        );
+    }
+
+    #[test]
     fn migration_home_expansion_selects_the_settings_openclaw_expands() {
         let setting = |scope: &[&str]| {
             let scope = scope
@@ -3011,8 +2983,21 @@ mod tests {
             &["agents", "defaults", "cwd"],
             &["agents", "entries", "main", "cwd"],
             &["agents", "list", "[]", "cwd"],
-            &["memory", "search", "extraPaths", "[]"],
             &["security", "installPolicy", "exec", "trustedDirs", "[]"],
+            &["gateway", "tls", "caPath"],
+            &["logging", "file"],
+            &["plugins", "entries", "demo", "config", "rootDir"],
+            &["agents", "defaults", "workspace"],
+            &["cron", "store"],
+        ] {
+            assert_eq!(setting(path), Some(true), "{path:?}");
+        }
+        assert_eq!(setting(&["session", "store"]), Some(false));
+        for text in [
+            &["messages", "responsePrefix"][..],
+            &["messages", "usageTemplate"],
+            // Expanded against the OS home, which the environment keeps.
+            &["memory", "search", "extraPaths", "[]"],
             &["plugins", "entries", "voice-call", "config", "store"],
             &[
                 "plugins",
@@ -3024,22 +3009,8 @@ mod tests {
                 "allowReadPaths",
                 "[]",
             ],
-            &["gateway", "tls", "caPath"],
-            &["logging", "file"],
-            &["plugins", "entries", "demo", "config", "rootDir"],
-            &["agents", "defaults", "workspace"],
-            &["cron", "store"],
-        ] {
-            assert_eq!(setting(path), Some(true), "{path:?}");
-        }
-        assert_eq!(setting(&["session", "store"]), Some(false));
-        assert_eq!(
-            setting(&["nodeHost", "workerRuns", "folders", "[]"]),
-            Some(false)
-        );
-        for text in [
-            &["messages", "responsePrefix"][..],
-            &["messages", "usageTemplate"],
+            // Resolved through links before `..`.
+            &["nodeHost", "workerRuns", "folders", "[]"],
             &["agents", "list", "[]", "identity", "name"],
             &["plugins", "entries", "demo", "config", "dirs", "[]"],
             // A digit-only key is an object key, not a list entry.

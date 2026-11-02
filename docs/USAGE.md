@@ -1266,8 +1266,9 @@ config treats as paths (keys ending in `dir`, `path`, `paths`, `file`, `root` or
 `workspace`, the keys `paths` and `pathPrepend`, and the entries of `paths` and
 `pathPrepend` lists) and the settings whose own OpenClaw consumers expand `~`,
 including `skills.load.extraDirs`, `hooks.internal.load.extraDirs`, agent `cwd`,
-`memory.search.extraPaths`, `nodeHost.workerRuns.folders` and `session.store`
-and `cron.store`. Each is expanded with the same whitespace handling and lexical
+`session.store` and `cron.store`. Settings OpenClaw expands against the OS home
+keep their meaning without a rewrite, because the environment keeps your
+`HOME`. Each is expanded with the same whitespace handling and lexical
 `.` and `..` resolution as its OpenClaw consumer. Other strings, such as message
 text, stay as written. The source home is your home directory when the migrated
 directory is your own `~/.openclaw`, through any path that leads to it;
