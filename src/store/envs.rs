@@ -1526,7 +1526,7 @@ pub(crate) fn import_environment_with_sandbox_origin(
                 validate_nonportable_runtime_state_paths(&target_paths)?;
             }
             reject_include_owned_sandbox_origin(&target_paths.config_path)?;
-            let copied_includes = extracted_workspaces
+            let mut copied_includes = extracted_workspaces
                 .config_include_paths()
                 .map(|path| {
                     path.strip_prefix(&extracted.root_dir)
@@ -1534,6 +1534,11 @@ pub(crate) fn import_environment_with_sandbox_origin(
                         .map_err(|error| error.to_string())
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            if !copied_includes.is_empty() {
+                // Relocate the root's directives too, so the included Gateway
+                // port is resolved through the imported copies.
+                copied_includes.push(target_paths.config_path.clone());
+            }
             super::openclaw_config::rewrite_copied_include_directives(
                 &copied_includes,
                 &source_roots,

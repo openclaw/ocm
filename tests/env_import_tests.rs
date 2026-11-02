@@ -885,6 +885,93 @@ fn env_import_validates_the_target_origin_before_reading_the_archive() {
 }
 
 #[test]
+fn env_import_moves_an_included_gateway_port_with_the_sandbox_values_that_follow_it() {
+    for absolute in [false, true] {
+        let root = TestDir::new("env-import-included-gateway-port");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let env = ocm_env(&root);
+
+        let create = run_ocm(&cwd, &env, &["env", "create", "source", "--port", "19789"]);
+        assert!(create.status.success(), "{}", stderr(&create));
+        let source = root.child("ocm-home/envs/source/.openclaw");
+        let directive = |state: &Path| {
+            if absolute {
+                state.join("gateway.json").display().to_string()
+            } else {
+                "./gateway.json".to_string()
+            }
+        };
+        write_text(
+            &source.join("openclaw.json"),
+            &serde_json::json!({
+                "gateway": {"$include": directive(&source)},
+                "mcp": {"apps": {
+                    "sandboxPort": 19790,
+                    "sandboxOrigin": "http://127.0.0.1:19790",
+                }},
+            })
+            .to_string(),
+        );
+        write_text(
+            &source.join("gateway.json"),
+            "{\"port\":19789,\"bind\":\"loopback\"}",
+        );
+
+        let export = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "env",
+                "export",
+                "source",
+                "--output",
+                "./source.ocm-env.tar",
+            ],
+        );
+        assert!(export.status.success(), "{}", stderr(&export));
+        let import = run_ocm(
+            &cwd,
+            &env,
+            &["env", "import", "./source.ocm-env.tar", "--name", "target"],
+        );
+        assert!(import.status.success(), "{}", stderr(&import));
+
+        let status = run_ocm(&cwd, &env, &["env", "status", "target", "--json"]);
+        assert!(status.status.success(), "{}", stderr(&status));
+        let imported = serde_json::from_str::<Value>(&stdout(&status)).unwrap()["gatewayPort"]
+            .as_u64()
+            .unwrap();
+        assert_ne!(imported, 19789);
+
+        let target = root.child("ocm-home/envs/target/.openclaw");
+        let read = |path: &str| {
+            serde_json::from_str::<Value>(&fs::read_to_string(target.join(path)).unwrap()).unwrap()
+        };
+        assert_eq!(
+            read("gateway.json"),
+            serde_json::json!({"port": imported, "bind": "loopback"})
+        );
+        let config = read("openclaw.json");
+        assert_eq!(
+            config["gateway"],
+            serde_json::json!({"$include": directive(&target)})
+        );
+        assert_eq!(
+            config["mcp"]["apps"],
+            serde_json::json!({
+                "sandboxPort": imported + 1,
+                "sandboxOrigin": format!("http://127.0.0.1:{}", imported + 1),
+            })
+        );
+        assert_eq!(
+            fs::read_to_string(source.join("gateway.json")).unwrap(),
+            "{\"port\":19789,\"bind\":\"loopback\"}"
+        );
+    }
+}
+
+#[test]
 fn env_import_rejects_include_owned_sandbox_configuration_before_creating_the_target() {
     let root = TestDir::new("env-import-include-owned-sandbox-origin");
     let cwd = root.child("workspace");

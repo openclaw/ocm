@@ -1572,6 +1572,136 @@ fn env_clone_accepts_an_explicit_target_sandbox_origin() {
     );
 }
 
+fn env_gateway_port(
+    cwd: &Path,
+    env: &std::collections::BTreeMap<String, String>,
+    name: &str,
+) -> u64 {
+    let status = run_ocm(cwd, env, &["env", "status", name, "--json"]);
+    assert!(status.status.success(), "{}", stderr(&status));
+    serde_json::from_str::<Value>(&stdout(&status)).unwrap()["gatewayPort"]
+        .as_u64()
+        .unwrap()
+}
+
+#[test]
+fn env_clone_moves_an_included_gateway_port_with_the_sandbox_values_that_follow_it() {
+    // (sandbox keys in openclaw.json, whether they follow the Gateway port)
+    let cases = [
+        (
+            "\"sandboxPort\":19790,\"sandboxOrigin\":\"http://127.0.0.1:19790\"",
+            true,
+        ),
+        ("\"sandboxOrigin\":\"http://localhost:19790/\"", true),
+        (
+            "\"sandboxPort\":25000,\"sandboxOrigin\":\"http://127.0.0.1:25000\"",
+            false,
+        ),
+    ];
+    for (apps, follows) in cases {
+        let root = TestDir::new("env-clone-included-gateway-port");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let env = ocm_env(&root);
+
+        let create = run_ocm(&cwd, &env, &["env", "create", "source", "--port", "19789"]);
+        assert!(create.status.success(), "{}", stderr(&create));
+        let source = root.child("ocm-home/envs/source/.openclaw");
+        let config = format!(
+            "{{\"gateway\":{{\"$include\":\"./gateway/gateway.json\"}},\"mcp\":{{\"apps\":{{{apps}}}}}}}"
+        );
+        let gateway = "{\"$include\":\"./port.json\",\"bind\":\"loopback\"}";
+        write_text(&source.join("openclaw.json"), &config);
+        write_text(&source.join("gateway/gateway.json"), gateway);
+        write_text(&source.join("gateway/port.json"), "{\"port\":19789}");
+
+        let clone = run_ocm(&cwd, &env, &["env", "clone", "source", "target"]);
+        assert!(clone.status.success(), "{}", stderr(&clone));
+        let cloned = env_gateway_port(&cwd, &env, "target");
+        assert_ne!(cloned, 19789);
+
+        let target = root.child("ocm-home/envs/target/.openclaw");
+        let read = |path: &str| {
+            serde_json::from_str::<Value>(&fs::read_to_string(target.join(path)).unwrap()).unwrap()
+        };
+        assert_eq!(
+            read("gateway/port.json"),
+            serde_json::json!({"port": cloned})
+        );
+        assert_eq!(
+            read("gateway/gateway.json"),
+            serde_json::json!({"$include": "./port.json", "bind": "loopback"})
+        );
+        let copied = read("openclaw.json");
+        assert_eq!(
+            copied["gateway"],
+            serde_json::json!({"$include": "./gateway/gateway.json"})
+        );
+        let source_apps = serde_json::from_str::<Value>(&format!("{{{apps}}}")).unwrap();
+        let mut expected = source_apps.clone();
+        if follows {
+            let sandbox = cloned + 1;
+            if expected.get("sandboxPort").is_some() {
+                expected["sandboxPort"] = sandbox.into();
+            }
+            let origin = expected["sandboxOrigin"]
+                .as_str()
+                .unwrap()
+                .replace("19790", &sandbox.to_string());
+            expected["sandboxOrigin"] = origin.into();
+        }
+        assert_eq!(copied["mcp"]["apps"], expected, "{apps}");
+
+        assert_eq!(env_gateway_port(&cwd, &env, "source"), 19789);
+        assert_eq!(
+            fs::read_to_string(source.join("openclaw.json")).unwrap(),
+            config
+        );
+        assert_eq!(
+            fs::read_to_string(source.join("gateway/port.json")).unwrap(),
+            "{\"port\":19789}"
+        );
+    }
+}
+
+#[test]
+fn env_clone_refuses_a_gateway_port_in_a_shared_include() {
+    let root = TestDir::new("env-clone-shared-gateway-port-include");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+
+    let create = run_ocm(&cwd, &env, &["env", "create", "source", "--port", "19789"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let source = root.child("ocm-home/envs/source/.openclaw");
+    let config =
+        "{\"gateway\":{\"$include\":\"./shared.json\"},\"talk\":{\"$include\":\"./shared.json\"}}";
+    write_text(&source.join("openclaw.json"), config);
+    write_text(&source.join("shared.json"), "{\"port\":19789}");
+
+    let clone = run_ocm(&cwd, &env, &["env", "clone", "source", "target"]);
+    assert_eq!(clone.status.code(), Some(1));
+    assert!(
+        stderr(&clone).contains("cannot give the new environment its own Gateway port")
+            && stderr(&clone).contains("shared.json"),
+        "{}",
+        stderr(&clone)
+    );
+    assert!(!root.child("ocm-home/envs/target").exists());
+    let listing = run_ocm(&cwd, &env, &["env", "list", "--json"]);
+    assert!(listing.status.success(), "{}", stderr(&listing));
+    let listed = serde_json::from_str::<Value>(&stdout(&listing)).unwrap();
+    assert_eq!(listed.as_array().unwrap().len(), 1, "{listed}");
+    assert_eq!(
+        fs::read_to_string(source.join("openclaw.json")).unwrap(),
+        config
+    );
+    assert_eq!(
+        fs::read_to_string(source.join("shared.json")).unwrap(),
+        "{\"port\":19789}"
+    );
+}
+
 #[test]
 fn env_clone_rejects_include_owned_sandbox_configuration_before_copying() {
     let root = TestDir::new("env-clone-include-owned-mcp-app-origin");

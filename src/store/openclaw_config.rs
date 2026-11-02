@@ -194,6 +194,9 @@ pub(crate) fn rewrite_openclaw_config_for_new_environment(
     gateway_port: Option<u32>,
     sandbox_origin: Option<&str>,
 ) -> Result<OpenClawConfigRewriteOutcome, String> {
+    if let Some(gateway_port) = gateway_port {
+        rewrite_included_gateway_port(target_paths, gateway_port)?;
+    }
     rewrite_openclaw_config_with_root_mapping(
         target_paths,
         source_root.map(|source_root| (source_root, target_paths.root.as_path())),
@@ -226,8 +229,9 @@ pub(crate) fn rewrite_openclaw_config_for_migration(
 }
 
 /// Moves a Gateway port that a copied `$include` supplies to `gateway_port`,
-/// with the MCP app sandbox port that follows it. A port the config file sets
-/// itself overrides its includes and is left to the file's own rewrite.
+/// with the MCP app sandbox port and loopback origin that follow it. A port the
+/// config file sets itself overrides its includes and is left to the file's own
+/// rewrite.
 fn rewrite_included_gateway_port(target: &EnvPaths, gateway_port: u32) -> Result<(), String> {
     let Some(mut config) = read_config_value(&target.config_path)? else {
         return Ok(());
@@ -254,7 +258,7 @@ fn rewrite_included_gateway_port(target: &EnvPaths, gateway_port: u32) -> Result
                 .is_some_and(|previous| previous != &candidate)
             {
                 return Err(format!(
-                    "cannot give the new environment its own Gateway port because OpenClaw include {} sets gateway.port and is also included elsewhere in the config; give gateway.port its own include before migration",
+                    "cannot give the new environment its own Gateway port because OpenClaw include {} sets gateway.port and is also included elsewhere in the config; give gateway.port its own include before creating a new OCM environment",
                     display_path(&path)
                 ));
             }
@@ -540,6 +544,9 @@ pub(super) fn rewrite_archived_openclaw_config(
         .iter()
         .map(|root| derive_env_paths(root).state_dir)
         .collect::<Vec<_>>();
+    if let Some(gateway_port) = gateway_port {
+        rewrite_included_gateway_port(target_paths, gateway_port)?;
+    }
     rewrite_openclaw_config_with_path_rewriter(
         target_paths,
         gateway_port,
