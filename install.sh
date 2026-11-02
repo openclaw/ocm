@@ -77,18 +77,18 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --version)
       shift
-      [[ $# -gt 0 ]] || { echo "error: --version requires a value" >&2; exit 1; }
+      [[ $# -gt 0 && -n "$1" ]] || { echo "error: --version requires a value" >&2; exit 1; }
       version="$1"
       ;;
     --prefix)
       shift
-      [[ $# -gt 0 ]] || { echo "error: --prefix requires a value" >&2; exit 1; }
+      [[ $# -gt 0 && -n "$1" ]] || { echo "error: --prefix requires a value" >&2; exit 1; }
       prefix="$1"
       prefix_given="true"
       ;;
     --bin-dir)
       shift
-      [[ $# -gt 0 ]] || { echo "error: --bin-dir requires a value" >&2; exit 1; }
+      [[ $# -gt 0 && -n "$1" ]] || { echo "error: --bin-dir requires a value" >&2; exit 1; }
       bin_dir="$1"
       ;;
     --force)
