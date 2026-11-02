@@ -182,13 +182,29 @@ pub(crate) fn set_handler(
 
 /// Register the owner like `set_handler`, keeping each of SIGINT, SIGTERM and
 /// SIGHUP that the process inherited as ignored, as `nohup` leaves SIGHUP. The
-/// owner then sees only the signals the caller allowed to stop OCM.
+/// owner then sees only the signals the caller allowed to stop OCM. Call it
+/// before OCM starts other threads: the signals stay pending on this thread
+/// while the owner is installed, and restoring an ignore discards a pending
+/// signal instead of handing it to the owner.
 pub(crate) fn set_handler_keeping_ignored(
     handler: impl Fn() -> bool + Send + Sync + 'static,
 ) -> Result<(), String> {
     #[cfg(unix)]
+    {
+        let unblocked = block_dispatched_signals()?;
+        let installed = install_keeping_ignored(handler);
+        let restored = set_signal_mask(&unblocked);
+        installed.and(restored)
+    }
+    #[cfg(not(unix))]
+    set_handler(handler)
+}
+
+#[cfg(unix)]
+fn install_keeping_ignored(
+    handler: impl Fn() -> bool + Send + Sync + 'static,
+) -> Result<(), String> {
     let mut ignored = Vec::new();
-    #[cfg(unix)]
     for (signal, _) in &FORWARD_HANDLERS {
         let action = signal_action(*signal)?;
         if action.sa_sigaction == libc::SIG_IGN {
@@ -196,9 +212,44 @@ pub(crate) fn set_handler_keeping_ignored(
         }
     }
     set_handler(handler)?;
-    #[cfg(unix)]
     for (signal, action) in &ignored {
         set_signal_action(*signal, action)?;
+    }
+    Ok(())
+}
+
+/// Blocks the dispatched signals on this thread and returns the previous mask.
+#[cfg(unix)]
+fn block_dispatched_signals() -> Result<libc::sigset_t, String> {
+    let mut blocked = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+    let mut previous = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+    // SAFETY: sigemptyset initializes the set before sigaddset and
+    // pthread_sigmask read it; pthread_sigmask initializes previous on success.
+    unsafe {
+        libc::sigemptyset(blocked.as_mut_ptr());
+        for (signal, _) in &FORWARD_HANDLERS {
+            libc::sigaddset(blocked.as_mut_ptr(), *signal);
+        }
+        let error = libc::pthread_sigmask(libc::SIG_BLOCK, blocked.as_ptr(), previous.as_mut_ptr());
+        if error != 0 {
+            return Err(format!(
+                "failed blocking signals: {}",
+                std::io::Error::from_raw_os_error(error)
+            ));
+        }
+        Ok(previous.assume_init())
+    }
+}
+
+#[cfg(unix)]
+fn set_signal_mask(mask: &libc::sigset_t) -> Result<(), String> {
+    // SAFETY: mask came from a successful pthread_sigmask query.
+    let error = unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, mask, std::ptr::null_mut()) };
+    if error != 0 {
+        return Err(format!(
+            "failed restoring the signal mask: {}",
+            std::io::Error::from_raw_os_error(error)
+        ));
     }
     Ok(())
 }
@@ -323,10 +374,18 @@ mod tests {
             );
             return;
         }
+        let signals = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&signals);
         unsafe {
             libc::signal(libc::SIGHUP, libc::SIG_IGN);
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::signal(libc::SIGTERM, libc::SIG_DFL);
         }
-        set_handler_keeping_ignored(|| true).unwrap();
+        set_handler_keeping_ignored(move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+            true
+        })
+        .unwrap();
         assert_eq!(
             signal_action(libc::SIGHUP).unwrap().sa_sigaction,
             libc::SIG_IGN
@@ -337,6 +396,11 @@ mod tests {
                 libc::SIG_DFL | libc::SIG_IGN
             ));
         }
+        // The installation leaves this thread's mask as it found it, so the
+        // owner still receives the signals it handles.
+        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+        settle();
+        assert_eq!(signals.load(Ordering::SeqCst), 1);
     }
 
     #[test]

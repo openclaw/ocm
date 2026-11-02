@@ -96,7 +96,8 @@ fn open_temp_dir() -> MutexGuard<'static, Option<PathBuf>> {
 /// SIGINT, SIGTERM or SIGHUP while the release archive is downloaded,
 /// extracted or staged removes its temporary directory before OCM exits with
 /// status 130, as other interrupted commands do. A signal the caller ignores,
-/// such as SIGHUP under `nohup`, stays ignored.
+/// such as SIGHUP under `nohup`, stays ignored; that needs the handler
+/// installed while OCM still runs a single thread.
 fn install_self_update_interrupt_handler() -> Result<(), String> {
     crate::infra::interrupt::set_handler_keeping_ignored(remove_open_temp_dir)
         .map_err(|error| format!("failed to install self-update signal handler: {error}"))
@@ -314,6 +315,10 @@ impl Cli {
             }
         }
 
+        if !check {
+            // Before the progress output starts its thread.
+            install_self_update_interrupt_handler()?;
+        }
         let target_display = version.clone().unwrap_or_else(|| "latest".to_string());
         let mut summary = if check {
             self.self_update_check(version.as_deref())?
@@ -442,7 +447,6 @@ impl Cli {
         })?;
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
 
-        install_self_update_interrupt_handler()?;
         let temp_root = SelfUpdateTempDir::create()?;
         let archive_path = temp_root.path().join(&asset.name);
         let mut archive = temp_root.create_within(|| {

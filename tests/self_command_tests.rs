@@ -896,6 +896,11 @@ fn assert_interrupted_download_removes_its_temporary_directory(
         }
     }
 
+    // The update keeps signals it inherits as ignored, so start it from the
+    // default dispositions whatever this test runner inherited.
+    for default in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+        unsafe { libc::signal(default, libc::SIG_DFL) };
+    }
     let root = TestDir::new(label);
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
