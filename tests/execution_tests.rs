@@ -110,6 +110,10 @@ fn build_launcher_command_joins_the_last_command_before_a_trailing_comment_or_ba
             r#"openclaw --mode "$(echo case)" $(x) # dev"#,
             r#"openclaw --mode "$(echo case)" $(x) 'gateway' 'two words' # dev"#,
         ),
+        (
+            r#"printf '%s\n' "$(printf '%s' if case)" # tail"#,
+            r#"printf '%s\n' "$(printf '%s' if case)" 'gateway' 'two words' # tail"#,
+        ),
         // Operators still separate the arguments into a failing command.
         ("openclaw;# dev", "openclaw; 'gateway' 'two words' # dev"),
         ("openclaw \\", "openclaw 'gateway' 'two words'"),
@@ -139,6 +143,9 @@ fn build_launcher_command_appends_after_recipes_without_a_trailing_comment() {
         "openclaw $'a' # x",
         "openclaw $(case x in a) echo;; esac) # x",
         "openclaw $(true; if :; then case x in a) echo;; esac; fi) # x",
+        r#"printf '%s\n' $(( $(printf 1; : "))) # marker") ))"#,
+        "openclaw ${x:-$'a'} # x",
+        r"openclaw ${x:-$'a\'} # marker'}",
         "openclaw 'unterminated # x",
         "openclaw \"$(echo # x\" # y",
     ];

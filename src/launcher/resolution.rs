@@ -159,7 +159,8 @@ fn is_word_at(bytes: &[u8], index: usize, word: &[u8]) -> bool {
 }
 
 /// Whether a token following `before` starts a command: nothing, an operator
-/// or a newline precedes it, or a reserved word that a command follows.
+/// or a newline precedes it, or a reserved word in command position that a
+/// command follows.
 fn in_command_position(before: &[u8]) -> bool {
     let Some(last) = before
         .iter()
@@ -177,7 +178,7 @@ fn in_command_position(before: &[u8]) -> bool {
     matches!(
         &before[first..=last],
         b"if" | b"then" | b"else" | b"elif" | b"while" | b"until" | b"do" | b"!" | b"{"
-    )
+    ) && in_command_position(&before[..first])
 }
 
 /// Blanks and operator characters end a shell token.
@@ -210,18 +211,25 @@ fn skip_span(bytes: &[u8], start: usize, nesting: usize) -> Option<usize> {
             let end = bytes[start + 1..].iter().position(|&byte| byte == b'\'')?;
             return Some(start + end + 2);
         }
-        // Arithmetic expansion: only its parentheses matter here.
+        // Arithmetic expansion: its parentheses, outside nested spans.
         (b'$', Some(b'(')) if bytes.get(start + 2) == Some(&b'(') => {
+            let mut index = start + 1;
             let mut depth = 0usize;
-            for (offset, &byte) in bytes[start + 1..].iter().enumerate() {
+            loop {
+                let byte = *bytes.get(index)?;
+                if opens_span(bytes, index) {
+                    index = skip_span(bytes, index, nesting + 1)?;
+                    continue;
+                }
                 match byte {
+                    b'\\' => index += 1,
                     b'(' => depth += 1,
-                    b')' if depth == 1 => return Some(start + offset + 2),
+                    b')' if depth == 1 => return Some(index + 1),
                     b')' => depth -= 1,
                     _ => {}
                 }
+                index += 1;
             }
-            return None;
         }
         (b'$', Some(b'(')) => {
             return match scan_tokens(bytes, start + 2, true, nesting)? {
@@ -237,6 +245,9 @@ fn skip_span(bytes: &[u8], start: usize, nesting: usize) -> Option<usize> {
         let byte = *bytes.get(index)?;
         if byte == close {
             return Some(index + 1);
+        }
+        if close == b'}' && byte == b'$' && bytes.get(index + 1) == Some(&b'\'') {
+            return None;
         }
         if byte == b'\\' {
             index += 2;
