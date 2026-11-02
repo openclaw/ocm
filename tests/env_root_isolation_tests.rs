@@ -550,3 +550,58 @@ fn create_clone_and_import_reject_ocm_store_roots_before_writing_state() {
         }
     }
 }
+
+#[test]
+fn existing_case_variants_of_store_names_follow_filesystem_identity() {
+    let fixture = TestDir::new("environment-store-root-case");
+    let env = ocm_env(&fixture);
+    template(&fixture, &env);
+    let home = fixture.child("ocm-home");
+    fs::create_dir_all(home.join("runtimes")).unwrap();
+    let variant = home.join("RUNTIMES");
+    // A distinct directory is not the store; an alias of it is.
+    let distinct = fs::create_dir(&variant).is_ok();
+    for action in ["create", "clone", "import"] {
+        let name = format!("variant-{action}");
+        let destination = variant.join(&name);
+        let result = admit(&fixture, &env, action, &name, &destination);
+        if distinct {
+            assert!(result.status.success(), "{}", stderr(&result));
+        } else {
+            assert!(!result.status.success());
+            assert!(
+                stderr(&result).contains("overlaps OCM store"),
+                "{}",
+                stderr(&result)
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn dangling_store_links_reserve_their_target_without_refusing_disjoint_roots() {
+    let fixture = TestDir::new("environment-store-root-dangling");
+    let env = ocm_env(&fixture);
+    template(&fixture, &env);
+    let home = fixture.child("ocm-home");
+    let external = fixture.child("external");
+    fs::create_dir(&external).unwrap();
+    let storage = external.join("missing-toolchains");
+    let _ = fs::remove_dir_all(home.join("toolchains"));
+    std::os::unix::fs::symlink(&storage, home.join("toolchains")).unwrap();
+
+    for destination in [storage.clone(), storage.join("nested"), external.clone()] {
+        let rejected = admit(&fixture, &env, "create", "blocked", &destination);
+        assert!(!rejected.status.success(), "{destination:?}");
+        assert!(
+            stderr(&rejected).contains("overlaps OCM store"),
+            "{}",
+            stderr(&rejected)
+        );
+        assert!(!storage.exists());
+    }
+    let disjoint = external.join("custom");
+    let accepted = admit(&fixture, &env, "create", "disjoint", &disjoint);
+    assert!(accepted.status.success(), "{}", stderr(&accepted));
+}

@@ -149,24 +149,14 @@ pub(crate) fn projected_path_relative(root: &Path, path: &Path) -> Result<Option
         let (Some(component), Some(expected)) = (component, expected) else {
             return Err("cannot distinguish differently encoded missing source names; restore the source before retrying".to_string());
         };
+        if missing_names_may_alias(component, expected)? {
+            continue;
+        }
         #[cfg(windows)]
         let (component, expected) = (
             component.trim_end_matches(&['.', ' '][..]),
             expected.trim_end_matches(&['.', ' '][..]),
         );
-        // Missing names lack filesystem identity. Reserve possible Unicode
-        // aliases without changing comparisons between existing entries.
-        if component.eq_ignore_ascii_case(expected)
-            || ((!component.is_ascii() || !expected.is_ascii())
-                && missing_name_characters(component)
-                    .compatibility_caseless_match(missing_name_characters(expected)))
-        {
-            continue;
-        }
-        #[cfg(windows)]
-        if windows_case_alias(component, expected)? {
-            continue;
-        }
         #[cfg(windows)]
         if (possible_short_name(component) || possible_short_name(expected))
             && !(plain_short_name(component) && plain_short_name(expected))
@@ -176,6 +166,28 @@ pub(crate) fn projected_path_relative(root: &Path, path: &Path) -> Result<Option
         return Ok(None);
     }
     Ok(Some(actual.collect()))
+}
+
+/// Missing names lack filesystem identity. Reserve possible case and Unicode
+/// aliases without changing comparisons between existing entries.
+pub(crate) fn missing_names_may_alias(component: &str, expected: &str) -> Result<bool, String> {
+    #[cfg(windows)]
+    let (component, expected) = (
+        component.trim_end_matches(&['.', ' '][..]),
+        expected.trim_end_matches(&['.', ' '][..]),
+    );
+    if component.eq_ignore_ascii_case(expected)
+        || ((!component.is_ascii() || !expected.is_ascii())
+            && missing_name_characters(component)
+                .compatibility_caseless_match(missing_name_characters(expected)))
+    {
+        return Ok(true);
+    }
+    #[cfg(windows)]
+    if windows_case_alias(component, expected)? {
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 fn missing_name_characters(name: &str) -> impl Iterator<Item = char> + '_ {
