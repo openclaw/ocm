@@ -167,6 +167,28 @@ impl OpenClawRuntimeStateCleanup {
         Ok(!self.removals.is_empty())
     }
 
+    /// Copies keep their source directory modes, so a removal may sit under a
+    /// read-only parent or hold read-only directories. Grant the owner write
+    /// on a real parent only while its entry is unlinked.
+    fn apply_to_copy(&self) -> Result<bool, String> {
+        for path in &self.removals {
+            let remove = || super::checkpoints::remove_tree_if_present(path);
+            match path.parent() {
+                Some(parent) if fs::symlink_metadata(parent).is_ok_and(|meta| meta.is_dir()) => {
+                    with_owner_write_permission(parent, remove)
+                }
+                _ => remove(),
+            }
+            .map_err(|error| {
+                format!(
+                    "could not finish removing {}, part of it may already be gone: {error}",
+                    display_path(path)
+                )
+            })?;
+        }
+        Ok(!self.removals.is_empty())
+    }
+
     /// Records each removal as it completes, so a failure can report what is already gone.
     pub(crate) fn apply_recording(&self, removed: &mut Vec<PathBuf>) -> Result<(), String> {
         for path in &self.removals {
@@ -1538,7 +1560,11 @@ fn clear_runtime_state_preserving_paths(
 
     let mut cleanup = plan_runtime_state_cleanup(paths, &workspaces, preserved_roots, &files)?;
     cleanup.preserve_directory_entries(&directories, &files)?;
-    cleanup.apply()
+    if copying {
+        cleanup.apply_to_copy()
+    } else {
+        cleanup.apply()
+    }
 }
 
 fn plan_runtime_state_cleanup(

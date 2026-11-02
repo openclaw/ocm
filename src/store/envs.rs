@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::os::unix::fs::DirBuilderExt;
 
 use super::common::{
-    copy_dir_recursive, copy_dir_with_sqlite_snapshots, copy_path, ensure_dir, path_exists,
+    copy_dir_with_sqlite_snapshots, copy_environment_dir, copy_path, ensure_dir, path_exists,
     read_json, write_json,
 };
 use super::dev_sources::{DevSourceRemoval, ensure_root_outside_dev_sources};
@@ -1514,7 +1514,7 @@ pub(crate) fn import_environment_with_sandbox_origin(
                     &target_paths.root,
                 )?;
             } else {
-                copy_dir_recursive(&extracted.root_dir, &target_paths.root)?;
+                copy_environment_dir(&extracted.root_dir, &target_paths.root)?;
             }
             if extracted.metadata.include_state {
                 if config_directory_permissions.is_some() {

@@ -643,7 +643,17 @@ fn env_clone_preserves_aliased_readonly_include_graphs() {
             & 0o777,
         0o500
     );
-    fs::set_permissions(source.join("config"), fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        fs::metadata(target.join("config"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o500
+    );
+    for config in [source.join("config"), target.join("config")] {
+        fs::set_permissions(config, fs::Permissions::from_mode(0o700)).unwrap();
+    }
 }
 
 #[test]
@@ -5271,4 +5281,182 @@ fn env_clone_skips_fifos_and_sockets_without_blocking() {
             .file_type()
             .is_fifo()
     );
+}
+
+#[cfg(unix)]
+fn run_ocm_with_umask(
+    cwd: &Path,
+    env: &std::collections::BTreeMap<String, String>,
+    mask: u32,
+    args: &[&str],
+) -> std::process::Output {
+    // Change only the child shell's umask; other tests share this test process.
+    std::process::Command::new("/bin/sh")
+        .args(["-c", &format!("umask {mask:03o}; exec \"$@\""), "ocm-umask"])
+        .arg(support::ocm_test_binary_path())
+        .args(args)
+        .current_dir(cwd)
+        .env_clear()
+        .envs(env)
+        .output()
+        .unwrap()
+}
+
+#[cfg(unix)]
+fn directory_mode(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path).unwrap().permissions().mode() & 0o7777
+}
+
+#[cfg(unix)]
+const COPIED_DIRECTORY_MODES: [(&str, u32); 6] = [
+    ("", 0o700),
+    ("agents/main/agent", 0o700),
+    ("credentials", 0o700),
+    ("workspace/secrets", 0o700),
+    ("workspace/team", 0o750),
+    ("workspace/vendor", 0o555),
+];
+
+#[cfg(unix)]
+fn write_private_openclaw_state(state: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    write_text(&state.join("agents/main/agent/auth-profiles.json"), "{}");
+    write_text(&state.join("credentials/creds.json"), "{}");
+    write_text(&state.join("workspace/secrets/plans.txt"), "plans");
+    write_text(&state.join("workspace/team/notes.txt"), "notes");
+    write_text(&state.join("workspace/vendor/pinned.txt"), "pinned");
+    fs::set_permissions(
+        state.join("agents/main/agent/auth-profiles.json"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    for (path, mode) in COPIED_DIRECTORY_MODES.iter().rev() {
+        fs::set_permissions(state.join(path), fs::Permissions::from_mode(*mode)).unwrap();
+    }
+}
+
+#[cfg(unix)]
+fn assert_copied_directory_modes(state: &Path, label: &str) {
+    for (path, mode) in COPIED_DIRECTORY_MODES {
+        // Clone and default import leave out credentials by design.
+        if state.join(path).exists() {
+            assert_eq!(directory_mode(&state.join(path)), mode, "{label} {path}");
+        }
+    }
+    assert_eq!(
+        directory_mode(&state.join("agents/main/agent/auth-profiles.json")),
+        0o600,
+        "{label}"
+    );
+}
+
+#[cfg(unix)]
+fn make_removable(root: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    for entry in fs::read_dir(root).unwrap() {
+        let path = entry.unwrap().path();
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        if metadata.is_dir() {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            make_removable(&path);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn env_clone_and_default_import_keep_source_directory_modes() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = TestDir::new("clone-directory-modes");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    let create = run_ocm(&cwd, &env, &["env", "create", "source"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let source = root.child("ocm-home/envs/source");
+    write_private_openclaw_state(&source.join(".openclaw"));
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o710)).unwrap();
+
+    for mask in [0o022, 0o077] {
+        let clone_name = format!("clone-{mask:03o}");
+        let clone = run_ocm_with_umask(&cwd, &env, mask, &["env", "clone", "source", &clone_name]);
+        assert!(clone.status.success(), "{}", stderr(&clone));
+        let archive = format!("default-{mask:03o}.tar");
+        let export = run_ocm_with_umask(
+            &cwd,
+            &env,
+            mask,
+            &["env", "export", "source", "--output", &archive],
+        );
+        assert!(export.status.success(), "{}", stderr(&export));
+        let import_name = format!("import-{mask:03o}");
+        let import = run_ocm_with_umask(
+            &cwd,
+            &env,
+            mask,
+            &["env", "import", &archive, "--name", &import_name],
+        );
+        assert!(import.status.success(), "{}", stderr(&import));
+        for name in [clone_name, import_name] {
+            let target = root.child(format!("ocm-home/envs/{name}"));
+            assert_eq!(directory_mode(&target), 0o710, "{name}");
+            assert!(!target.join(".openclaw/credentials").exists(), "{name}");
+            assert_copied_directory_modes(&target.join(".openclaw"), &name);
+        }
+    }
+    make_removable(root.path());
+}
+
+#[cfg(unix)]
+#[test]
+fn migrate_and_adopt_import_keep_source_directory_modes() {
+    let root = TestDir::new("migrate-directory-modes");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    let home = root.child("home/.openclaw");
+    write_private_openclaw_state(&home);
+
+    for (name, args) in [
+        ("migrated", vec!["migrate", "migrated"]),
+        ("adopted", vec!["adopt", "import", "--name", "adopted"]),
+    ] {
+        let output = run_ocm_with_umask(&cwd, &env, 0o022, &args);
+        assert!(output.status.success(), "{}", stderr(&output));
+        let state = root.child(format!("ocm-home/envs/{name}/.openclaw"));
+        assert!(state.join("credentials/creds.json").exists(), "{name}");
+        assert_copied_directory_modes(&state, name);
+    }
+    make_removable(root.path());
+}
+
+#[cfg(unix)]
+#[test]
+fn env_clone_clears_runtime_state_under_a_read_only_state_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = TestDir::new("clone-read-only-state");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    let create = run_ocm(&cwd, &env, &["env", "create", "source"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    let state = root.child("ocm-home/envs/source/.openclaw");
+    write_text(&state.join("workspace/notes.txt"), "notes");
+    write_text(&state.join("logs/gateway.log"), "old");
+    fs::set_permissions(state.join("logs"), fs::Permissions::from_mode(0o555)).unwrap();
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o500)).unwrap();
+
+    let clone = run_ocm(&cwd, &env, &["env", "clone", "source", "target"]);
+    assert!(clone.status.success(), "{}", stderr(&clone));
+    let target = root.child("ocm-home/envs/target/.openclaw");
+    assert_eq!(directory_mode(&target), 0o500);
+    assert!(!target.join("logs").exists());
+    assert_eq!(
+        fs::read_to_string(target.join("workspace/notes.txt")).unwrap(),
+        "notes"
+    );
+    assert!(state.join("logs/gateway.log").exists());
+    assert_eq!(directory_mode(&state), 0o500);
+    make_removable(root.path());
 }

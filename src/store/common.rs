@@ -253,6 +253,8 @@ pub(crate) fn try_lock_file_shared(
 #[derive(Clone, Copy)]
 enum CopyPolicy {
     Ordinary,
+    /// Ordinary entries; each copied directory keeps its source mode.
+    OrdinaryPreservingModes,
     RuntimeAssembly,
     RuntimeRecovery,
 }
@@ -275,6 +277,18 @@ pub(crate) fn copy_runtime_path(source: &Path, destination: &Path) -> Result<(),
 /// Copy a runtime tree without changing the directory modes in its integrity digest.
 pub(crate) fn copy_dir_preserving_modes(source: &Path, destination: &Path) -> Result<(), String> {
     copy_dir_recursive_inner(source, destination, None, None, CopyPolicy::RuntimeRecovery)
+}
+
+/// Copy an environment tree whose directories keep their source modes, as
+/// clone and migration copies do, instead of the process umask.
+pub(crate) fn copy_environment_dir(source: &Path, destination: &Path) -> Result<(), String> {
+    copy_dir_recursive_inner(
+        source,
+        destination,
+        None,
+        None,
+        CopyPolicy::OrdinaryPreservingModes,
+    )
 }
 
 pub(crate) fn copy_dir_preserving_permissions(
@@ -432,7 +446,13 @@ impl<'a> OpenClawDirectoryCopy<'a> {
             )),
             None => None,
         };
-        copy_dir_recursive_inner(source, destination, Some(self), None, CopyPolicy::Ordinary)
+        copy_dir_recursive_inner(
+            source,
+            destination,
+            Some(self),
+            None,
+            CopyPolicy::OrdinaryPreservingModes,
+        )
     }
 
     // Returns the replacement target and whether it names a directory.
@@ -599,8 +619,10 @@ fn copy_dir_recursive_inner(
         }
     }
 
-    if matches!(policy, CopyPolicy::RuntimeRecovery)
-        || private_root.is_some_and(|root| root != destination)
+    if matches!(
+        policy,
+        CopyPolicy::OrdinaryPreservingModes | CopyPolicy::RuntimeRecovery
+    ) || private_root.is_some_and(|root| root != destination)
     {
         // Populate children before restoring modes, including read-only directories.
         let permissions = fs::metadata(source)
@@ -639,7 +661,10 @@ fn copy_path_inner(
 
     if file_type.is_symlink() {
         #[cfg(windows)]
-        if !matches!(policy, CopyPolicy::Ordinary) {
+        if matches!(
+            policy,
+            CopyPolicy::RuntimeAssembly | CopyPolicy::RuntimeRecovery
+        ) {
             if let Some(parent) = destination.parent() {
                 ensure_dir(parent)?;
             }
