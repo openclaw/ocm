@@ -335,6 +335,136 @@ fn assert_preflight_observation(observation: &str, source_root: &Path, environme
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn upgrade_preflights_the_package_behind_a_migrated_openclaw_executable() {
+    let root = TestDir::new("upgrade-preflight-migrated-executable");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    // A global npm install links bin/openclaw to the installed package entrypoint.
+    // `ocm migrate` stores this absolute path unquoted although `#` is shell syntax
+    // elsewhere in a launcher command.
+    let package = root.child("npm#1/lib/node_modules/openclaw");
+    fs::create_dir_all(&package).unwrap();
+    support::write_executable_script(
+        &package.join("openclaw.mjs"),
+        "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 2026.8.13; fi\nexit 0\n",
+    );
+    fs::write(
+        package.join("package.json"),
+        r#"{"name":"openclaw","version":"2026.8.13","bin":{"openclaw":"openclaw.mjs"}}"#,
+    )
+    .unwrap();
+    let bin = root.child("npm#1/bin");
+    fs::create_dir_all(&bin).unwrap();
+    std::os::unix::fs::symlink(
+        "../lib/node_modules/openclaw/openclaw.mjs",
+        bin.join("openclaw"),
+    )
+    .unwrap();
+    let home = root.child("home/.openclaw");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(home.join("openclaw.json"), "{}").unwrap();
+
+    let version = "2026.8.14";
+    let candidate = r#"#!/bin/sh
+case "$1" in
+  --version) echo 2026.8.14; exit 0 ;;
+  update)
+    if [ "$2" = preflight ]; then
+      printf '%s\n' "$5" "$OPENCLAW_STATE_DIR" "$OPENCLAW_CONFIG_PATH" > "$OCM_TEST_PREFLIGHT_OBSERVATION"
+      cat "$OCM_TEST_PREFLIGHT_RECEIPT"
+      exit 0
+    fi
+    printf '{"status":"ok","mode":"finalize","postUpdate":{}}\n'
+    exit 0 ;;
+  gateway) printf '{"rpc":{"ok":true}}\n'; exit 0 ;;
+esac
+exit 0
+"#;
+    let tarball = openclaw_package_tarball_with_manifest(
+        candidate,
+        &serde_json::json!({
+            "name": "openclaw",
+            "version": version,
+            "bin": {"openclaw": "openclaw.mjs"},
+            "openclaw": {"updatePreflightProtocol": 1}
+        })
+        .to_string(),
+    );
+    let tarball_server = TestHttpServer::serve_bytes_times(
+        "/openclaw-2026.8.14.tgz",
+        "application/octet-stream",
+        &tarball,
+        4,
+    );
+    let packument = serde_json::json!({
+        "dist-tags": {"latest": version},
+        "versions": {version: {
+            "version": version,
+            "dist": {"tarball": tarball_server.url(), "integrity": sha512_integrity(&tarball)}
+        }}
+    });
+    let packument_server = TestHttpServer::serve_bytes_sequence(
+        "/openclaw",
+        "application/json",
+        (0..8).map(|_| packument.to_string().into_bytes()).collect(),
+    );
+    let mut env = ocm_env(&root);
+    install_fake_node_and_npm(&root, &mut env, "22.22.3");
+    env.insert(
+        "OCM_INTERNAL_OPENCLAW_RELEASES_URL".into(),
+        packument_server.url(),
+    );
+    let path = format!("{}:{}", path_string(&bin), env["PATH"]);
+    env.insert("PATH".into(), path);
+    let observation = root.child("preflight-observation");
+    let receipt = root.child("preflight-receipt.json");
+    fs::write(
+        &receipt,
+        preflight_receipt_json("ready", version).to_string(),
+    )
+    .unwrap();
+    env.insert(
+        "OCM_TEST_PREFLIGHT_OBSERVATION".into(),
+        path_string(&observation),
+    );
+    env.insert("OCM_TEST_PREFLIGHT_RECEIPT".into(), path_string(&receipt));
+
+    let migrated = run_ocm(&cwd, &env, &["migrate", "mira"]);
+    assert!(migrated.status.success(), "{}", stderr(&migrated));
+    let launcher = run_ocm(&cwd, &env, &["launcher", "show", "mira.migrated", "--json"]);
+    assert!(launcher.status.success(), "{}", stderr(&launcher));
+    let launcher: Value = serde_json::from_slice(&launcher.stdout).unwrap();
+    // Migration quotes the path only when the shell would not read it as one word.
+    let command = launcher["command"].as_str().unwrap();
+    let executable = path_string(&bin.join("openclaw"));
+    assert!(
+        command == executable || command == ocm::infra::shell::quote_posix(&executable),
+        "{command}"
+    );
+
+    let upgraded = run_ocm(
+        &cwd,
+        &env,
+        &["upgrade", "mira", "--version", version, "--json"],
+    );
+    let summary: Value = serde_json::from_slice(&upgraded.stdout)
+        .unwrap_or_else(|_| panic!("{}", stderr(&upgraded)));
+    assert!(upgraded.status.success(), "{summary}");
+    assert_eq!(summary["outcome"], "switched", "{summary}");
+    let shown = run_ocm(&cwd, &env, &["env", "show", "mira", "--json"]);
+    assert!(shown.status.success(), "{}", stderr(&shown));
+    let environment: Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert!(environment["defaultLauncher"].is_null(), "{environment}");
+    assert!(environment["defaultRuntime"].is_string(), "{environment}");
+    assert_preflight_observation(
+        &fs::read_to_string(&observation).expect("preflight did not run"),
+        &fs::canonicalize(&package).unwrap(),
+        &environment,
+    );
+}
+
 #[test]
 fn upgrade_preflight_refusal_keeps_tracked_source_running() {
     assert_refused_preflights(false, false);
