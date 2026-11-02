@@ -573,6 +573,8 @@ New environment roots must be separate: a root cannot equal, contain, or sit
 inside another registered environment root, including through path aliases.
 Creation, cloning, import, and other commands that create an environment reject
 overlap before writing environment state, regardless of protection flags.
+A new root also cannot be `OCM_HOME`, contain it, or overlap the store
+directories OCM keeps there, such as `runtimes` or `snapshots`.
 Default sibling roots and disjoint custom roots remain valid.
 
 These operations also reject roots that overlap registered dev sources,
@@ -752,6 +754,7 @@ configuration rewriting, and cleanup behavior.
 Clone and imports without state reject symlinks or non-directory entries at `.openclaw`, `.openclaw/agents`, and `.openclaw/extensions` before rewriting or clearing copied state, preserving the source and leaving the target unregistered.
 Clone and imports without state remove unconfigured agent directory links from the copy without changing their linked source data.
 Configured agent directories inside the environment retain their payloads through clone and ordinary export/import; configured external or symlinked directories are rejected.
+Clone and ordinary export/import recreate an absolute link into the source environment, including a dangling one, as a relative link to the same location in the copy, as migration does, so the copy does not keep reading or writing the source environment. A link whose target the copy omits or clears points at that location in the copy rather than at the source. Relative links and links outside the environment keep their targets.
 Equivalent accepted and canonical environment-root spellings preserve the same configured agent payload, including agent directories nested in otherwise temporary locations.
 
 Clone (including upgrade simulation), `migrate`, and `adopt import` use SQLite snapshots for recognized operational databases: shared state and quarantine, canonical agent stores, legacy `memory/*.sqlite` stores, and the default Workboard, Team Reports, Logbook, and active Matrix account state stores.

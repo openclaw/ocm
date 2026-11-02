@@ -15,7 +15,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde_json::Value;
 
 use crate::env::EnvMeta;
-use crate::infra::archive::{EnvArchiveEntryKind, EnvArchiveOptions};
+use crate::infra::archive::{EnvArchiveEntryKind, EnvArchiveOptions, SymlinkRelocation};
 
 use super::common::path_exists;
 use super::layout::{EnvPaths, clean_path, derive_env_paths, display_path};
@@ -222,6 +222,9 @@ pub(crate) fn openclaw_env_archive_options(
         included_path_roots,
         excluded_path_roots,
         snapshot_sqlite_files: true,
+        // An import must not keep reading or writing the source through
+        // absolute links; relative links keep their authored targets.
+        symlink_relocation: SymlinkRelocation::Absolute,
         ..EnvArchiveOptions::default()
     };
     let git_paths = archived_git_paths_in_import_removed_roots(paths, &options)?;
@@ -591,7 +594,7 @@ pub(crate) fn openclaw_env_state_archive_options(
         should_preserve_bytes: |path| {
             is_integrity_protected_history_path(Path::new(".openclaw"), path)
         },
-        relocate_internal_symlinks: true,
+        symlink_relocation: SymlinkRelocation::Owned,
         private_output: true,
         ..EnvArchiveOptions::default()
     })
@@ -3381,6 +3384,10 @@ impl<'a> OpenClawSqliteCopy<'a> {
             }
         }
         Ok(())
+    }
+
+    pub(super) fn state_root(&self) -> &Path {
+        self.state_root
     }
 
     // Takes a path relative to the copied state root.

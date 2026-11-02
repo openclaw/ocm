@@ -282,10 +282,33 @@ fn read_receipt(root: &Path) -> Result<Receipt, String> {
         .map_err(|error| format!("cannot read self-update receipt: {error}"))?;
     let receipt: Receipt =
         serde_json::from_slice(&data).map_err(|e| format!("invalid self-update receipt: {e}"))?;
-    if receipt.schema != 1 || transaction_root(&receipt.binary_path)? != root {
+    if receipt.schema != 1 || !same_journal(&transaction_root(&receipt.binary_path)?, root) {
         return Err("unsupported or misplaced self-update receipt".into());
     }
     Ok(receipt)
+}
+
+/// Another spelling of the install directory, such as a symlinked directory,
+/// a second PATH entry or a case variant, reaches the same journal directory.
+/// The final component is not followed and must be a directory, so a journal
+/// that is a symlink (or a hard link to one) stays foreign, and a moved
+/// directory leaves the recorded path reaching nothing.
+fn same_journal(recorded: &Path, found: &Path) -> bool {
+    if recorded == found {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        matches!(
+            (fs::symlink_metadata(recorded), fs::symlink_metadata(found)),
+            (Ok(recorded), Ok(found))
+                if found.is_dir()
+                    && (recorded.dev(), recorded.ino()) == (found.dev(), found.ino())
+        )
+    }
+    #[cfg(not(unix))]
+    false
 }
 
 fn spawn_worker(cli: &Cli, previous: &Path, receipt: &Receipt) -> Result<Child, String> {

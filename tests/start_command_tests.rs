@@ -245,6 +245,38 @@ fn start_refused_by_a_non_empty_root_removes_the_launcher_it_created() {
 }
 
 #[test]
+fn start_refused_by_an_ocm_store_root_removes_the_launcher_it_created() {
+    let root = TestDir::new("start-refused-store-root");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    let store = root.child("ocm-home/launchers");
+    let store_arg = path_string(&store);
+
+    let refused = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "start",
+            "demo",
+            "--command",
+            "openclaw",
+            "--root",
+            &store_arg,
+            "--no-service",
+        ],
+    );
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(
+        stderr(&refused).contains("overlaps OCM store"),
+        "{}",
+        stderr(&refused)
+    );
+    assert_launcher_absent(&cwd, &env, "demo.local");
+    assert!(!store.join(".openclaw").exists());
+}
+
+#[test]
 fn start_refused_for_an_existing_env_removes_only_a_launcher_it_created() {
     let root = TestDir::new("start-refused-existing-launcher");
     let cwd = root.child("workspace");
@@ -1024,6 +1056,96 @@ fn start_minimum_setup_does_not_traverse_unrelated_external_includes() {
             fs::read_to_string(workspace.join("marker")).unwrap(),
             "authored data"
         );
+    }
+}
+
+#[test]
+fn start_keeps_an_inline_gateway_port_beside_admitted_external_includes() {
+    for shape in ["root-include", "nested-include", "include-only"] {
+        let root = TestDir::new(shape);
+        let cwd = root.child("cwd");
+        let shared = root.child("shared");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&shared).unwrap();
+        let mut env = ocm_env(&root);
+        for args in [
+            vec!["launcher", "add", "stable", "--command", "openclaw"],
+            vec!["env", "create", "demo", "--launcher", "stable"],
+        ] {
+            let result = run_ocm(&cwd, &env, &args);
+            assert!(result.status.success(), "{}", stderr(&result));
+        }
+        let status = |env: &BTreeMap<String, String>| {
+            let result = run_ocm(&cwd, env, &["env", "status", "demo", "--json"]);
+            assert!(result.status.success(), "{}", stderr(&result));
+            let status: Value = serde_json::from_str(&stdout(&result)).unwrap();
+            (
+                status["gatewayPort"].clone(),
+                status["gatewayPortSource"].clone(),
+            )
+        };
+        let (automatic, source) = status(&env);
+        assert_eq!(source, "computed");
+        assert_ne!(automatic, 28541);
+
+        let external = shared.join("common.json5");
+        let payload = if shape == "include-only" {
+            "{gateway:{port:28541}}\n"
+        } else {
+            "{providers:{}}\n"
+        };
+        fs::write(&external, payload).unwrap();
+        let config = match shape {
+            "root-include" => serde_json::json!({
+                "$include": path_string(&external),
+                "gateway": {"port": 28541}
+            }),
+            "nested-include" => serde_json::json!({
+                "models": {"$include": path_string(&external)},
+                "gateway": {"port": 28541}
+            }),
+            _ => serde_json::json!({"$include": path_string(&external)}),
+        };
+        let config_path = root.child("ocm-home/envs/demo/.openclaw/openclaw.json");
+        let original = serde_json::to_vec(&config).unwrap();
+        fs::write(&config_path, &original).unwrap();
+
+        let configured = (Value::from(28541), Value::from("config"));
+        let computed = (automatic.clone(), Value::from("computed"));
+        // An inline port overrides every include, so it is honored even
+        // without the admitted root. Start still refuses a required setting
+        // that only the unadmitted include could supply, without writing.
+        if shape == "nested-include" {
+            assert_eq!(status(&env), configured);
+        } else {
+            let expected = if shape == "root-include" {
+                &configured
+            } else {
+                &computed
+            };
+            assert_eq!(&status(&env), expected, "{shape}");
+            let refused = run_ocm(&cwd, &env, &["start", "demo", "--no-service"]);
+            assert!(!refused.status.success(), "{shape}");
+            assert!(stderr(&refused).contains("outside the admitted configuration roots"));
+            assert_eq!(fs::read(&config_path).unwrap(), original);
+        }
+
+        env.insert("OPENCLAW_INCLUDE_ROOTS".to_string(), path_string(&shared));
+        if shape == "include-only" {
+            // A port supplied only by an include outside the config directory
+            // is not read; the saved automatic port applies.
+            assert_eq!(status(&env), computed);
+        } else {
+            assert_eq!(status(&env), configured, "{shape}");
+            let started = run_ocm(&cwd, &env, &["start", "demo", "--no-service", "--json"]);
+            assert!(started.status.success(), "{shape}: {}", stderr(&started));
+            let summary: Value = serde_json::from_str(&stdout(&started)).unwrap();
+            assert_eq!(summary["gatewayPort"], 28541, "{shape}");
+            let raw: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+            assert_eq!(raw["gateway"]["port"], 28541, "{shape}");
+            assert_eq!(status(&env), configured, "{shape}");
+        }
+        assert_eq!(fs::read_to_string(&external).unwrap(), payload);
     }
 }
 

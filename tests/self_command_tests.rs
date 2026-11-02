@@ -674,6 +674,151 @@ fn self_update_unchanged_still_refuses_an_unfinished_receipt() {
     assert!(release.requests().is_empty());
 }
 
+/// Writes a finished receipt for `recorded` into `journal`, as an update
+/// started through that spelling of the executable would leave it.
+#[cfg(unix)]
+fn write_updated_receipt(root: &TestDir, journal: &Path, recorded: &Path) -> Vec<u8> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::create_dir_all(journal).unwrap();
+    fs::set_permissions(journal, fs::Permissions::from_mode(0o700)).unwrap();
+    let receipt = serde_json::json!({
+        "schema": 1,
+        "id": "finished",
+        "phase": "updated",
+        "binaryPath": recorded,
+        "ocmHome": root.child("ocm-home"),
+        "userHome": root.child("home"),
+        "currentVersion": "0.0.1",
+        "targetVersion": env!("CARGO_PKG_VERSION"),
+        "previousSha256": "0",
+        "candidateSha256": "0",
+        "daemonWasRunning": false,
+        "gateways": [],
+        "error": null,
+        "rollbackError": null,
+    });
+    let bytes = serde_json::to_vec_pretty(&receipt).unwrap();
+    fs::write(journal.join("receipt.json"), &bytes).unwrap();
+    bytes
+}
+
+#[cfg(unix)]
+#[test]
+fn self_update_reads_a_receipt_through_another_spelling_of_the_install_dir() {
+    let root = TestDir::new("self-update-install-dir-alias");
+    let real = fs::canonicalize(copied_ocm(&root)).unwrap();
+    let bin = real.parent().unwrap();
+    let alias = bin.with_file_name("bin-alias").join("ocm");
+    std::os::unix::fs::symlink(bin, alias.parent().unwrap()).unwrap();
+    // The update ran through the symlinked directory.
+    let journal = bin.join(".ocm.self-update");
+    let receipt = write_updated_receipt(&root, &journal, &alias);
+    let metadata = format!(
+        "{{\"tag_name\":\"v{}\",\"assets\":[]}}",
+        env!("CARGO_PKG_VERSION")
+    );
+    let release =
+        TestHttpServer::serve_bytes_times("/release", "application/json", metadata.as_bytes(), 2);
+    let env = release_env(&root, &release.url());
+
+    let mut spellings = vec![real.clone()];
+    // A case variant reaches the same file on case-insensitive storage.
+    let upper = bin.with_file_name("BIN").join("ocm");
+    if fs::symlink_metadata(&upper).is_ok() {
+        spellings.push(upper);
+    }
+    for binary in &spellings {
+        for args in [
+            ["self", "update", "--status"],
+            ["self", "update", "--recover"],
+        ] {
+            let output = run_ocm_binary(binary, root.path(), &env, &args);
+            assert!(
+                output.status.success(),
+                "{args:?} through {}: {}",
+                binary.display(),
+                stderr(&output)
+            );
+            let shown: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(shown["phase"], "updated");
+            assert_eq!(shown["binaryPath"], path_string(&alias));
+        }
+        // Admission reads the finished receipt before an unchanged release.
+        let update = run_ocm_binary(binary, root.path(), &env, &["self", "update", "--json"]);
+        assert!(update.status.success(), "{}", stderr(&update));
+        let summary: serde_json::Value = serde_json::from_slice(&update.stdout).unwrap();
+        assert_eq!(summary["status"], "upToDate");
+    }
+    assert_eq!(fs::read(journal.join("receipt.json")).unwrap(), receipt);
+}
+
+#[cfg(unix)]
+#[test]
+fn self_update_refuses_a_receipt_for_another_or_moved_install_dir() {
+    let root = TestDir::new("self-update-foreign-install-dir");
+    let base = fs::canonicalize(root.path()).unwrap();
+    let install = |dir: &str| {
+        let binary = base.join(dir).join("ocm");
+        fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        fs::copy(env!("CARGO_BIN_EXE_ocm"), &binary).unwrap();
+        binary
+    };
+    let other = install("other/bin");
+    write_updated_receipt(&root, &other.with_file_name(".ocm.self-update"), &other);
+    // A receipt for another binary, copied beside this one.
+    let copied = install("copied/bin");
+    write_updated_receipt(&root, &copied.with_file_name(".ocm.self-update"), &other);
+    // A journal that is a symlink to another binary's journal.
+    let linked = install("linked/bin");
+    std::os::unix::fs::symlink(
+        other.with_file_name(".ocm.self-update"),
+        linked.with_file_name(".ocm.self-update"),
+    )
+    .unwrap();
+    // Two journal paths that are one symlink inode: a hard link to the
+    // symlink at another binary's journal.
+    let parked = base.join("parked");
+    write_updated_receipt(&root, &parked, &base.join("hard/bin/ocm"));
+    let hard = install("hard/bin");
+    let hard_linked = install("hard-linked/bin");
+    std::os::unix::fs::symlink(&parked, hard.with_file_name(".ocm.self-update")).unwrap();
+    fs::hard_link(
+        hard.with_file_name(".ocm.self-update"),
+        hard_linked.with_file_name(".ocm.self-update"),
+    )
+    .unwrap();
+    // An install directory moved after its update: the recorded path is gone.
+    let moved = install("moved/bin");
+    write_updated_receipt(
+        &root,
+        &moved.with_file_name(".ocm.self-update"),
+        &base.join("old/bin/ocm"),
+    );
+    let env = release_env(&root, "http://127.0.0.1:9/unused");
+
+    for binary in [&copied, &linked, &hard_linked, &moved] {
+        for args in [
+            ["self", "update", "--status"],
+            ["self", "update", "--recover"],
+        ] {
+            let output = run_ocm_binary(binary, root.path(), &env, &args);
+            assert!(
+                !output.status.success(),
+                "{args:?} through {}: {}",
+                binary.display(),
+                stdout(&output)
+            );
+            assert!(
+                stderr(&output).contains("unsupported or misplaced self-update receipt"),
+                "{args:?} through {}: {}",
+                binary.display(),
+                stderr(&output)
+            );
+        }
+    }
+}
+
 #[test]
 fn self_update_refuses_an_unknown_daemon_version_before_replacement() {
     let root = TestDir::new("self-update-running-daemon-skew");

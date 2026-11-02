@@ -242,6 +242,13 @@ fn copy_database_files_into(
         let mut hasher = Sha256::new();
         let mut buffer = vec![0_u8; 64 * 1024];
         loop {
+            if crate::infra::interrupt::cancellation_requested() {
+                return Err(format!(
+                    "failed to read {}: {}",
+                    path.display(),
+                    crate::infra::interrupt::cancelled_error()
+                ));
+            }
             let read = file
                 .read(&mut buffer)
                 .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
@@ -462,6 +469,15 @@ fn backup_database(
         )
     })?;
     loop {
+        // Stop between steps; returning closes the target connection before
+        // its caller removes the snapshot file.
+        if crate::infra::interrupt::cancellation_requested() {
+            return Err(format!(
+                "failed to copy SQLite database {}: {}",
+                source.display(),
+                crate::infra::interrupt::cancelled_error()
+            ));
+        }
         let status = match backup.step(SQLITE_BACKUP_PAGES_PER_STEP) {
             Ok(status) => status,
             Err(error) if sqlite_needs_rollback(&error) => return Ok(false),

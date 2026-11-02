@@ -1,14 +1,14 @@
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output};
 use std::time::Duration;
 
 use serde::Serialize;
 
 use super::platform::{
     ManagedServiceEnablement, ServiceManagerKind, gui_domain, service_manager_binary,
-    service_manager_kind,
+    service_manager_detail, service_manager_kind,
 };
 use crate::cli::render::format_rfc3339;
 use crate::env::GatewayProcessSpec;
@@ -717,6 +717,20 @@ pub(crate) fn inspect_job_for_recovery(
     inspect_job_inner(label, service_path, env, JobInspection::Recovery)
 }
 
+/// A failed manager read keeps the manager's own explanation, such as an
+/// unreachable user bus or launchd domain, so refusals name their cause.
+fn inspection_failure(label: &str, command: &str, output: &Output) -> String {
+    let detail = service_manager_detail(output);
+    if detail.is_empty() {
+        format!(
+            "failed to inspect managed service {label}: {command} exited with {}",
+            output.status
+        )
+    } else {
+        format!("failed to inspect managed service {label}: {command} failed: {detail}")
+    }
+}
+
 fn inspect_job_inner(
     label: &str,
     service_path: &Path,
@@ -748,10 +762,7 @@ fn inspect_job_inner(
                 {
                     return Ok(status);
                 }
-                return Err(format!(
-                    "failed to inspect managed service {label}: launchctl exited with {}",
-                    output.status
-                ));
+                return Err(inspection_failure(label, "launchctl print", &output));
             }
             status.loaded = true;
             parse_launchctl_print(&String::from_utf8_lossy(&output.stdout), &mut status);
@@ -795,10 +806,7 @@ fn inspect_job_inner(
                 return Ok(status);
             }
             if !output.status.success() {
-                return Err(format!(
-                    "failed to inspect managed service {label}: systemctl exited with {}",
-                    output.status
-                ));
+                return Err(inspection_failure(label, "systemctl --user show", &output));
             }
             parse_systemctl_show(&text, &mut status);
             if checked {
@@ -853,10 +861,7 @@ pub(crate) fn observe_job_for_source_watch(
                 {
                     return Ok(ManagedJobObservation::Absent);
                 }
-                return Err(format!(
-                    "failed to inspect managed service {label}: launchctl exited with {}",
-                    output.status
-                ));
+                return Err(inspection_failure(label, "launchctl print", &output));
             }
             status.loaded = true;
             parse_launchctl_print(&String::from_utf8_lossy(&output.stdout), &mut status);
@@ -883,10 +888,7 @@ pub(crate) fn observe_job_for_source_watch(
                 return Ok(ManagedJobObservation::Absent);
             }
             if !output.status.success() {
-                return Err(format!(
-                    "failed to inspect managed service {label}: systemctl exited with {}",
-                    output.status
-                ));
+                return Err(inspection_failure(label, "systemctl --user show", &output));
             }
             if property("LoadState=") != Some("loaded") {
                 return Err(format!("managed service {label} has an unknown load state"));

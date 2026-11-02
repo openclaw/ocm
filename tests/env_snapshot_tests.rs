@@ -151,12 +151,36 @@ fn env_snapshot_refuses_storage_inside_custom_roots_and_preserves_disjoint_roots
             }
             _ => root.child("live"),
         };
+        // New roots may not overlap OCM's store. Register the overlapping
+        // layouts the way earlier OCM versions admitted them.
+        let physical = match layout {
+            "exact" => Some(storage.join("source")),
+            "ancestor" => Some(storage.clone()),
+            #[cfg(unix)]
+            "source-alias" => Some(storage.join("source")),
+            _ => None,
+        };
+        let admitted = if physical.is_some() {
+            root.child("admitted")
+        } else {
+            live.clone()
+        };
         let create = run_ocm(
             root.path(),
             &env,
-            &["env", "create", "source", "--root", &path_string(&live)],
+            &["env", "create", "source", "--root", &path_string(&admitted)],
         );
         assert!(create.status.success(), "{layout}: {}", stderr(&create));
+        if let Some(physical) = physical {
+            if physical.is_dir() {
+                fs::remove_dir(&physical).unwrap();
+            }
+            fs::create_dir_all(physical.parent().unwrap()).unwrap();
+            fs::rename(&admitted, &physical).unwrap();
+            let mut source = get_environment("source", &env, root.path()).unwrap();
+            source.root = path_string(&live);
+            save_environment(source, &env, root.path()).unwrap();
+        }
         #[cfg(unix)]
         if layout == "storage-alias" {
             fs::remove_dir(&storage).unwrap();
