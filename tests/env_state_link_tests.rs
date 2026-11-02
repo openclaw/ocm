@@ -5,7 +5,8 @@ mod support;
 use std::fs;
 use std::os::unix::fs::symlink;
 
-use support::{TestDir, ocm_env, run_ocm, stderr, write_text};
+use serde_json::Value;
+use support::{TestDir, ocm_env, run_ocm, stderr, write_executable_script, write_text};
 
 fn check_copy_layout(layout: &str, import: bool) {
     let root = TestDir::new(&format!("state-link-{layout}-{import}"));
@@ -210,5 +211,181 @@ fn unmodified_export_import_preserves_source_state_across_directory_and_link_lay
         "state-link",
     ] {
         check_copy_layout(layout, true);
+    }
+}
+
+fn check_checkpoint_layout(layout: &str) {
+    let root = TestDir::new(&format!("checkpoint-state-link-{layout}"));
+    let mut env = ocm_env(&root);
+    let finalized = root.child("finalized");
+    env.insert("OCM_TEST_FINALIZED".into(), finalized.display().to_string());
+    for (name, version) in [("old", "2026.9.1"), ("new", "2026.9.2")] {
+        let executable = root.child(name);
+        write_executable_script(
+            &executable,
+            &format!(
+                r#"#!/bin/sh
+case "$1 $2" in
+  '--version ') echo '{version}';;
+  'config validate') echo 'Config valid';;
+  'doctor --lint') echo '{{"ok":true,"checksRun":1,"checksSkipped":0,"findings":[]}}';;
+  'update finalize')
+    : > "$OCM_TEST_FINALIZED"
+    echo '{{"status":"ok","mode":"finalize","postUpdate":{{"doctor":{{"status":"ok"}},"plugins":{{"status":"ok"}}}}}}';;
+  'gateway status') echo '{{"rpc":{{"ok":true}}}}';;
+  *) echo "unexpected fixture invocation $*" >&2; exit 91;;
+esac
+"#
+            ),
+        );
+        let result = run_ocm(
+            root.path(),
+            &env,
+            &[
+                "runtime",
+                "add",
+                name,
+                "--path",
+                executable.to_str().unwrap(),
+            ],
+        );
+        assert!(result.status.success(), "{}", stderr(&result));
+    }
+    let create = run_ocm(
+        root.path(),
+        &env,
+        &["env", "create", "demo", "--runtime", "old"],
+    );
+    assert!(create.status.success(), "{}", stderr(&create));
+    let env_root = root.child("ocm-home/envs/demo");
+    let state = env_root.join(".openclaw");
+    write_text(&state.join("openclaw.json"), "{}\n");
+    write_text(
+        &state.join("agents/main/sessions/session.jsonl"),
+        "before\n",
+    );
+    write_text(&state.join("extensions/demo/index.js"), "before\n");
+    let external = root.child("external");
+    let moved = |relative: &str, target: std::path::PathBuf| {
+        fs::rename(state.join(relative), &target).unwrap();
+        symlink(&target, state.join(relative)).unwrap();
+    };
+    match layout {
+        "directory" => {}
+        "inside-state-link" => {
+            fs::rename(&state, env_root.join("state")).unwrap();
+            symlink("state", &state).unwrap();
+        }
+        "state-link" => {
+            fs::rename(&state, &external).unwrap();
+            symlink(&external, &state).unwrap();
+        }
+        "dangling-state-link" => {
+            fs::remove_dir_all(&state).unwrap();
+            symlink(root.child("missing"), &state).unwrap();
+        }
+        "agents-link" => moved("agents", external.clone()),
+        "relative-agents-link" => {
+            fs::rename(state.join("agents"), &external).unwrap();
+            symlink("../../../../external", state.join("agents")).unwrap();
+        }
+        "extensions-link" => moved("extensions", external.clone()),
+        _ => unreachable!(),
+    }
+    let session = state.join("agents/main/sessions/session.jsonl");
+    let snapshots = || {
+        let list = run_ocm(
+            root.path(),
+            &env,
+            &["env", "snapshot", "list", "demo", "--json"],
+        );
+        assert!(list.status.success(), "{}", stderr(&list));
+        serde_json::from_slice::<Value>(&list.stdout).unwrap()
+    };
+    let binding = || {
+        let show = run_ocm(root.path(), &env, &["env", "show", "demo", "--json"]);
+        assert!(show.status.success(), "{}", stderr(&show));
+        serde_json::from_slice::<Value>(&show.stdout).unwrap()["defaultRuntime"].clone()
+    };
+
+    let snapshot = run_ocm(
+        root.path(),
+        &env,
+        &["env", "snapshot", "create", "demo", "--json"],
+    );
+    let archive = root.child("state.ocm-env.tar");
+    let export = run_ocm(
+        root.path(),
+        &env,
+        &[
+            "env",
+            "export",
+            "demo",
+            "--include-state",
+            "--output",
+            archive.to_str().unwrap(),
+        ],
+    );
+    if matches!(layout, "directory" | "inside-state-link") {
+        assert!(snapshot.status.success(), "{}", stderr(&snapshot));
+        let id = serde_json::from_slice::<Value>(&snapshot.stdout).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        write_text(&session, "after\n");
+        let restore = run_ocm(
+            root.path(),
+            &env,
+            &["env", "snapshot", "restore", "demo", &id],
+        );
+        assert!(restore.status.success(), "{}", stderr(&restore));
+        assert_eq!(fs::read_to_string(&session).unwrap(), "before\n");
+        assert!(export.status.success(), "{}", stderr(&export));
+        let upgrade = run_ocm(root.path(), &env, &["upgrade", "demo", "--runtime", "new"]);
+        assert!(upgrade.status.success(), "{}", stderr(&upgrade));
+        assert!(finalized.exists());
+        assert_eq!(binding(), "new");
+        return;
+    }
+
+    for (command, result) in [("snapshot create", &snapshot), ("export", &export)] {
+        assert!(
+            !result.status.success(),
+            "{command} accepted unsafe layout: {layout}"
+        );
+        assert!(
+            stderr(result).contains("resolves outside the environment root"),
+            "{command} {layout}: {}",
+            stderr(result)
+        );
+    }
+    assert!(fs::symlink_metadata(&archive).is_err(), "archive written");
+    let upgrade = run_ocm(root.path(), &env, &["upgrade", "demo", "--runtime", "new"]);
+    assert!(!upgrade.status.success(), "upgrade accepted: {layout}");
+    assert!(
+        stderr(&upgrade).contains("resolves outside the environment root"),
+        "{}",
+        stderr(&upgrade)
+    );
+    assert!(!finalized.exists(), "upgrade finalized before refusing");
+    assert_eq!(binding(), "old");
+    assert_eq!(snapshots(), serde_json::json!([]));
+    if layout != "dangling-state-link" {
+        assert_eq!(fs::read_to_string(&session).unwrap(), "before\n");
+    }
+}
+
+#[test]
+fn checkpoints_and_state_export_refuse_state_linked_outside_the_root() {
+    for layout in [
+        "directory",
+        "inside-state-link",
+        "state-link",
+        "dangling-state-link",
+        "agents-link",
+        "relative-agents-link",
+        "extensions-link",
+    ] {
+        check_checkpoint_layout(layout);
     }
 }

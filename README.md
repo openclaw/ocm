@@ -376,6 +376,14 @@ its former backing directory is left untouched. Older tree checkpoints whose
 artifact is itself a symlink are refused on restore: they did not retain
 historical contents. Create a new snapshot to protect the current contents.
 
+Snapshot creation, upgrade checkpoints (including the safety checkpoint taken
+by `upgrade rollback`) and `env export --include-state` refuse an environment
+whose `.openclaw`, `.openclaw/agents` or `.openclaw/extensions` is a symlink
+that resolves outside the environment root, before capturing, stopping a running
+gateway or switching the runtime. Such a link would be captured instead of the
+state behind it, so restore and rollback could not return that state. Links at
+those paths that resolve inside the root are captured with their targets.
+
 Snapshot removal validates that the stored environment, snapshot ID, and
 artifact path match the named snapshot before deleting anything. It takes the
 live metadata and checkpoint out of service together, then reports warnings if

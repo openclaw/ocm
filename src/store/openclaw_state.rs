@@ -560,6 +560,7 @@ fn export_git_selection_error(repository: &Path, error: String) -> String {
 pub(crate) fn openclaw_env_state_archive_options(
     paths: &EnvPaths,
 ) -> Result<EnvArchiveOptions, String> {
+    validate_runtime_state_inside_root(paths)?;
     // This mode archives files without interpreting OpenClaw configuration.
     // Do not follow linked directories while discovering rebuildable debris.
     let excluded_path_roots = if fs::symlink_metadata(&paths.state_dir)
@@ -1461,6 +1462,38 @@ pub(crate) fn validate_nonportable_runtime_state_paths(paths: &EnvPaths) -> Resu
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(())
+}
+
+/// Checkpoints and state archives keep links inside the root as links, so a
+/// state directory linked outside the root would leave its contents behind.
+/// Links that stay inside the root are captured together with their targets.
+pub(crate) fn validate_runtime_state_inside_root(paths: &EnvPaths) -> Result<(), String> {
+    let root = fs::canonicalize(&paths.root).map_err(|error| error.to_string())?;
+    for path in [
+        paths.state_dir.clone(),
+        paths.state_dir.join("agents"),
+        paths.state_dir.join("extensions"),
+    ] {
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {}
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.to_string()),
+        }
+        // Resolve the link's own target so a dangling external link is refused too.
+        let target = fs::read_link(&path).map_err(|error| error.to_string())?;
+        let parent = path.parent().ok_or("OpenClaw state path has no parent")?;
+        let resolved = canonicalize_path_allow_missing(&parent.join(target))?;
+        if resolved == root || !resolved.starts_with(&root) {
+            return Err(format!(
+                "cannot safely preserve OpenClaw state through a symlink that resolves outside the environment root: {} (resolved: {}; environment root resolves to: {}); replace the link with a real directory inside the environment root",
+                display_path(&path),
+                display_path(&resolved),
+                display_path(&root)
+            ));
         }
     }
     Ok(())

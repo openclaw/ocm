@@ -1667,6 +1667,10 @@ fn check_snapshot_residue_preserves_source(root_link: bool, borrowed: bool) {
     } else {
         linked.join(".openclaw")
     };
+    // New snapshots refuse a state directory linked outside the root, so
+    // capture before linking it; restore must still not follow the live link.
+    let state_snapshot =
+        (!root_link).then(|| fixture.run_ok(&["env", "snapshot", "create", "linked", "--json"]));
     fs::remove_dir_all(&link).unwrap();
     symlink(&source, &link).unwrap();
     let residue = if root_link {
@@ -1677,7 +1681,8 @@ fn check_snapshot_residue_preserves_source(root_link: bool, borrowed: bool) {
     write_text(&residue.join("Cargo.lock"), "authored source lock\n");
     write_text(&residue.join("run/keep"), "authored source data\n");
     let child_before = fixture.child_witness();
-    let snapshot = fixture.run_ok(&["env", "snapshot", "create", "linked", "--json"]);
+    let snapshot = state_snapshot
+        .unwrap_or_else(|| fixture.run_ok(&["env", "snapshot", "create", "linked", "--json"]));
     let snapshot: Value = serde_json::from_str(&stdout(&snapshot)).unwrap();
     fixture.run_ok(&[
         "env",
@@ -1722,10 +1727,12 @@ fn legacy_snapshot_restore_preserves_linked_registered_source() {
     let source = fixture.project.join(".worktrees/child");
     let linked = fixture.root.child("ocm-home/envs/linked");
     let state_link = linked.join(".openclaw");
-    fs::remove_dir_all(&state_link).unwrap();
-    symlink(&source, &state_link).unwrap();
+    // New snapshots refuse this link, so record the snapshot first and
+    // replace its artifact with the historical archive shape below.
     let captured = fixture.run_ok(&["env", "snapshot", "create", "linked", "--json"]);
     let captured: Value = serde_json::from_str(&stdout(&captured)).unwrap();
+    fs::remove_dir_all(&state_link).unwrap();
+    symlink(&source, &state_link).unwrap();
     let id = captured["id"].as_str().unwrap();
     let cwd = fixture.root.path();
     let meta = get_environment("linked", &fixture.env, cwd).unwrap();
