@@ -1338,7 +1338,12 @@ fn absolute_archive_link_target(
     }
     let inside = root_relative_link_target(source_root, captured_target)?;
     let parent = path.parent()?.strip_prefix(source_root).ok()?;
-    Some((relative_link_target(parent, &inside), inside))
+    // The physical target decides whether the archived link names a directory.
+    let physical = fs::canonicalize(source_root.join(&inside))
+        .ok()
+        .and_then(|target| target.strip_prefix(source_root).ok().map(Path::to_path_buf))
+        .unwrap_or_else(|| inside.clone());
+    Some((relative_link_target(parent, &inside), physical))
 }
 
 // Returns the root-relative path a link target names, without resolving the
