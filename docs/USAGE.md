@@ -192,8 +192,8 @@ OCM owns the native Vite process and prints its initial
 native browser handoff once both documents are ready. The UI uses a captured
 loopback address retained across stop/start for that environment. A busy retained
 port is an error; OCM does not silently choose another address. When another
-environment's Gateway port family holds it, the error names that environment;
-remove that environment to release the address, or start with `--no-ui`. Clone and import
+environment's Gateway port family holds it, the error names that other
+environment; remove it to release the address, or start with `--no-ui`. Clone and import
 select new addresses, while snapshot restore keeps the current environment's
 reservation. Removing the environment releases it. `ocm dev status luna` reports
 the address. On Linux, macOS, and Windows, a matching repeated start requests a

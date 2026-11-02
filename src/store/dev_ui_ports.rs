@@ -244,6 +244,48 @@ mod tests {
     }
 
     #[test]
+    fn retained_dev_ui_port_refusal_names_the_claim_that_holds_it() {
+        let root = tempfile::tempdir().unwrap();
+        let env = environment(root.path());
+        let mut alpha = create("alpha", &env, root.path());
+        let socket = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = u32::from(socket.local_addr().unwrap().port());
+        alpha.dev_ui_port = Some(port);
+        let refusal = |metas: &[EnvMeta]| {
+            super::super::gateway_ports::choose_source_ui_port(&alpha, metas, &[], &env)
+                .unwrap_err()
+        };
+
+        // A bound socket keeps the occupied wording.
+        assert!(refusal(&[alpha.clone()]).contains("occupied or reserved"));
+
+        // Another environment's Gateway port family names that environment.
+        let mut other = alpha.clone();
+        other.name = "other".to_string();
+        other.gateway_port = Some(port - 1);
+        other.dev_ui_port = None;
+        let claimed = refusal(&[alpha.clone(), other.clone()]);
+        assert!(
+            claimed.contains(&format!(
+                "retained UI port {port} for env alpha is claimed by env other's Gateway port family"
+            )) && claimed.contains("--no-ui")
+                && !claimed.contains("occupied or reserved"),
+            "{claimed}"
+        );
+
+        // The environment's own family cannot be released by removing it.
+        let mut own = alpha.clone();
+        own.gateway_port = Some(port - 1);
+        let own_claim = refusal(&[own]);
+        assert!(
+            own_claim.contains("is inside its own Gateway port family")
+                && own_claim.contains("--no-ui")
+                && !own_claim.contains("remove env"),
+            "{own_claim}"
+        );
+    }
+
+    #[test]
     fn dev_ui_ports_survive_old_writers_restore_clone_and_removal() {
         let root = tempfile::tempdir().unwrap();
         let env = environment(root.path());

@@ -210,13 +210,24 @@ pub(super) fn choose_source_ui_port(
         if !(1..=u16::MAX as u32).contains(&port) {
             return Err(format!("env {} has an invalid retained UI port", meta.name));
         }
-        let gateway_owner = gateway_ports.iter().find_map(|(name, base)| {
-            let (start, end) = openclaw_port_family_range(*base.as_ref().ok()?);
-            (start..=end).contains(&port).then_some((name, start, end))
-        });
-        if let Some((owner, start, end)) = gateway_owner {
+        let gateway_owner = |own: bool| {
+            gateway_ports
+                .iter()
+                .filter(|(name, _)| (**name == meta.name) == own)
+                .find_map(|(name, base)| {
+                    let (start, end) = openclaw_port_family_range(*base.as_ref().ok()?);
+                    (start..=end).contains(&port).then_some((name, start, end))
+                })
+        };
+        if let Some((owner, start, end)) = gateway_owner(false) {
             return Err(format!(
                 "retained UI port {port} for env {} is claimed by env {owner}'s Gateway port family {start}..={end}; remove env {owner} to release it, or start with --no-ui",
+                meta.name,
+            ));
+        }
+        if let Some((_, start, end)) = gateway_owner(true) {
+            return Err(format!(
+                "retained UI port {port} for env {} is inside its own Gateway port family {start}..={end}; start with --no-ui",
                 meta.name,
             ));
         }
