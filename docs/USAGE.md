@@ -1254,23 +1254,25 @@ the source home, including symlink escapes, remain rejected.
 The existing restrictions on include-owned agent workspaces and sandbox origins
 still apply.
 
-Migration and adoption also spell out home-relative config values. A plain
+Migration and adoption also spell out home-relative config paths. A plain
 install expands `~` against its home, but the new environment runs with
 `OPENCLAW_HOME` set to its root, so OpenClaw expands `~` against the environment
-root instead. A value that starts with `~/` and lies outside `~/.openclaw`, such
-as a local plugin in `plugins.load.paths`, a `skills.load.extraDirs` entry, an
-agent directory or a session or cron store, is therefore rewritten in
-`openclaw.json` and its copied includes to the absolute path it named in the
-source home, with `.` and `..` resolved the way OpenClaw resolves them. The
-source home is your home directory when the migrated directory is your own
-`~/.openclaw`, through any path that leads to it. Otherwise it is the directory
-that contains a migrated `.openclaw`, or your home directory for a state
-directory with another name. Values under `~/.openclaw` already name the
-environment's copied state and stay as written, as do a bare `~` and values
-with leading or trailing whitespace, because OpenClaw settings differ in
-whether they trim it. Clone and archive import
-keep `~/...` values unchanged, because their source already expands `~` against
-an environment root.
+root instead. Every setting OpenClaw expands `~` in that names a location outside
+`~/.openclaw`, such as a local plugin in `plugins.load.paths`, a
+`skills.load.extraDirs` entry, an agent directory or a session or cron store, is
+therefore rewritten in `openclaw.json` and its copied includes to the absolute
+path it named in the source home. These are the keys ending in `dir`, `path`,
+`paths`, `file`, `root` or `workspace`, the entries of `paths` and `pathPrepend`
+lists, `skills.load.extraDirs` and `skills.load.allowSymlinkTargets`, and
+`session.store` and `cron.store`, expanded with the same whitespace handling
+and lexical `.` and `..` resolution as OpenClaw. Other strings, such as message
+text, stay as written. The source home is your home directory when the migrated
+directory is your own `~/.openclaw`, through any path that leads to it;
+otherwise it is the directory that contains the migrated `.openclaw`, or your
+home directory for a state directory with another name. Values under
+`~/.openclaw` already name the environment's copied state and stay as written.
+Clone and archive import keep `~/...` values unchanged, because their source
+already expands `~` against an environment root.
 
 Migration and adoption give the new environment its own Gateway port. A
 `gateway.port` set in the copied `openclaw.json` or in one of its copied

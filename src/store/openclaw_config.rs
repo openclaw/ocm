@@ -231,9 +231,9 @@ pub(crate) fn rewrite_openclaw_config_for_migration(
 /// A plain install expands `~` against its home, but the environment runs
 /// with `OPENCLAW_HOME` set to its root, which OpenClaw expands `~` against
 /// instead. Values under `~/.openclaw` already name the copied state
-/// directory; every other `~/` value is spelled out against the source home so
-/// it keeps naming the same location. Absolute values inside the source state
-/// directory are then relocated by the later rewrites.
+/// directory; every other home-relative path setting is spelled out against
+/// the source home so it keeps naming the same location. Absolute values
+/// inside the source state directory are then relocated by the later rewrites.
 fn expand_migrated_home_relative_paths(
     target: &EnvPaths,
     source_home: &Path,
@@ -241,56 +241,118 @@ fn expand_migrated_home_relative_paths(
     if !source_home.is_absolute() {
         return Ok(());
     }
-    let expand = |value: &mut Value| expand_home_relative_paths(value, source_home);
-    if let Some(mut value) = read_config_value(&target.config_path)?
-        && expand(&mut value)
-    {
-        write_config_value(&target.config_path, &value)?;
+    let Some(effective) = load_effective_openclaw_config(&target.config_path)? else {
+        return Ok(());
+    };
+    let mut scopes = effective.include_scopes;
+    scopes.insert(target.config_path.clone(), BTreeSet::from([Vec::new()]));
+    for (path, scopes) in scopes {
+        let Some(value) = read_config_value(&path)? else {
+            continue;
+        };
+        let mut rewritten = None;
+        for mut scope in scopes {
+            let mut candidate = value.clone();
+            expand_home_relative_paths_in_scope(&mut candidate, &mut scope, source_home);
+            if rewritten
+                .as_ref()
+                .is_some_and(|previous| previous != &candidate)
+            {
+                return Err(format!(
+                    "cannot safely expand home-relative paths in shared OpenClaw include {}; give path settings their own include before migration",
+                    display_path(&path)
+                ));
+            }
+            rewritten = Some(candidate);
+        }
+        if let Some(rewritten) = rewritten.filter(|rewritten| *rewritten != value) {
+            write_copied_config_value(&path, &target.state_dir, &rewritten)?;
+        }
     }
-    rewrite_openclaw_config_includes_with_path_rewriter(
-        &target.config_path,
-        &target.state_dir,
-        expand,
-    )?;
     Ok(())
 }
 
-/// Expands `~/` string values against `home`. `$include` directives keep
-/// their own relocation.
-fn expand_home_relative_paths(value: &mut Value, home: &Path) -> bool {
+/// Expands the home-relative path settings in a config fragment included at
+/// `scope`. `$include` directives keep their own relocation.
+fn expand_home_relative_paths_in_scope(
+    value: &mut Value,
+    scope: &mut Vec<String>,
+    home: &Path,
+) -> bool {
     match value {
         Value::String(raw) => {
-            let Some(expanded) = expand_home_relative_path(raw, home) else {
+            let Some(trims) = home_relative_path_setting(scope) else {
+                return false;
+            };
+            let Some(expanded) = expand_home_relative_path(raw, home, trims) else {
                 return false;
             };
             *raw = expanded;
             true
         }
-        Value::Array(values) => values.iter_mut().fold(false, |changed, nested| {
-            expand_home_relative_paths(nested, home) || changed
-        }),
-        Value::Object(values) => values
-            .iter_mut()
-            .filter(|(key, _)| key.as_str() != "$include")
-            .fold(false, |changed, (_, nested)| {
-                expand_home_relative_paths(nested, home) || changed
-            }),
+        Value::Array(values) => {
+            let mut changed = false;
+            for (index, nested) in values.iter_mut().enumerate() {
+                scope.push(index.to_string());
+                changed |= expand_home_relative_paths_in_scope(nested, scope, home);
+                scope.pop();
+            }
+            changed
+        }
+        Value::Object(values) => {
+            let mut changed = false;
+            for (key, nested) in values.iter_mut().filter(|(key, _)| *key != "$include") {
+                scope.push(key.clone());
+                changed |= expand_home_relative_paths_in_scope(nested, scope, home);
+                scope.pop();
+            }
+            changed
+        }
         _ => false,
     }
 }
 
-fn expand_home_relative_path(raw: &str, home: &Path) -> Option<String> {
-    // Only a leading `~` followed by a separator is expanded. A bare `~` is
-    // also an ordinary non-path value. OpenClaw path settings differ in
-    // whether they trim surrounding whitespace before expanding, so a value
-    // with surrounding whitespace has no single location and stays as written.
-    if (!raw.starts_with("~/") && !raw.starts_with("~\\")) || raw.trim_end() != raw {
+/// Whether OpenClaw expands a leading `~` in the string setting at `scope`,
+/// and whether it trims the value first. OpenClaw's runtime config expands
+/// keys ending in `dir`, `path`, `paths`, `file`, `root` or `workspace`, and
+/// the direct entries of `paths` and `pathPrepend` lists; a few settings
+/// expand `~` in their own consumers. Other strings, such as message text,
+/// stay as written.
+fn home_relative_path_setting(scope: &[String]) -> Option<bool> {
+    const PATH_LISTS: [&str; 2] = ["paths", "pathPrepend"];
+    const PATH_KEY_SUFFIXES: [&str; 6] = ["dir", "path", "paths", "file", "root", "workspace"];
+    let is_index =
+        |segment: &str| !segment.is_empty() && segment.bytes().all(|b| b.is_ascii_digit());
+    match scope {
+        [.., list, index] if is_index(index) => (PATH_LISTS.contains(&list.as_str())
+            || matches!(scope, [skills, load, list, _]
+                if skills == "skills"
+                    && load == "load"
+                    && (list == "extraDirs" || list == "allowSymlinkTargets")))
+        .then_some(true),
+        // The session store resolver expands `~` without trimming first.
+        [session, store] if session == "session" && store == "store" => Some(false),
+        [cron, store] if cron == "cron" && store == "store" => Some(true),
+        [.., key] => {
+            let key = key.to_ascii_lowercase();
+            PATH_KEY_SUFFIXES
+                .iter()
+                .any(|suffix| key.ends_with(suffix))
+                .then_some(true)
+        }
+        [] => None,
+    }
+}
+
+fn expand_home_relative_path(raw: &str, home: &Path, trims: bool) -> Option<String> {
+    let value = if trims { raw.trim() } else { raw };
+    if value != "~" && !value.starts_with("~/") && !value.starts_with("~\\") {
         return None;
     }
     // Expand as OpenClaw does: replace the leading `~`, then resolve `.` and
     // `..` lexically, so later rewrites cannot follow links OpenClaw ignores.
     let mut expanded = home.as_os_str().to_os_string();
-    expanded.push(&raw[1..]);
+    expanded.push(&value[1..]);
     let expanded = clean_path(Path::new(&expanded));
     if expanded.starts_with(home.join(".openclaw")) {
         return None;
@@ -2769,8 +2831,10 @@ mod tests {
     #[test]
     fn migration_home_expansion_follows_openclaw_tilde_rules() {
         let home = Path::new("/home/alice");
-        let expand = |raw| expand_home_relative_path(raw, home);
+        let expand = |raw| expand_home_relative_path(raw, home, true);
         assert_eq!(expand("~/dev/p").as_deref(), Some("/home/alice/dev/p"));
+        assert_eq!(expand(" ~/dev/p ").as_deref(), Some("/home/alice/dev/p"));
+        assert_eq!(expand("~").as_deref(), Some("/home/alice"));
         assert_eq!(
             expand("~/a/./../dev/p").as_deref(),
             Some("/home/alice/dev/p")
@@ -2788,15 +2852,45 @@ mod tests {
         assert_eq!(expand("~/x/../.openclaw/y"), None);
         // OpenClaw replaces the `~` of `~\` too; on POSIX the rest stays one name.
         assert_eq!(expand("~\\dev").as_deref(), Some("/home/alice\\dev"));
-        for unchanged in [
-            "~",
-            " ~/dev/p",
-            "~/dev/p ",
-            "~alice/dev",
-            "dev/~/p",
-            "/abs/~/p",
-        ] {
+        for unchanged in ["~alice/dev", "dev/~/p", "/abs/~/p", "~~/p"] {
             assert_eq!(expand(unchanged), None, "{unchanged}");
+        }
+        // A setting that does not trim keeps its whitespace semantics.
+        assert_eq!(expand_home_relative_path(" ~/s.json", home, false), None);
+        assert_eq!(
+            expand_home_relative_path("~/s.json ", home, false).as_deref(),
+            Some("/home/alice/s.json ")
+        );
+    }
+
+    #[test]
+    fn migration_home_expansion_selects_the_settings_openclaw_expands() {
+        let setting = |scope: &[&str]| {
+            home_relative_path_setting(&scope.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        };
+        for path in [
+            &["plugins", "load", "paths", "0"][..],
+            &["tools", "exec", "pathPrepend", "1"],
+            &["skills", "load", "extraDirs", "0"],
+            &["skills", "load", "allowSymlinkTargets", "2"],
+            &["agents", "list", "0", "agentDir"],
+            &["gateway", "tls", "caPath"],
+            &["logging", "file"],
+            &["plugins", "entries", "demo", "config", "rootDir"],
+            &["agents", "defaults", "workspace"],
+            &["cron", "store"],
+        ] {
+            assert_eq!(setting(path), Some(true), "{path:?}");
+        }
+        assert_eq!(setting(&["session", "store"]), Some(false));
+        for text in [
+            &["messages", "responsePrefix"][..],
+            &["agents", "list", "0", "identity", "name"],
+            &["plugins", "entries", "demo", "config", "dirs", "0"],
+            &["memory", "store"],
+            &[],
+        ] {
+            assert_eq!(setting(text), None, "{text:?}");
         }
     }
 
