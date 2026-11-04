@@ -4012,7 +4012,7 @@ fn visit_runtime_state_files(
     }
 }
 
-fn inferred_foreign_env_root(current_root: &Path, path: &Path) -> Option<PathBuf> {
+pub(super) fn inferred_foreign_env_root(current_root: &Path, path: &Path) -> Option<PathBuf> {
     if !path.is_absolute() {
         return None;
     }

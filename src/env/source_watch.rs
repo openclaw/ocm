@@ -1499,7 +1499,7 @@ fn legacy_source_watch_command_matches(command: &str) -> bool {
         && command.contains("run")
 }
 
-fn remove_file_if_present(path: &Path) -> Result<(), String> {
+pub(super) fn remove_file_if_present(path: &Path) -> Result<(), String> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),

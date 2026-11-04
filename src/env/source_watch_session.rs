@@ -1,3 +1,4 @@
+use super::source_watch::remove_file_if_present;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -783,14 +784,6 @@ fn read_optional_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, Str
             display_path(path)
         )
     })
-}
-
-fn remove_file_if_present(path: &Path) -> Result<(), String> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!("failed removing {}: {error}", display_path(path))),
-    }
 }
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
