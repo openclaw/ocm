@@ -864,60 +864,7 @@ fn init_openclaw_repo(root: &TestDir) -> PathBuf {
     )
     .unwrap();
 
-    let init = Command::new("git").arg("init").arg(&repo).output().unwrap();
-    assert!(
-        init.status.success(),
-        "{}",
-        String::from_utf8_lossy(&init.stderr)
-    );
-    let email = Command::new("git")
-        .args([
-            "-C",
-            &path_string(&repo),
-            "config",
-            "user.email",
-            "tests@example.com",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        email.status.success(),
-        "{}",
-        String::from_utf8_lossy(&email.stderr)
-    );
-    let name = Command::new("git")
-        .args([
-            "-C",
-            &path_string(&repo),
-            "config",
-            "user.name",
-            "OCM Tests",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        name.status.success(),
-        "{}",
-        String::from_utf8_lossy(&name.stderr)
-    );
-    let add = Command::new("git")
-        .args(["-C", &path_string(&repo), "add", "."])
-        .output()
-        .unwrap();
-    assert!(
-        add.status.success(),
-        "{}",
-        String::from_utf8_lossy(&add.stderr)
-    );
-    let commit = Command::new("git")
-        .args(["-C", &path_string(&repo), "commit", "-m", "init"])
-        .output()
-        .unwrap();
-    assert!(
-        commit.status.success(),
-        "{}",
-        String::from_utf8_lossy(&commit.stderr)
-    );
+    support::init_git_repo(&repo);
 
     repo
 }

@@ -8,7 +8,10 @@ use std::{fs, path::Path};
 
 use serde_json::Value;
 
-use crate::support::{TestDir, ocm_env, run_ocm, stderr, stdout, write_text};
+use crate::support::{
+    TestDir, isolated_git as import_git, isolated_git_argument as import_git_argument, ocm_env,
+    run_ocm, stderr, stdout, write_text,
+};
 
 #[cfg(unix)]
 #[test]
@@ -1649,37 +1652,6 @@ fn assert_imported_git_graphs(cases: &[(bool, bool, bool, ImportGitLayout)]) {
             );
         }
     }
-}
-
-fn import_git_argument(value: &str) -> String {
-    #[cfg(windows)]
-    {
-        if let Some(path) = value.strip_prefix(r"\\?\UNC\") {
-            return format!(r"\\{path}");
-        }
-        if let Some(path) = value.strip_prefix(r"\\?\") {
-            return path.to_string();
-        }
-    }
-    value.to_string()
-}
-
-fn import_git(
-    path: &Path,
-    env: &std::collections::BTreeMap<String, String>,
-    args: &[&str],
-) -> String {
-    let result = std::process::Command::new("git")
-        .arg("-C")
-        .arg(import_git_argument(&path.to_string_lossy()))
-        .args(args.iter().map(|value| import_git_argument(value)))
-        .env_clear()
-        .envs(env)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .output()
-        .unwrap();
-    assert!(result.status.success(), "{}", stderr(&result));
-    stdout(&result).trim().to_string()
 }
 
 #[test]
