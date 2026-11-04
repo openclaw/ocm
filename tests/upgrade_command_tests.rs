@@ -23,10 +23,10 @@ use ocm::supervisor::{
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256, Sha512};
-use tar::{Builder, Header};
+use tar::Builder;
 
 use crate::support::{
-    TestDir, TestHttpServer, hold_environment_operation,
+    TestDir, TestHttpServer, append_tar_file, hold_environment_operation,
     install_fake_launchctl as install_base_fake_launchctl, install_fake_node_and_npm, ocm_env,
     path_string, run_ocm, sha512_integrity, stderr, stdout, write_empty_supervisor_runtime,
     write_executable_script, write_json_replacing_path, write_text,
@@ -38,19 +38,6 @@ fn install_fake_launchctl(root: &TestDir, env: &mut std::collections::BTreeMap<S
         "OCM_TEST_NATIVE_DAEMON_PID".into(),
         std::process::id().to_string(),
     );
-}
-
-fn append_tar_file(
-    builder: &mut Builder<&mut GzEncoder<Vec<u8>>>,
-    path: &str,
-    body: &[u8],
-    mode: u32,
-) {
-    let mut header = Header::new_gnu();
-    header.set_size(body.len() as u64);
-    header.set_mode(mode);
-    header.set_cksum();
-    builder.append_data(&mut header, path, body).unwrap();
 }
 
 fn openclaw_package_tarball(script_body: &str, version: &str) -> Vec<u8> {

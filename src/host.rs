@@ -940,7 +940,7 @@ fn run_host_install_command(command: &HostInstallCommand) -> Result<(), String> 
         return Ok(());
     }
 
-    let detail = summarize_error_output(&output.stderr, &output.stdout)
+    let detail = summarize_command_output(&output.stderr, &output.stdout)
         .unwrap_or_else(|| format!("exited with code {}", output.status.code().unwrap_or(1)));
     Err(format!("{} failed: {detail}", command.display()))
 }
@@ -984,12 +984,13 @@ fn tool_version(command: &str, args: &[&str]) -> Result<HostCommandSummary, Stri
         .output()
         .map_err(|error| format!("{command} {}", command_failure_detail(error)))?;
     if !output.status.success() {
-        let detail = summarize_error_output(&output.stderr, &output.stdout).unwrap_or_else(|| {
-            format!(
-                "{command} exited with code {}",
-                output.status.code().unwrap_or(1)
-            )
-        });
+        let detail =
+            summarize_command_output(&output.stderr, &output.stdout).unwrap_or_else(|| {
+                format!(
+                    "{command} exited with code {}",
+                    output.status.code().unwrap_or(1)
+                )
+            });
         return Err(format!("{command} could not be run: {detail}"));
     }
 
@@ -1008,21 +1009,8 @@ fn command_failure_detail(error: std::io::Error) -> String {
     }
 }
 
-fn summarize_command_output(stdout: &[u8], stderr: &[u8]) -> Option<String> {
-    for bytes in [stdout, stderr] {
-        let text = String::from_utf8_lossy(bytes);
-        if let Some(line) = text.lines().find_map(|line| {
-            let trimmed = line.trim();
-            (!trimmed.is_empty()).then_some(trimmed.to_string())
-        }) {
-            return Some(line);
-        }
-    }
-    None
-}
-
-fn summarize_error_output(stderr: &[u8], stdout: &[u8]) -> Option<String> {
-    for bytes in [stderr, stdout] {
+fn summarize_command_output(primary: &[u8], fallback: &[u8]) -> Option<String> {
+    for bytes in [primary, fallback] {
         let text = String::from_utf8_lossy(bytes);
         if let Some(line) = text.lines().find_map(|line| {
             let trimmed = line.trim();

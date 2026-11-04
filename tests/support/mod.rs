@@ -785,7 +785,7 @@ fi
     env.insert("PATH".to_string(), combined_path);
 }
 
-fn append_tar_file(
+pub fn append_tar_file(
     builder: &mut Builder<&mut GzEncoder<Vec<u8>>>,
     path: &str,
     body: &[u8],

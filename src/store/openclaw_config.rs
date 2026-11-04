@@ -2474,33 +2474,9 @@ fn inferred_foreign_env_root(
     user_home: &Path,
     path: &Path,
 ) -> Option<PathBuf> {
-    if !path.is_absolute() {
-        return None;
-    }
-
-    let path = clean_path(path);
-    if path.starts_with(current_root) {
-        return None;
-    }
-
-    let mut prefix = PathBuf::new();
-    for component in path.components() {
-        if component.as_os_str() == ".openclaw" {
-            if prefix.as_os_str().is_empty() {
-                return None;
-            }
-            let prefix = clean_path(&prefix);
-            // Paths in the user's own OpenClaw home point at live data, not at
-            // a copied environment root.
-            if prefix == user_home {
-                return None;
-            }
-            return Some(prefix);
-        }
-        prefix.push(component.as_os_str());
-    }
-
-    None
+    // The user’s own OpenClaw home is live data, not a copied environment.
+    super::openclaw_state::inferred_foreign_env_root(current_root, path)
+        .filter(|root| root != user_home)
 }
 
 fn read_workspace_field(value: &Value) -> Option<&str> {

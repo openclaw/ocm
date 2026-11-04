@@ -10,27 +10,14 @@ use flate2::{Compression, write::GzEncoder};
 use ocm::infra::download::file_sha256;
 use ocm::store::{runtime_install_root, runtime_meta_path};
 use serde_json::Value;
-use tar::{Builder, Header};
+use tar::Builder;
 
 use crate::support::{
-    TestDir, TestHttpServer, install_fake_managed_node_archive, install_fake_node_and_npm,
-    install_fake_service_manager, ocm_env,
+    TestDir, TestHttpServer, append_tar_file, install_fake_managed_node_archive,
+    install_fake_node_and_npm, install_fake_service_manager, ocm_env,
     openclaw_package_tarball as openclaw_package_tarball_with_version, path_string, run_ocm,
     sha512_integrity, stderr, stdout, write_executable_script,
 };
-
-fn append_tar_file(
-    builder: &mut Builder<&mut GzEncoder<Vec<u8>>>,
-    path: &str,
-    body: &[u8],
-    mode: u32,
-) {
-    let mut header = Header::new_gnu();
-    header.set_size(body.len() as u64);
-    header.set_mode(mode);
-    header.set_cksum();
-    builder.append_data(&mut header, path, body).unwrap();
-}
 
 fn openclaw_package_tarball(script_body: &str) -> Vec<u8> {
     openclaw_package_tarball_with_engine(script_body, None)
@@ -41,24 +28,7 @@ fn openclaw_package_tarball_with_engine(script_body: &str, engine: Option<&str>)
     if let Some(engine) = engine {
         package["engines"] = serde_json::json!({"node": engine});
     }
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    {
-        let mut builder = Builder::new(&mut encoder);
-        append_tar_file(
-            &mut builder,
-            "package/openclaw.mjs",
-            script_body.as_bytes(),
-            0o755,
-        );
-        append_tar_file(
-            &mut builder,
-            "package/package.json",
-            package.to_string().as_bytes(),
-            0o644,
-        );
-        builder.finish().unwrap();
-    }
-    encoder.finish().unwrap()
+    support::openclaw_package_tarball_with_manifest(script_body, &package.to_string())
 }
 
 #[cfg(unix)]
