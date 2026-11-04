@@ -12,6 +12,7 @@ Gateway lifecycle. Remove a product mapping only when its owner is obsolete.
 | [Copied executable fixtures](https://github.com/openclaw/ocm/pull/996) | Share the existing bounded exec-admission retry with the common binary runner; remove two local copies. | Only `ExecutableFileBusy` before a child starts is retried, at most five attempts. Process exit failures and all other errors remain failures. | Full ordered remote baseline passed with the shared helper, including the self-update and daemon suites and isolated install/version smoke. CI tracked in the linked PR. |
 | [Native shutdown proof](https://github.com/openclaw/ocm/pull/995) | Wait up to 30 seconds after an accepted stop; reject renewed running intent, status failures and deadline expiry. | Native child-PID, installed-state, port and cleanup assertions stay intact. | Remote formatting, 41 release-policy tests, 5 shutdown regressions, Python syntax and all-target compilation passed; native CI tracked in the linked PR. |
 | [Native npm prerequisite](https://github.com/openclaw/ocm/pull/993) | Document npm 11.19.1 for the Rust native companion tests. | Native npm control and installed companion dependency graph checks. | Worker npm 11.17.0 failed before OCM ran; isolated npm 11.19.1 passed. Remote Markdown check passed. |
+| Background-resume PTY diagnostics | Capture child stderr without pipe backpressure; report its bounded tail, wait phase, child exit and terminal foreground group on failure. | Existing background-stop, foreground-input, watch-lease and cleanup assertions and deadlines. | Remote formatting, 41 release-policy tests, 5 shutdown tests, all-target compilation, Rust suites and isolated install/version smoke passed. Five injected failure/success controls passed, including 128 KiB of child stderr with a 16 KiB printed tail. CI tracked in the follow-up PR. |
 
 ## Audit coverage and retained tests
 
@@ -58,6 +59,19 @@ in #989; these failures do not justify deleting lifecycle coverage.
 The full worker run also exposed transient Linux `ExecutableFileBusy` while
 launching a copied binary, before OCM ran. The shared retry above follows the
 existing daemon fixture policy; it never retries a process exit.
+
+The unchanged background-resume PTY test timed out waiting for foreground input
+in [run 41826860341](https://github.com/openclaw/ocm/actions/runs/41826860341).
+A single targeted macOS retry passed. Its failure previously hid child stderr;
+the diagnostics above preserve the original exception and print at most 16 KiB
+of child output. This records evidence for a recurrence without claiming a root
+cause or weakening the lifecycle test.
+
+During the diagnostics follow-up, the unchanged supervisor publication-retry
+fixture failed when its selected port family was already occupied. The other
+601 source tests passed. That exact fixture passed alone, followed by all unrun
+integration, binary and documentation tests and the isolated install. Keep this
+port-contention observation as a separate fixture-isolation follow-up.
 
 Remote baseline uses Rust 1.98.1, Node.js 24.19.0 and npm 11.19.1. CI owns the
 declared Rust/Node and native platform matrix. No release is part of this audit.

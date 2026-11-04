@@ -9302,10 +9302,14 @@ import os
 import pty
 import signal
 import subprocess
+import sys
 import termios
+import tempfile
 import time
 
 def wait_path(path, label):
+    global phase
+    phase = label
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
         if os.path.exists(path):
@@ -9314,12 +9318,16 @@ def wait_path(path, label):
     raise RuntimeError(f"timed out waiting for {label}")
 
 def wait_stopped(pid, label):
+    global phase, last_wait_status
+    phase = label
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
         waited, status = os.waitpid(pid, os.WNOHANG | os.WUNTRACED)
         if waited == pid:
+            last_wait_status = status
             if os.WIFSTOPPED(status):
                 return
+            process.returncode = os.waitstatus_to_exitcode(status)
             raise RuntimeError(f"OCM exited while waiting for {label}: status={status}")
         time.sleep(0.025)
     raise RuntimeError(f"timed out waiting for {label}")
@@ -9327,6 +9335,9 @@ def wait_stopped(pid, label):
 master, slave = pty.openpty()
 process = None
 succeeded = False
+phase = "terminal setup"
+last_wait_status = None
+stderr_log = tempfile.TemporaryFile()
 try:
     os.setsid()
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
@@ -9346,7 +9357,7 @@ try:
         cwd=os.environ["OCM_TEST_CWD"],
         stdin=slave,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
+        stderr=stderr_log,
         preexec_fn=os.setpgrp,
     )
     wait_path(os.environ["OCM_TEST_STARTED"], "watcher startup")
@@ -9366,11 +9377,30 @@ try:
     master = -1
     os.close(slave)
     slave = -1
+    phase = "watcher exit"
     exit_code = process.wait(timeout=10)
     if exit_code != 0:
-        error = process.stderr.read().decode(errors="replace")
-        raise RuntimeError(f"OCM exited with {exit_code}: {error}")
+        raise RuntimeError(f"OCM exited with {exit_code}")
     succeeded = True
+except Exception:
+    try:
+        print(f"PTY phase: {phase}; last wait status: {last_wait_status}", file=sys.stderr)
+        if process is not None:
+            print(f"OCM pid: {process.pid}; return code: {process.poll()}", file=sys.stderr)
+        if slave >= 0:
+            try:
+                foreground = os.tcgetpgrp(slave)
+            except OSError as error:
+                foreground = f"unavailable (errno {error.errno})"
+            print(f"terminal foreground group: {foreground}", file=sys.stderr)
+        stderr_log.seek(0, os.SEEK_END)
+        size = stderr_log.tell()
+        stderr_log.seek(max(0, size - 16384))
+        error = stderr_log.read(16384).decode(errors="replace")
+        print(f"OCM stderr (last 16384 of {size} bytes):\n{error}", file=sys.stderr)
+    except Exception as diagnostic_error:
+        print(f"PTY diagnostics unavailable: {diagnostic_error}", file=sys.stderr)
+    raise
 finally:
     if not succeeded and process is not None:
         for process_group in (process.pid,):
@@ -9382,6 +9412,7 @@ finally:
         os.close(master)
     if slave >= 0:
         os.close(slave)
+    stderr_log.close()
 "#;
     let output = Command::new("python3")
         .arg("-c")
