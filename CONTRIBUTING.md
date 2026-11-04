@@ -32,6 +32,12 @@ npm launcher accepts `^22.15.0 || >=24.0.0`, while runtime-install tests require
 tests do not require registry dependency downloads. A different supported
 version is useful development proof, but does not replace the CI version matrix.
 
+Use npm `11.19.1` for the complete Rust suite as well as npm packaging checks.
+The native companion tests compare OCM with direct npm installs using the linked
+strategy. With npm `11.17.0`, that native control can fail to resolve an external
+directory dependency before OCM runs. A supported Node version alone does not
+qualify npm for these tests.
+
 Synchronize the intended source, including new files, into the owned remote
 checkout before running checks. Record the base, candidate commit (or exact
 uncommitted diff), `Cargo.lock`, remote OS, and tool versions with the command
