@@ -1259,3 +1259,60 @@ pub fn captured_records(database: &Path) -> Vec<String> {
         .collect::<Result<_, _>>()
         .unwrap()
 }
+
+pub fn isolated_git_argument(value: &str) -> String {
+    #[cfg(windows)]
+    {
+        if let Some(path) = value.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{path}");
+        }
+        if let Some(path) = value.strip_prefix(r"\\?\") {
+            return path.to_string();
+        }
+    }
+    value.to_string()
+}
+
+pub fn isolated_git(path: &Path, env: &BTreeMap<String, String>, args: &[&str]) -> String {
+    let result = Command::new("git")
+        .arg("-C")
+        .arg(isolated_git_argument(&path.to_string_lossy()))
+        .args(args.iter().map(|value| isolated_git_argument(value)))
+        .env_clear()
+        .envs(env)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "{}", stderr(&result));
+    stdout(&result).trim().to_string()
+}
+
+pub fn init_git_repo(path: &Path) {
+    let init = Command::new("git").arg("init").arg(path).output().unwrap();
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    commit_git_repo(path);
+}
+
+pub fn commit_git_repo(path: &Path) {
+    for args in [
+        &["config", "user.email", "tests@example.com"][..],
+        &["config", "user.name", "OCM Tests"][..],
+        &["add", "."][..],
+        &["commit", "-m", "init"][..],
+    ] {
+        let result = Command::new("git")
+            .args(["-C", &path_string(path)])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+}

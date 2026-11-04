@@ -4,7 +4,10 @@ use std::fs;
 
 use ocm::infra::archive::{EnvArchiveMetadata, extract_env_archive};
 
-use crate::support::{TestDir, ocm_env, run_ocm, stderr, stdout, write_text};
+use crate::support::{
+    TestDir, isolated_git as export_git, isolated_git_argument as export_git_argument, ocm_env,
+    run_ocm, stderr, stdout, write_text,
+};
 
 #[test]
 fn env_export_writes_the_default_archive_path() {
@@ -2335,37 +2338,6 @@ fn env_export_retains_agent_payload_under_equivalent_root_spellings() {
             config.as_bytes()
         );
     }
-}
-
-fn export_git_argument(value: &str) -> String {
-    #[cfg(windows)]
-    {
-        if let Some(path) = value.strip_prefix(r"\\?\UNC\") {
-            return format!(r"\\{path}");
-        }
-        if let Some(path) = value.strip_prefix(r"\\?\") {
-            return path.to_string();
-        }
-    }
-    value.to_string()
-}
-
-fn export_git(
-    path: &std::path::Path,
-    env: &std::collections::BTreeMap<String, String>,
-    args: &[&str],
-) -> String {
-    let result = std::process::Command::new("git")
-        .arg("-C")
-        .arg(export_git_argument(&path.to_string_lossy()))
-        .args(args.iter().map(|value| export_git_argument(value)))
-        .env_clear()
-        .envs(env)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .output()
-        .unwrap();
-    assert!(result.status.success(), "{}", stderr(&result));
-    stdout(&result).trim().to_string()
 }
 
 #[test]
