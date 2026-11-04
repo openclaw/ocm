@@ -36,6 +36,8 @@ jobs:
         run: cargo fmt --check
       - name: Test automatic release policy and production boundaries
         run: python3 -B -m unittest discover -s scripts/tests -p 'test_auto_release*.py'
+      - name: Test native Gateway shutdown observation
+        run: python3 -B -m unittest discover -s scripts/tests -p 'test_native_gateway*.py'
 
   msrv:
     name: Rust 1.88 minimum
@@ -236,32 +238,6 @@ jobs:
             --ocm target/release/ocm \
             --openclaw-version 2026.10.9 \
             --disposable-host
-      - name: Build upgrade candidate (finite PR568 validation)
-        if: github.event_name == 'pull_request' && github.event.pull_request.number == 568 && runner.os == 'Linux'
-        run: cargo install --locked --path . --root "$RUNNER_TEMP/ocm-install"
-      - name: Prove real released-predecessor service upgrade (finite PR568 validation)
-        if: github.event_name == 'pull_request' && github.event.pull_request.number == 568 && runner.os == 'Linux'
-        timeout-minutes: 25
-        run: |
-          proof="$RUNNER_TEMP/ocm-released-upgrade"
-          prefix="/opt/ocm-pr568-$GITHUB_RUN_ID"
-          sudo install -d -o "$(id -u)" -g "$(id -g)" -m 0755 "$prefix"
-          python3 scripts/validate-released-upgrade.py prepare --prefix "$prefix" --output "$proof" --candidate "$RUNNER_TEMP/ocm-install/bin/ocm"
-          cargo install --locked --path . --root "$prefix" --force
-          python3 scripts/validate-released-upgrade.py verify --prefix "$prefix" --output "$proof"
-      - name: Release owned upgrade service and user
-        if: always() && github.event_name == 'pull_request' && github.event.pull_request.number == 568 && runner.os == 'Linux'
-        run: python3 scripts/validate-released-upgrade.py cleanup --prefix "/opt/ocm-pr568-$GITHUB_RUN_ID" --output "$RUNNER_TEMP/ocm-released-upgrade"
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: always() && !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.number == 568 && runner.os == 'Linux'
-        with:
-          name: released-predecessor-upgrade
-          path: |
-            ${{ runner.temp }}/ocm-released-upgrade/*.json
-            ${{ runner.temp }}/ocm-released-upgrade/*.log
-          if-no-files-found: error
-          retention-days: 7
-
       - name: Run test suite
         run: cargo test --locked
       - name: Smoke test cargo install

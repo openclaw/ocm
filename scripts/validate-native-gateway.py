@@ -15,6 +15,7 @@ import tempfile
 from urllib.parse import urlsplit
 
 from native_gateway_provider import ProviderFixture
+from native_gateway_status import stop_gateway
 
 UNIT = "ai.openclaw.ocm.service"
 ENV_NAME = "native-gateway"
@@ -146,8 +147,7 @@ def main():
         assert after["childPid"] != before["childPid"]
         assert not (Path("/proc") / str(before["childPid"])).exists()
         provider.check(oc_json, ENV_NAME, "after restart")
-        stopped = oc_json("service stop", "service", "stop", ENV_NAME)
-        assert not stopped["running"] and not stopped["desiredRunning"]
+        stop_gateway(oc_json, ENV_NAME)
         final = status()
         assert final["installed"] and not final["running"] and final["childPid"] is None
         assert not (Path("/proc") / str(after["childPid"])).exists()

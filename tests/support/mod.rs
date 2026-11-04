@@ -785,7 +785,7 @@ fi
     env.insert("PATH".to_string(), combined_path);
 }
 
-fn append_tar_file(
+pub fn append_tar_file(
     builder: &mut Builder<&mut GzEncoder<Vec<u8>>>,
     path: &str,
     body: &[u8],
@@ -1059,6 +1059,21 @@ pub fn run_ocm(cwd: &Path, env: &BTreeMap<String, String>, args: &[&str]) -> Out
     run_ocm_binary(&ocm_test_binary_path(), cwd, env, args)
 }
 
+// Retry exec admission only; a process that started is never run again.
+pub fn retry_executable_busy<T>(
+    mut operation: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    for attempt in 0..5 {
+        match operation() {
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < 4 => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            result => return result,
+        }
+    }
+    unreachable!("the final attempt always returns")
+}
+
 pub fn run_ocm_binary(
     binary: &Path,
     cwd: &Path,
@@ -1070,7 +1085,7 @@ pub fn run_ocm_binary(
     command.args(args);
     command.env_clear();
     command.envs(env);
-    command.output().unwrap()
+    retry_executable_busy(|| command.output()).unwrap()
 }
 
 /// Run ocm, failing instead of hanging when it does not exit within `limit`.
@@ -1258,4 +1273,80 @@ pub fn captured_records(database: &Path) -> Vec<String> {
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap()
+}
+
+pub fn isolated_git_argument(value: &str) -> String {
+    #[cfg(windows)]
+    {
+        if let Some(path) = value.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{path}");
+        }
+        if let Some(path) = value.strip_prefix(r"\\?\") {
+            return path.to_string();
+        }
+    }
+    value.to_string()
+}
+
+pub fn isolated_git(path: &Path, env: &BTreeMap<String, String>, args: &[&str]) -> String {
+    let result = Command::new("git")
+        .arg("-C")
+        .arg(isolated_git_argument(&path.to_string_lossy()))
+        .args(args.iter().map(|value| isolated_git_argument(value)))
+        .env_clear()
+        .envs(env)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "{}", stderr(&result));
+    stdout(&result).trim().to_string()
+}
+
+pub fn init_git_repo(path: &Path) {
+    let init = Command::new("git").arg("init").arg(path).output().unwrap();
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    commit_git_repo(path);
+}
+
+pub fn commit_git_repo(path: &Path) {
+    for args in [
+        &["config", "user.email", "tests@example.com"][..],
+        &["config", "user.name", "OCM Tests"][..],
+        &["add", "."][..],
+        &["commit", "-m", "init"][..],
+    ] {
+        let result = Command::new("git")
+            .args(["-C", &path_string(path)])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+}
+
+pub fn official_release_fixture() -> (TestHttpServer, TestHttpServer) {
+    let tarball =
+        openclaw_package_tarball("#!/usr/bin/env node\nconsole.log('stable');\n", "2026.3.24");
+    let integrity = sha512_integrity(&tarball);
+    let tarball_server = TestHttpServer::serve_bytes(
+        "/openclaw-2026.3.24.tgz",
+        "application/octet-stream",
+        &tarball,
+    );
+    let packument = format!(
+        "{{\"dist-tags\":{{\"latest\":\"2026.3.24\"}},\"versions\":{{\"2026.3.24\":{{\"version\":\"2026.3.24\",\"dist\":{{\"tarball\":\"{}\",\"integrity\":\"{}\"}}}}}},\"time\":{{\"2026.3.24\":\"2026-03-25T16:35:52.000Z\"}}}}",
+        tarball_server.url(),
+        integrity
+    );
+    let packument_server =
+        TestHttpServer::serve_bytes("/openclaw", "application/json", packument.as_bytes());
+    (tarball_server, packument_server)
 }

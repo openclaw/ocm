@@ -78,17 +78,7 @@ impl Cli {
         } else {
             0
         };
-        if json_flag {
-            self.print_json(&summary)?;
-            return Ok(code);
-        }
-
-        self.stdout_lines(render::service::service_action(
-            &summary,
-            profile,
-            &self.command_example(),
-        ));
-        Ok(code)
+        self.print_service_action(&summary, json_flag, profile, code)
     }
 
     pub(super) fn handle_service_stop(&self, args: Vec<String>) -> Result<i32, String> {
@@ -99,17 +89,7 @@ impl Cli {
         Self::assert_no_extra_args(&args[1..])?;
 
         let summary = self.service_service().stop(name)?;
-        if json_flag {
-            self.print_json(&summary)?;
-            return Ok(0);
-        }
-
-        self.stdout_lines(render::service::service_action(
-            &summary,
-            profile,
-            &self.command_example(),
-        ));
-        Ok(0)
+        self.print_service_action(&summary, json_flag, profile, 0)
     }
 
     pub(super) fn handle_service_restart(&self, args: Vec<String>) -> Result<i32, String> {
@@ -129,16 +109,25 @@ impl Cli {
         } else {
             0
         };
-        if json_flag {
-            self.print_json(&summary)?;
-            return Ok(code);
-        }
+        self.print_service_action(&summary, json_flag, profile, code)
+    }
 
-        self.stdout_lines(render::service::service_action(
-            &summary,
-            profile,
-            &self.command_example(),
-        ));
+    fn print_service_action(
+        &self,
+        summary: &crate::service::ServiceActionSummary,
+        json: bool,
+        profile: render::RenderProfile,
+        code: i32,
+    ) -> Result<i32, String> {
+        if json {
+            self.print_json(summary)?;
+        } else {
+            self.stdout_lines(render::service::service_action(
+                summary,
+                profile,
+                &self.command_example(),
+            ));
+        }
         Ok(code)
     }
 
@@ -174,17 +163,7 @@ impl Cli {
         Self::assert_no_extra_args(&args[1..])?;
 
         let summary = self.service_service().uninstall(name)?;
-        if json_flag {
-            self.print_json(&summary)?;
-            return Ok(0);
-        }
-
-        self.stdout_lines(render::service::service_action(
-            &summary,
-            profile,
-            &self.command_example(),
-        ));
-        Ok(0)
+        self.print_service_action(&summary, json_flag, profile, 0)
     }
 
     pub(super) fn handle_service_refresh_daemon(&self, args: Vec<String>) -> Result<i32, String> {

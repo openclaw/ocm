@@ -27,9 +27,10 @@ use ocm::supervisor::{SupervisorRuntimeChild, SupervisorRuntimeService, Supervis
 use serde_json::Value;
 
 use crate::support::{
-    TestDir, create_owned_dev_env, dev_plain, dev_watch, enable_fake_daemon_gateway_admission,
-    hold_environment_operation, install_fake_service_manager, ocm_env, path_string,
-    register_owned_dev_env, run_ocm, stderr, stdout, write_executable_script,
+    TestDir, commit_git_repo as commit_nested_openclaw_repo, create_owned_dev_env, dev_plain,
+    dev_watch, enable_fake_daemon_gateway_admission, hold_environment_operation,
+    install_fake_service_manager, ocm_env, path_string, register_owned_dev_env, run_ocm, stderr,
+    stdout, write_executable_script,
 };
 
 fn init_openclaw_repo(root: &TestDir) -> PathBuf {
@@ -55,60 +56,7 @@ fn init_openclaw_repo(root: &TestDir) -> PathBuf {
     .unwrap();
     fs::write(repo.join(".gitignore"), ".env\nnode_modules/\n").unwrap();
 
-    let init = Command::new("git").arg("init").arg(&repo).output().unwrap();
-    assert!(
-        init.status.success(),
-        "{}",
-        String::from_utf8_lossy(&init.stderr)
-    );
-    let email = Command::new("git")
-        .args([
-            "-C",
-            &path_string(&repo),
-            "config",
-            "user.email",
-            "tests@example.com",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        email.status.success(),
-        "{}",
-        String::from_utf8_lossy(&email.stderr)
-    );
-    let name = Command::new("git")
-        .args([
-            "-C",
-            &path_string(&repo),
-            "config",
-            "user.name",
-            "OCM Tests",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        name.status.success(),
-        "{}",
-        String::from_utf8_lossy(&name.stderr)
-    );
-    let add = Command::new("git")
-        .args(["-C", &path_string(&repo), "add", "."])
-        .output()
-        .unwrap();
-    assert!(
-        add.status.success(),
-        "{}",
-        String::from_utf8_lossy(&add.stderr)
-    );
-    let commit = Command::new("git")
-        .args(["-C", &path_string(&repo), "commit", "-m", "init"])
-        .output()
-        .unwrap();
-    assert!(
-        commit.status.success(),
-        "{}",
-        String::from_utf8_lossy(&commit.stderr)
-    );
+    support::init_git_repo(&repo);
 
     repo
 }
@@ -127,41 +75,6 @@ fn init_nested_openclaw_repo(path: &Path) {
         init.status.success(),
         "{}",
         String::from_utf8_lossy(&init.stderr)
-    );
-}
-
-fn commit_nested_openclaw_repo(path: &Path) {
-    for (key, value) in [
-        ("user.email", "tests@example.com"),
-        ("user.name", "OCM Tests"),
-    ] {
-        let configure = Command::new("git")
-            .args(["-C", &path_string(path), "config", key, value])
-            .output()
-            .unwrap();
-        assert!(
-            configure.status.success(),
-            "{}",
-            String::from_utf8_lossy(&configure.stderr)
-        );
-    }
-    let add = Command::new("git")
-        .args(["-C", &path_string(path), "add", "."])
-        .output()
-        .unwrap();
-    assert!(
-        add.status.success(),
-        "{}",
-        String::from_utf8_lossy(&add.stderr)
-    );
-    let commit = Command::new("git")
-        .args(["-C", &path_string(path), "commit", "-m", "init"])
-        .output()
-        .unwrap();
-    assert!(
-        commit.status.success(),
-        "{}",
-        String::from_utf8_lossy(&commit.stderr)
     );
 }
 

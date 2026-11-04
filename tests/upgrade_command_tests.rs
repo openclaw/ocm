@@ -23,10 +23,10 @@ use ocm::supervisor::{
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256, Sha512};
-use tar::{Builder, Header};
+use tar::Builder;
 
 use crate::support::{
-    TestDir, TestHttpServer, hold_environment_operation,
+    TestDir, TestHttpServer, append_tar_file, hold_environment_operation,
     install_fake_launchctl as install_base_fake_launchctl, install_fake_node_and_npm, ocm_env,
     path_string, run_ocm, sha512_integrity, stderr, stdout, write_empty_supervisor_runtime,
     write_executable_script, write_json_replacing_path, write_text,
@@ -38,19 +38,6 @@ fn install_fake_launchctl(root: &TestDir, env: &mut std::collections::BTreeMap<S
         "OCM_TEST_NATIVE_DAEMON_PID".into(),
         std::process::id().to_string(),
     );
-}
-
-fn append_tar_file(
-    builder: &mut Builder<&mut GzEncoder<Vec<u8>>>,
-    path: &str,
-    body: &[u8],
-    mode: u32,
-) {
-    let mut header = Header::new_gnu();
-    header.set_size(body.len() as u64);
-    header.set_mode(mode);
-    header.set_cksum();
-    builder.append_data(&mut header, path, body).unwrap();
 }
 
 fn openclaw_package_tarball(script_body: &str, version: &str) -> Vec<u8> {
@@ -877,60 +864,7 @@ fn init_openclaw_repo(root: &TestDir) -> PathBuf {
     )
     .unwrap();
 
-    let init = Command::new("git").arg("init").arg(&repo).output().unwrap();
-    assert!(
-        init.status.success(),
-        "{}",
-        String::from_utf8_lossy(&init.stderr)
-    );
-    let email = Command::new("git")
-        .args([
-            "-C",
-            &path_string(&repo),
-            "config",
-            "user.email",
-            "tests@example.com",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        email.status.success(),
-        "{}",
-        String::from_utf8_lossy(&email.stderr)
-    );
-    let name = Command::new("git")
-        .args([
-            "-C",
-            &path_string(&repo),
-            "config",
-            "user.name",
-            "OCM Tests",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        name.status.success(),
-        "{}",
-        String::from_utf8_lossy(&name.stderr)
-    );
-    let add = Command::new("git")
-        .args(["-C", &path_string(&repo), "add", "."])
-        .output()
-        .unwrap();
-    assert!(
-        add.status.success(),
-        "{}",
-        String::from_utf8_lossy(&add.stderr)
-    );
-    let commit = Command::new("git")
-        .args(["-C", &path_string(&repo), "commit", "-m", "init"])
-        .output()
-        .unwrap();
-    assert!(
-        commit.status.success(),
-        "{}",
-        String::from_utf8_lossy(&commit.stderr)
-    );
+    support::init_git_repo(&repo);
 
     repo
 }
