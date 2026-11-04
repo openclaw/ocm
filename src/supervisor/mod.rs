@@ -1894,6 +1894,7 @@ impl<'a> SupervisorService<'a> {
             self.cwd,
             &gateway_admission,
             &stop_requested,
+            preflight_supervisor_child_ports,
         )?;
         write_supervisor_runtime_state(
             &runtime_path,
@@ -1939,6 +1940,7 @@ impl<'a> SupervisorService<'a> {
                 self.cwd,
                 &gateway_admission,
                 &stop_requested,
+                preflight_supervisor_child_ports,
             )?;
             if runtime_dirty {
                 write_supervisor_runtime_state(
@@ -3270,6 +3272,7 @@ fn start_due_children(
     cwd: &Path,
     gateway_admission: &SupervisorGatewayAdmission,
     stop_requested: &AtomicBool,
+    preflight_ports: impl Fn(&PendingSupervisorChild) -> Result<(), String>,
 ) -> Result<bool, String> {
     let runtime_path = supervisor_runtime_path(env, cwd)?;
     let ocm_home = display_path(&resolve_ocm_home(env, cwd)?);
@@ -3293,7 +3296,7 @@ fn start_due_children(
                 EnvironmentService::new(env, cwd).ensure_source_watch_allows_service(&env_name)
             })
             .and_then(|()| {
-                let result = preflight_supervisor_child_ports(&next_child);
+                let result = preflight_ports(&next_child);
                 port_conflict = result.is_err();
                 result
             })
@@ -4684,28 +4687,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn dynamic_child_publication_failure_prevents_spawn_and_allows_retry() {
-        const ISOLATED: &str = "OCM_TEST_ISOLATED_PUBLICATION_RETRY";
-        if std::env::var(ISOLATED).as_deref() != Ok("1") {
-            // A parallel pre-exec fixture can retain any listening sockets
-            // inherited at fork. Keep this socket-sensitive proof independent.
-            let output = Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "supervisor::tests::dynamic_child_publication_failure_prevents_spawn_and_allows_retry",
-                    "--nocapture",
-                ])
-                .env(ISOLATED, "1")
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "isolated publication retry failed: {}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            return;
-        }
         let root = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = u32::from(listener.local_addr().unwrap().port());
         let env = BTreeMap::from([
             ("HOME".to_string(), display_path(&root.path().join("home"))),
             (
@@ -4729,7 +4713,7 @@ mod tests {
             .create(crate::env::CreateEnvironmentOptions {
                 name: "demo".to_string(),
                 root: None,
-                gateway_port: None,
+                gateway_port: Some(port),
                 service_enabled: false,
                 service_running: false,
                 default_runtime: Some("stable".to_string()),
@@ -4769,6 +4753,9 @@ mod tests {
         )]);
         let mut running = BTreeMap::new();
         let mut inactive = BTreeMap::new();
+        // Publication ordering is independent of real port availability.
+        // Keep this port occupied through both attempts to prove that boundary.
+        assert!(preflight_supervisor_child_ports(&pending["demo"]).is_err());
         let failed = start_due_children(
             &mut running,
             &mut pending,
@@ -4777,6 +4764,7 @@ mod tests {
             root.path(),
             &admission,
             &AtomicBool::new(false),
+            |_| Ok(()),
         );
         // Opening the child logs is the first spawn operation, even if the
         // process is stopped before its executable has time to run.
@@ -4826,6 +4814,7 @@ mod tests {
                 root.path(),
                 &admission,
                 &AtomicBool::new(false),
+                |_| Ok(()),
             )
             .unwrap()
         );
