@@ -247,17 +247,7 @@ impl Cli {
         if !yes {
             let _operation_lock = self.environment_service().lock_operation(name)?;
             let summary = self.build_env_destroy_summary(name, false, force)?;
-            if json_flag {
-                self.print_json(&summary)?;
-                return Ok(0);
-            }
-
-            self.stdout_lines(render::env::env_destroy_preview(
-                &summary,
-                profile,
-                &self.command_example(),
-            ));
-            return Ok(0);
+            return self.print_env_destroy_preview(&summary, json_flag, profile, 0);
         }
 
         // Service and binding mutations use the same per-env lock. Keep it
@@ -273,29 +263,11 @@ impl Cli {
                 "environment state changed since destroy preview; request a new preview"
                     .to_string(),
             );
-            if json_flag {
-                self.print_json(&summary)?;
-            } else {
-                self.stdout_lines(render::env::env_destroy_preview(
-                    &summary,
-                    profile,
-                    &self.command_example(),
-                ));
-            }
-            return Ok(1);
+            return self.print_env_destroy_preview(&summary, json_flag, profile, 1);
         }
 
         if !summary.blockers.is_empty() {
-            if json_flag {
-                self.print_json(&summary)?;
-            } else {
-                self.stdout_lines(render::env::env_destroy_preview(
-                    &summary,
-                    profile,
-                    &self.command_example(),
-                ));
-            }
-            return Ok(1);
+            return self.print_env_destroy_preview(&summary, json_flag, profile, 1);
         }
 
         let env_before = self.environment_service().get(name)?;
@@ -303,16 +275,7 @@ impl Cli {
             if expected_state_token.is_some() {
                 summary.code = Some("source_watch_active".to_string());
                 summary.blockers.push("guarded destruction requires a stopped source watch; run dev stop, then request a fresh destroy preview".to_string());
-                if json_flag {
-                    self.print_json(&summary)?;
-                } else {
-                    self.stdout_lines(render::env::env_destroy_preview(
-                        &summary,
-                        profile,
-                        &self.command_example(),
-                    ));
-                }
-                return Ok(1);
+                return self.print_env_destroy_preview(&summary, json_flag, profile, 1);
             }
             // The controller may need the operation lock to restore its service.
             // Stop only the generation accepted by this apply, then revalidate.
@@ -356,16 +319,7 @@ impl Cli {
                 },
             );
             if !summary.blockers.is_empty() {
-                if json_flag {
-                    self.print_json(&summary)?;
-                } else {
-                    self.stdout_lines(render::env::env_destroy_preview(
-                        &summary,
-                        profile,
-                        &self.command_example(),
-                    ));
-                }
-                return Ok(1);
+                return self.print_env_destroy_preview(&summary, json_flag, profile, 1);
             }
         }
         self.environment_service()
@@ -427,16 +381,7 @@ impl Cli {
             if summary.code.as_deref() != Some("partial_apply") {
                 return Err(error);
             }
-            if json_flag {
-                self.print_json(&summary)?;
-            } else {
-                self.stdout_lines(render::env::env_destroy_preview(
-                    &summary,
-                    profile,
-                    &self.command_example(),
-                ));
-            }
-            return Ok(1);
+            return self.print_env_destroy_preview(&summary, json_flag, profile, 1);
         }
 
         let _ = &operation_lock;
@@ -476,6 +421,25 @@ impl Cli {
             &self.command_example(),
         ));
         Ok(0)
+    }
+
+    fn print_env_destroy_preview(
+        &self,
+        summary: &EnvDestroySummary,
+        json: bool,
+        profile: render::RenderProfile,
+        code: i32,
+    ) -> Result<i32, String> {
+        if json {
+            self.print_json(summary)?;
+        } else {
+            self.stdout_lines(render::env::env_destroy_preview(
+                summary,
+                profile,
+                &self.command_example(),
+            ));
+        }
+        Ok(code)
     }
 
     pub(super) fn handle_env_prune(&self, args: Vec<String>) -> Result<i32, String> {
