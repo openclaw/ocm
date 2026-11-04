@@ -4,6 +4,20 @@ use std::fs;
 
 use crate::support::{TestDir, ocm_env, run_ocm, stderr, stdout};
 
+fn assert_help_parity(label: &str, left: &[&str], right: &[&str]) -> String {
+    let root = TestDir::new(label);
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    let via_help = run_ocm(&cwd, &env, left);
+    let alternative = run_ocm(&cwd, &env, right);
+    assert!(via_help.status.success(), "{}", stderr(&via_help));
+    assert!(alternative.status.success(), "{}", stderr(&alternative));
+    let output = stdout(&via_help);
+    assert_eq!(output, stdout(&alternative));
+    output
+}
+
 #[test]
 fn top_level_help_lists_commands_and_examples() {
     let root = TestDir::new("help-root");
@@ -55,18 +69,7 @@ fn top_level_help_lists_commands_and_examples() {
 
 #[test]
 fn logs_help_is_available_from_help_and_flag() {
-    let root = TestDir::new("help-logs");
-    let cwd = root.child("workspace");
-    fs::create_dir_all(&cwd).unwrap();
-    let env = ocm_env(&root);
-
-    let via_help = run_ocm(&cwd, &env, &["help", "logs"]);
-    let via_flag = run_ocm(&cwd, &env, &["logs", "--help"]);
-    assert!(via_help.status.success(), "{}", stderr(&via_help));
-    assert!(via_flag.status.success(), "{}", stderr(&via_flag));
-
-    let output = stdout(&via_help);
-    assert_eq!(output, stdout(&via_flag));
+    let output = assert_help_parity("help-logs", &["help", "logs"], &["logs", "--help"]);
     assert!(output.contains(
         "ocm logs <env> [--stream <info|error>] [--tail <count>] [--follow|-f] [--raw] [--json]"
     ));
@@ -78,18 +81,7 @@ fn logs_help_is_available_from_help_and_flag() {
 
 #[test]
 fn dev_help_is_available_from_help_and_bare_group() {
-    let root = TestDir::new("help-dev-group");
-    let cwd = root.child("workspace");
-    fs::create_dir_all(&cwd).unwrap();
-    let env = ocm_env(&root);
-
-    let via_help = run_ocm(&cwd, &env, &["help", "dev"]);
-    let bare = run_ocm(&cwd, &env, &["dev", "--help"]);
-    assert!(via_help.status.success(), "{}", stderr(&via_help));
-    assert!(bare.status.success(), "{}", stderr(&bare));
-
-    let output = stdout(&via_help);
-    assert_eq!(output, stdout(&bare));
+    let output = assert_help_parity("help-dev-group", &["help", "dev"], &["dev", "--help"]);
     assert!(output.contains(
         "ocm dev <env> [--repo <path>] [--root <path>] [--port <port>] [--watch | --no-watch] [--ui | --no-ui] [--force] [--service] [--onboard]"
     ));
@@ -108,52 +100,27 @@ fn dev_help_is_available_from_help_and_bare_group() {
 
 #[test]
 fn dev_status_help_is_available_from_help_and_flag() {
-    let root = TestDir::new("help-dev-status");
-    let cwd = root.child("workspace");
-    fs::create_dir_all(&cwd).unwrap();
-    let env = ocm_env(&root);
-
-    let via_help = run_ocm(&cwd, &env, &["help", "dev", "status"]);
-    let via_flag = run_ocm(&cwd, &env, &["dev", "status", "--help"]);
-    assert!(via_help.status.success(), "{}", stderr(&via_help));
-    assert!(via_flag.status.success(), "{}", stderr(&via_flag));
-
-    let output = stdout(&via_help);
-    assert_eq!(output, stdout(&via_flag));
+    let output = assert_help_parity(
+        "help-dev-status",
+        &["help", "dev", "status"],
+        &["dev", "status", "--help"],
+    );
     assert!(output.contains("ocm dev status [env] [--raw] [--json]"));
 }
 
 #[test]
 fn doctor_group_help_is_available_from_help_and_bare_group() {
-    let root = TestDir::new("help-doctor-group");
-    let cwd = root.child("workspace");
-    fs::create_dir_all(&cwd).unwrap();
-    let env = ocm_env(&root);
-
-    let via_help = run_ocm(&cwd, &env, &["help", "doctor"]);
-    let bare = run_ocm(&cwd, &env, &["doctor"]);
-    assert!(via_help.status.success(), "{}", stderr(&via_help));
-    assert!(bare.status.success(), "{}", stderr(&bare));
-
-    let output = stdout(&via_help);
-    assert_eq!(output, stdout(&bare));
+    let output = assert_help_parity("help-doctor-group", &["help", "doctor"], &["doctor"]);
     assert!(output.contains("ocm doctor host"));
 }
 
 #[test]
 fn doctor_host_help_is_available_from_help_and_flag() {
-    let root = TestDir::new("help-doctor-host");
-    let cwd = root.child("workspace");
-    fs::create_dir_all(&cwd).unwrap();
-    let env = ocm_env(&root);
-
-    let via_help = run_ocm(&cwd, &env, &["help", "doctor", "host"]);
-    let via_flag = run_ocm(&cwd, &env, &["doctor", "host", "--help"]);
-    assert!(via_help.status.success(), "{}", stderr(&via_help));
-    assert!(via_flag.status.success(), "{}", stderr(&via_flag));
-
-    let output = stdout(&via_help);
-    assert_eq!(output, stdout(&via_flag));
+    let output = assert_help_parity(
+        "help-doctor-host",
+        &["help", "doctor", "host"],
+        &["doctor", "host", "--help"],
+    );
     assert!(output.contains("ocm doctor host [--raw] [--json]"));
     assert!(output.contains("ocm doctor host --fix git --yes [--json]"));
     assert!(output.contains("--fix <tool>"));
@@ -185,18 +152,7 @@ fn help_uses_ocm_self_for_root_and_leaf_examples() {
 
 #[test]
 fn start_help_is_available_from_help_and_flag() {
-    let root = TestDir::new("help-start");
-    let cwd = root.child("workspace");
-    fs::create_dir_all(&cwd).unwrap();
-    let env = ocm_env(&root);
-
-    let via_help = run_ocm(&cwd, &env, &["help", "start"]);
-    let via_flag = run_ocm(&cwd, &env, &["start", "--help"]);
-    assert!(via_help.status.success(), "{}", stderr(&via_help));
-    assert!(via_flag.status.success(), "{}", stderr(&via_flag));
-
-    let output = stdout(&via_help);
-    assert_eq!(output, stdout(&via_flag));
+    let output = assert_help_parity("help-start", &["help", "start"], &["start", "--help"]);
     assert!(output.contains("ocm start [name]"));
     assert!(output.contains("--no-service"));
     assert!(output.contains("--onboard"));
@@ -207,18 +163,7 @@ fn start_help_is_available_from_help_and_flag() {
 
 #[test]
 fn upgrade_help_is_available_from_help_and_flag() {
-    let root = TestDir::new("help-upgrade");
-    let cwd = root.child("workspace");
-    fs::create_dir_all(&cwd).unwrap();
-    let env = ocm_env(&root);
-
-    let via_help = run_ocm(&cwd, &env, &["help", "upgrade"]);
-    let via_flag = run_ocm(&cwd, &env, &["upgrade", "--help"]);
-    assert!(via_help.status.success(), "{}", stderr(&via_help));
-    assert!(via_flag.status.success(), "{}", stderr(&via_flag));
-
-    let output = stdout(&via_help);
-    assert_eq!(output, stdout(&via_flag));
+    let output = assert_help_parity("help-upgrade", &["help", "upgrade"], &["upgrade", "--help"]);
     assert!(
         output
             .contains("ocm upgrade simulate <env> --to <version|channel|repo-path|owner/repo#PR>")
@@ -236,70 +181,30 @@ fn upgrade_help_is_available_from_help_and_flag() {
 
 #[test]
 fn upgrade_rollback_help_is_available_from_help_and_flag() {
-    let root = TestDir::new("help-upgrade-rollback");
-    let cwd = root.child("workspace");
-    fs::create_dir_all(&cwd).unwrap();
-    let env = ocm_env(&root);
-
-    let via_help = run_ocm(&cwd, &env, &["help", "upgrade", "rollback"]);
-    let via_flag = run_ocm(&cwd, &env, &["upgrade", "rollback", "--help"]);
-    assert!(via_help.status.success(), "{}", stderr(&via_help));
-    assert!(via_flag.status.success(), "{}", stderr(&via_flag));
-
-    let output = stdout(&via_help);
-    assert_eq!(output, stdout(&via_flag));
+    let output = assert_help_parity(
+        "help-upgrade-rollback",
+        &["help", "upgrade", "rollback"],
+        &["upgrade", "rollback", "--help"],
+    );
     assert!(output.contains("--transaction <id>"));
     assert!(output.contains("--dry-run"));
 }
 
 #[test]
 fn setup_help_is_available_from_help_and_flag() {
-    let root = TestDir::new("help-setup");
-    let cwd = root.child("workspace");
-    fs::create_dir_all(&cwd).unwrap();
-    let env = ocm_env(&root);
-
-    let via_help = run_ocm(&cwd, &env, &["help", "setup"]);
-    let via_flag = run_ocm(&cwd, &env, &["setup", "--help"]);
-    assert!(via_help.status.success(), "{}", stderr(&via_help));
-    assert!(via_flag.status.success(), "{}", stderr(&via_flag));
-
-    let output = stdout(&via_help);
-    assert_eq!(output, stdout(&via_flag));
+    let output = assert_help_parity("help-setup", &["help", "setup"], &["setup", "--help"]);
     assert!(output.contains("ocm setup"));
 }
 
 #[test]
 fn self_help_is_available_from_help_and_bare_group() {
-    let root = TestDir::new("help-self-group");
-    let cwd = root.child("workspace");
-    fs::create_dir_all(&cwd).unwrap();
-    let env = ocm_env(&root);
-
-    let via_help = run_ocm(&cwd, &env, &["help", "self"]);
-    let bare = run_ocm(&cwd, &env, &["self"]);
-    assert!(via_help.status.success(), "{}", stderr(&via_help));
-    assert!(bare.status.success(), "{}", stderr(&bare));
-
-    let output = stdout(&via_help);
-    assert_eq!(output, stdout(&bare));
+    let output = assert_help_parity("help-self-group", &["help", "self"], &["self"]);
     assert!(output.contains("ocm self update --check"));
 }
 
 #[test]
 fn env_group_help_is_available_from_help_and_bare_group() {
-    let root = TestDir::new("help-env-group");
-    let cwd = root.child("workspace");
-    fs::create_dir_all(&cwd).unwrap();
-    let env = ocm_env(&root);
-
-    let via_help = run_ocm(&cwd, &env, &["help", "env"]);
-    let bare = run_ocm(&cwd, &env, &["env"]);
-    assert!(via_help.status.success(), "{}", stderr(&via_help));
-    assert!(bare.status.success(), "{}", stderr(&bare));
-
-    let output = stdout(&via_help);
-    assert_eq!(output, stdout(&bare));
+    let output = assert_help_parity("help-env-group", &["help", "env"], &["env"]);
     assert!(output.contains("ocm help env create"));
     assert!(output.contains("ocm help env snapshot"));
 }
@@ -380,35 +285,17 @@ fn env_set_runtime_help_mentions_release_selectors() {
 
 #[test]
 fn release_group_help_is_available_from_help_and_bare_group() {
-    let root = TestDir::new("help-release-group");
-    let cwd = root.child("workspace");
-    fs::create_dir_all(&cwd).unwrap();
-    let env = ocm_env(&root);
-
-    let via_help = run_ocm(&cwd, &env, &["help", "release"]);
-    let bare = run_ocm(&cwd, &env, &["release"]);
-    assert!(via_help.status.success(), "{}", stderr(&via_help));
-    assert!(bare.status.success(), "{}", stderr(&bare));
-
-    let output = stdout(&via_help);
-    assert_eq!(output, stdout(&bare));
+    let output = assert_help_parity("help-release-group", &["help", "release"], &["release"]);
     assert!(output.contains("ocm release show 2026.3.24"));
 }
 
 #[test]
 fn env_run_help_is_available_through_help_keyword_and_flag() {
-    let root = TestDir::new("help-env-run");
-    let cwd = root.child("workspace");
-    fs::create_dir_all(&cwd).unwrap();
-    let env = ocm_env(&root);
-
-    let via_help = run_ocm(&cwd, &env, &["help", "env", "run"]);
-    let via_flag = run_ocm(&cwd, &env, &["env", "run", "--help"]);
-    assert!(via_help.status.success(), "{}", stderr(&via_help));
-    assert!(via_flag.status.success(), "{}", stderr(&via_flag));
-
-    let output = stdout(&via_help);
-    assert_eq!(output, stdout(&via_flag));
+    let output = assert_help_parity(
+        "help-env-run",
+        &["help", "env", "run"],
+        &["env", "run", "--help"],
+    );
     assert!(output.contains(
         "ocm env run <name> [--runtime <name> | --launcher <name>] -- <openclaw args...>"
     ));
