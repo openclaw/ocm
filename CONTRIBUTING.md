@@ -112,6 +112,7 @@ set -eu
 git diff --check HEAD
 cargo fmt --check
 python3 -B -m unittest discover -s scripts/tests -p 'test_auto_release*.py'
+python3 -B -m unittest discover -s scripts/tests -p 'test_native_gateway*.py'
 
 # 2. Compile every workspace target, including test targets.
 cargo check --workspace --all-targets --locked
@@ -128,7 +129,9 @@ There is no separate Clippy gate in the current CI contract. Do not invent one
 or equate formatting with compilation. The automatic-release Python suite is
 part of every CI Format job, even when the patch does not edit release scripts;
 its subprocess prerequisites and isolated fixtures are described in
-[automatic releases](docs/AUTOMATIC_RELEASES.md#verification).
+[automatic releases](docs/AUTOMATIC_RELEASES.md#verification). The native Gateway
+Python checks also run in the Format job; they simulate shutdown observations
+without launching a service.
 
 During iteration, reproduce a failure with the smallest relevant command, such
 as `cargo test --locked --test cli_invocation_tests`. Retain preceding results
