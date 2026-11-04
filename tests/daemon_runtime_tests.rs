@@ -17,7 +17,8 @@ use serde_json::{Value, to_value};
 
 use crate::support::{
     TestDir, install_fake_launchctl, install_fake_service_manager, install_fake_systemd_tools,
-    ocm_env, ocm_test_binary_path, path_string, run_ocm, stderr, stdout, write_executable_script,
+    ocm_env, ocm_test_binary_path, path_string, retry_executable_busy, run_ocm, stderr, stdout,
+    write_executable_script,
 };
 
 static DAEMON_RUNTIME_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -3843,15 +3844,7 @@ fn homebrew_daemon_children_keep_the_link_across_brew_upgrade() {
         .args(["__daemon", "run", "--once", "--json"])
         .env_clear()
         .envs(&env);
-    let output = (0..5)
-        .find_map(|_| match run.output() {
-            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
-                sleep(Duration::from_millis(20));
-                None
-            }
-            result => Some(result.unwrap()),
-        })
-        .expect("copied ocm stayed busy");
+    let output = retry_executable_busy(|| run.output()).expect("copied ocm stayed busy");
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(upgraded.exists(), "no child simulated the upgrade");
     let link = path_string(&prefix.join("bin/ocm"));
@@ -3937,15 +3930,7 @@ fn homebrew_daemon_started_before_brew_upgrade_gives_new_gateways_the_link() {
         .envs(&env)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let mut daemon = (0..5)
-        .find_map(|_| match command.spawn() {
-            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
-                sleep(Duration::from_millis(20));
-                None
-            }
-            result => Some(result.unwrap()),
-        })
-        .expect("copied ocm stayed busy");
+    let mut daemon = retry_executable_busy(|| command.spawn()).expect("copied ocm stayed busy");
     let started = wait_for_runtime_children(&runtime_path, 0, None, Duration::from_secs(5));
     if started.is_none() {
         stop_process(&mut daemon);
