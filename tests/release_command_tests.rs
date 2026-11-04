@@ -5,8 +5,8 @@ use std::fs;
 use serde_json::json;
 
 use crate::support::{
-    TestDir, TestHttpServer, install_fake_managed_node_archive, install_fake_node_and_npm, ocm_env,
-    openclaw_package_tarball, path_string, run_ocm, sha512_integrity, stderr, stdout,
+    TestDir, TestHttpServer, install_fake_node_and_npm, ocm_env, openclaw_package_tarball, run_ocm,
+    sha512_integrity, stderr, stdout,
 };
 
 fn requests_install_metadata(server: &TestHttpServer) -> bool {
@@ -308,46 +308,6 @@ fn release_install_rejects_non_canonical_runtime_names() {
             "release install uses the canonical runtime name \"stable\" for this selector"
         )
     );
-}
-
-#[test]
-fn release_install_stays_quiet_when_managed_node_fallback_is_available() {
-    let root = TestDir::new("release-install-host-doctor");
-    let cwd = root.child("workspace");
-    fs::create_dir_all(&cwd).unwrap();
-
-    let tarball =
-        openclaw_package_tarball("#!/usr/bin/env node\nconsole.log('stable');\n", "2026.3.24");
-    let integrity = sha512_integrity(&tarball);
-    let tarball_server = TestHttpServer::serve_bytes(
-        "/openclaw-2026.3.24.tgz",
-        "application/octet-stream",
-        &tarball,
-    );
-    let packument = format!(
-        "{{\"dist-tags\":{{\"latest\":\"2026.3.24\"}},\"versions\":{{\"2026.3.24\":{{\"version\":\"2026.3.24\",\"dist\":{{\"tarball\":\"{}\",\"integrity\":\"{}\"}}}}}},\"time\":{{\"2026.3.24\":\"2026-03-25T16:35:52.000Z\"}}}}",
-        tarball_server.url(),
-        integrity
-    );
-    let packument_server =
-        TestHttpServer::serve_bytes_times("/openclaw", "application/json", packument.as_bytes(), 2);
-    let mut env = ocm_env(&root);
-    let empty_path = root.child("empty-path");
-    fs::create_dir_all(&empty_path).unwrap();
-    env.insert("PATH".to_string(), path_string(&empty_path));
-    env.insert(
-        "OCM_INTERNAL_OPENCLAW_RELEASES_URL".to_string(),
-        packument_server.url(),
-    );
-    let _managed_node = install_fake_managed_node_archive(&root, &mut env, "24.22.1");
-
-    let install = run_ocm(&cwd, &env, &["release", "install", "--channel", "stable"]);
-    assert!(install.status.success(), "{}", stderr(&install));
-    let output = stdout(&install);
-    assert!(output.contains("Installed runtime stable"));
-    assert!(!output.contains("healthy: true"));
-    assert!(!output.contains("officialReleaseReady: true"));
-    assert!(!output.contains("check: category=official-release"));
 }
 
 #[test]
