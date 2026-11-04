@@ -1059,6 +1059,21 @@ pub fn run_ocm(cwd: &Path, env: &BTreeMap<String, String>, args: &[&str]) -> Out
     run_ocm_binary(&ocm_test_binary_path(), cwd, env, args)
 }
 
+// Retry exec admission only; a process that started is never run again.
+pub fn retry_executable_busy<T>(
+    mut operation: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    for attempt in 0..5 {
+        match operation() {
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < 4 => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            result => return result,
+        }
+    }
+    unreachable!("the final attempt always returns")
+}
+
 pub fn run_ocm_binary(
     binary: &Path,
     cwd: &Path,
@@ -1070,7 +1085,7 @@ pub fn run_ocm_binary(
     command.args(args);
     command.env_clear();
     command.envs(env);
-    command.output().unwrap()
+    retry_executable_busy(|| command.output()).unwrap()
 }
 
 /// Run ocm, failing instead of hanging when it does not exit within `limit`.
