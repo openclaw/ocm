@@ -492,7 +492,7 @@ pub fn runtime_installed(
     command_example: &str,
 ) -> Vec<String> {
     if !profile.pretty {
-        return runtime_installed_raw(meta, command_example);
+        return runtime_action_raw("Installed", meta, command_example);
     }
 
     runtime_action_receipt("Runtime installed", meta, profile, command_example)
@@ -504,19 +504,15 @@ pub fn runtime_built(
     command_example: &str,
 ) -> Vec<String> {
     if !profile.pretty {
-        let mut lines = runtime_installed_raw(meta, command_example);
-        if let Some(first) = lines.first_mut() {
-            *first = format!("Built runtime {}", meta.name);
-        }
-        return lines;
+        return runtime_action_raw("Built", meta, command_example);
     }
 
     runtime_action_receipt("Runtime built", meta, profile, command_example)
 }
 
-fn runtime_installed_raw(meta: &RuntimeMeta, command_example: &str) -> Vec<String> {
+fn runtime_action_raw(action: &str, meta: &RuntimeMeta, command_example: &str) -> Vec<String> {
     let mut lines = vec![
-        format!("Installed runtime {}", meta.name),
+        format!("{action} runtime {}", meta.name),
         format!("  binary path: {}", meta.binary_path),
     ];
     if let Some(install_root) = meta.install_root.as_deref() {
@@ -535,25 +531,10 @@ pub fn runtime_reused(
     command_example: &str,
 ) -> Vec<String> {
     if !profile.pretty {
-        return runtime_reused_raw(meta, command_example);
+        return runtime_action_raw("Using installed", meta, command_example);
     }
 
     runtime_action_receipt("Runtime ready", meta, profile, command_example)
-}
-
-fn runtime_reused_raw(meta: &RuntimeMeta, command_example: &str) -> Vec<String> {
-    let mut lines = vec![
-        format!("Using installed runtime {}", meta.name),
-        format!("  binary path: {}", meta.binary_path),
-    ];
-    if let Some(install_root) = meta.install_root.as_deref() {
-        lines.push(format!("  install root: {install_root}"));
-    }
-    lines.push(format!(
-        "  use in env: {command_example} env create mira --runtime {}",
-        meta.name
-    ));
-    lines
 }
 
 pub fn runtime_releases(releases: &[RuntimeRelease]) -> Vec<String> {
@@ -673,25 +654,10 @@ pub fn runtime_updated(
     command_example: &str,
 ) -> Vec<String> {
     if !profile.pretty {
-        return runtime_updated_raw(meta, command_example);
+        return runtime_action_raw("Updated", meta, command_example);
     }
 
     runtime_action_receipt("Runtime updated", meta, profile, command_example)
-}
-
-fn runtime_updated_raw(meta: &RuntimeMeta, command_example: &str) -> Vec<String> {
-    let mut lines = vec![
-        format!("Updated runtime {}", meta.name),
-        format!("  binary path: {}", meta.binary_path),
-    ];
-    if let Some(install_root) = meta.install_root.as_deref() {
-        lines.push(format!("  install root: {install_root}"));
-    }
-    lines.push(format!(
-        "  use in env: {command_example} env create mira --runtime {}",
-        meta.name
-    ));
-    lines
 }
 
 fn runtime_action_receipt(

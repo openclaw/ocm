@@ -456,20 +456,27 @@ impl<'a> RuntimeService<'a> {
         })
     }
 
+    fn install_unbound(
+        &self,
+        name: &str,
+        install: impl FnOnce(InstallContext<'_>) -> Result<RuntimeMeta, String>,
+    ) -> Result<RuntimeMeta, String> {
+        let meta = self.with_unbound_runtime(name, |guard| {
+            install(InstallContext {
+                env: self.env,
+                cwd: self.cwd,
+                runtime_guard: Some(guard),
+            })
+        })?;
+        self.refresh_supervisor_if_present(name)?;
+        Ok(meta)
+    }
+
     pub fn install(&self, options: InstallRuntimeOptions) -> Result<RuntimeMeta, String> {
         let name = options.name.clone();
-        let meta = self.with_unbound_runtime(&name, |guard| {
-            install_runtime_with_context(
-                options,
-                InstallContext {
-                    env: self.env,
-                    cwd: self.cwd,
-                    runtime_guard: Some(guard),
-                },
-            )
-        })?;
-        self.refresh_supervisor_if_present(&name)?;
-        Ok(meta)
+        self.install_unbound(&name, |context| {
+            install_runtime_with_context(options, context)
+        })
     }
 
     pub fn install_from_url(
@@ -477,18 +484,9 @@ impl<'a> RuntimeService<'a> {
         options: InstallRuntimeFromUrlOptions,
     ) -> Result<RuntimeMeta, String> {
         let name = options.name.clone();
-        let meta = self.with_unbound_runtime(&name, |guard| {
-            install_runtime_from_url_with_context(
-                options,
-                InstallContext {
-                    env: self.env,
-                    cwd: self.cwd,
-                    runtime_guard: Some(guard),
-                },
-            )
-        })?;
-        self.refresh_supervisor_if_present(&name)?;
-        Ok(meta)
+        self.install_unbound(&name, |context| {
+            install_runtime_from_url_with_context(options, context)
+        })
     }
 
     pub fn install_from_release(
@@ -496,18 +494,9 @@ impl<'a> RuntimeService<'a> {
         options: InstallRuntimeFromReleaseOptions,
     ) -> Result<RuntimeMeta, String> {
         let name = options.name.clone();
-        let meta = self.with_unbound_runtime(&name, |guard| {
-            install_runtime_from_release_with_context(
-                options,
-                InstallContext {
-                    env: self.env,
-                    cwd: self.cwd,
-                    runtime_guard: Some(guard),
-                },
-            )
-        })?;
-        self.refresh_supervisor_if_present(&name)?;
-        Ok(meta)
+        self.install_unbound(&name, |context| {
+            install_runtime_from_release_with_context(options, context)
+        })
     }
 
     pub fn install_from_official_openclaw_release(
@@ -515,34 +504,16 @@ impl<'a> RuntimeService<'a> {
         options: InstallRuntimeFromOfficialReleaseOptions,
     ) -> Result<RuntimeMeta, String> {
         let name = options.name.clone();
-        let meta = self.with_unbound_runtime(&name, |guard| {
-            install_runtime_from_official_openclaw_release_with_context(
-                options,
-                InstallContext {
-                    env: self.env,
-                    cwd: self.cwd,
-                    runtime_guard: Some(guard),
-                },
-            )
-        })?;
-        self.refresh_supervisor_if_present(&name)?;
-        Ok(meta)
+        self.install_unbound(&name, |context| {
+            install_runtime_from_official_openclaw_release_with_context(options, context)
+        })
     }
 
     pub fn build_local(&self, options: BuildLocalRuntimeOptions) -> Result<RuntimeMeta, String> {
         let name = options.name.clone();
-        let meta = self.with_unbound_runtime(&name, |guard| {
-            install_runtime_from_local_openclaw_build(
-                options,
-                InstallContext {
-                    env: self.env,
-                    cwd: self.cwd,
-                    runtime_guard: Some(guard),
-                },
-            )
-        })?;
-        self.refresh_supervisor_if_present(&name)?;
-        Ok(meta)
+        self.install_unbound(&name, |context| {
+            install_runtime_from_local_openclaw_build(options, context)
+        })
     }
 
     pub fn update_from_release(
