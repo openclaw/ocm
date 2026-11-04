@@ -1501,44 +1501,52 @@ fn env_clone_uses_openclaw_config_env_precedence_for_workspace_selection() {
 
 #[test]
 fn env_clone_rewrites_identity_bound_workspaces_to_the_copied_data_path() {
-    let root = TestDir::new("env-clone-runtime-identity");
-    let cwd = root.child("workspace");
-    fs::create_dir_all(&cwd).unwrap();
-    let env = ocm_env(&root);
+    for form in ["defaults", "entries", "list"] {
+        let root = TestDir::new("env-clone-runtime-identity");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let env = ocm_env(&root);
 
-    let create = run_ocm(&cwd, &env, &["env", "create", "source", "--port", "19789"]);
-    assert!(create.status.success(), "{}", stderr(&create));
+        let create = run_ocm(&cwd, &env, &["env", "create", "source", "--port", "19789"]);
+        assert!(create.status.success(), "{}", stderr(&create));
 
-    let source_state = root.child("ocm-home/envs/source/.openclaw");
-    write_text(
-        &source_state.join("openclaw.json"),
-        concat!(
-            "{\n",
-            "  agents: { defaults: {\n",
-            "    workspace: '${OCM_ACTIVE_ENV_ROOT}/.openclaw/team/${OCM_ACTIVE_ENV}-${OPENCLAW_GATEWAY_PORT}'\n",
-            "  } }\n",
-            "}\n"
-        ),
-    );
-    write_text(
-        &source_state.join("team/source-19789/notes.txt"),
-        "runtime workspace\n",
-    );
+        let source_state = root.child("ocm-home/envs/source/.openclaw");
+        let template =
+            "${OCM_ACTIVE_ENV_ROOT}/.openclaw/team/${OCM_ACTIVE_ENV}-${OPENCLAW_GATEWAY_PORT}";
+        let agents = match form {
+            "defaults" => serde_json::json!({"defaults": {"workspace": template}}),
+            "entries" => serde_json::json!({"entries": {"main": {"workspace": template}}}),
+            _ => serde_json::json!({"list": [{"id": "main", "workspace": template}]}),
+        };
+        write_text(
+            &source_state.join("openclaw.json"),
+            &serde_json::json!({"agents": agents}).to_string(),
+        );
+        write_text(
+            &source_state.join("team/source-19789/notes.txt"),
+            "runtime workspace\n",
+        );
 
-    let clone = run_ocm(&cwd, &env, &["env", "clone", "source", "target"]);
-    assert!(clone.status.success(), "{}", stderr(&clone));
+        let clone = run_ocm(&cwd, &env, &["env", "clone", "source", "target"]);
+        assert!(clone.status.success(), "{}", stderr(&clone));
 
-    let target_state = root.child("ocm-home/envs/target/.openclaw");
-    let copied_workspace = target_state.join("team/source-19789");
-    assert_eq!(
-        fs::read_to_string(copied_workspace.join("notes.txt")).unwrap(),
-        "runtime workspace\n"
-    );
-    let config: Value =
-        serde_json::from_str(&fs::read_to_string(target_state.join("openclaw.json")).unwrap())
-            .unwrap();
-    let configured_workspace = config["agents"]["defaults"]["workspace"].as_str().unwrap();
-    assert_eq!(Path::new(configured_workspace), copied_workspace);
+        let target_state = root.child("ocm-home/envs/target/.openclaw");
+        let copied_workspace = target_state.join("team/source-19789");
+        assert_eq!(
+            fs::read_to_string(copied_workspace.join("notes.txt")).unwrap(),
+            "runtime workspace\n"
+        );
+        let config: Value =
+            serde_json::from_str(&fs::read_to_string(target_state.join("openclaw.json")).unwrap())
+                .unwrap();
+        let workspace = match form {
+            "defaults" => &config["agents"]["defaults"]["workspace"],
+            "entries" => &config["agents"]["entries"]["main"]["workspace"],
+            _ => &config["agents"]["list"][0]["workspace"],
+        };
+        let configured_workspace = workspace.as_str().unwrap();
+        assert_eq!(Path::new(configured_workspace), copied_workspace);
+    }
 }
 
 #[test]
