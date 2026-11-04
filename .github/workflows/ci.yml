@@ -36,6 +36,8 @@ jobs:
         run: cargo fmt --check
       - name: Test automatic release policy and production boundaries
         run: python3 -B -m unittest discover -s scripts/tests -p 'test_auto_release*.py'
+      - name: Test native Gateway shutdown observation
+        run: python3 -B -m unittest discover -s scripts/tests -p 'test_native_gateway*.py'
 
   msrv:
     name: Rust 1.88 minimum
