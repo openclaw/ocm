@@ -7,8 +7,7 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::support::{
-    TestDir, TestHttpServer, install_fake_node_and_npm, ocm_env, openclaw_package_tarball, run_ocm,
-    sha512_integrity, stderr, stdout, write_executable_script,
+    TestDir, install_fake_node_and_npm, ocm_env, run_ocm, stderr, stdout, write_executable_script,
 };
 
 #[test]
@@ -260,21 +259,7 @@ fn env_doctor_keeps_official_runtime_healthy_when_managed_fallback_is_available(
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
 
-    let tarball =
-        openclaw_package_tarball("#!/usr/bin/env node\nconsole.log('stable');\n", "2026.3.24");
-    let integrity = sha512_integrity(&tarball);
-    let tarball_server = TestHttpServer::serve_bytes(
-        "/openclaw-2026.3.24.tgz",
-        "application/octet-stream",
-        &tarball,
-    );
-    let packument = format!(
-        "{{\"dist-tags\":{{\"latest\":\"2026.3.24\"}},\"versions\":{{\"2026.3.24\":{{\"version\":\"2026.3.24\",\"dist\":{{\"tarball\":\"{}\",\"integrity\":\"{}\"}}}}}},\"time\":{{\"2026.3.24\":\"2026-03-25T16:35:52.000Z\"}}}}",
-        tarball_server.url(),
-        integrity
-    );
-    let packument_server =
-        TestHttpServer::serve_bytes("/openclaw", "application/json", packument.as_bytes());
+    let (_tarball_server, packument_server) = support::official_release_fixture();
     let mut env = ocm_env(&root);
     install_fake_node_and_npm(&root, &mut env, "22.22.3");
     env.insert(
