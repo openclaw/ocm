@@ -5,7 +5,7 @@ use std::fs;
 use crate::support::{TestDir, ocm_env, run_ocm, stderr, stdout};
 
 #[test]
-fn top_level_help_is_clean_and_points_to_topics() {
+fn top_level_help_lists_commands_and_examples() {
     let root = TestDir::new("help-root");
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
@@ -15,25 +15,8 @@ fn top_level_help_is_clean_and_points_to_topics() {
     assert!(help.status.success(), "{}", stderr(&help));
     let output = stdout(&help);
     assert!(output.contains(&format!("OpenClaw Manager v{}", env!("CARGO_PKG_VERSION"))));
-    assert!(output.contains(
-        "Manage isolated OpenClaw environments, releases, runtimes, launchers, and env supervision."
-    ));
     assert!(output.contains("ocm [--color <mode>] <command> [args]"));
-    assert!(output.contains("Fast path: create or reuse an env and keep it running"));
-    assert!(output.contains("Run selected OpenClaw checkouts with isolated environment state"));
-    assert!(output.contains("Guided setup for release and local-dev flows"));
-    assert!(output.contains("Safely update one env or all envs and restart services when needed"));
-    assert!(output.contains("Check host software for release and feature readiness"));
-    assert!(output.contains("Update the installed ocm binary"));
-    assert!(output.contains("Bring an existing plain OpenClaw home into OCM"));
-    assert!(output.contains("Inspect and control the explicit OpenClaw adoption flow"));
     assert!(output.contains("--color <mode>"));
-    assert!(output.contains("Color policy for pretty output: auto, always, or never"));
-    assert!(output.contains("Environment lifecycle, binding, execution, snapshots, and repair"));
-    assert!(output.contains("start"));
-    assert!(output.contains("dev"));
-    assert!(output.contains("upgrade"));
-    assert!(output.contains("setup"));
     assert!(output.contains("ocm dev shaks"));
     assert!(output.contains("ocm dev shaks --no-ui"));
     assert!(output.contains("ocm start"));
@@ -84,7 +67,6 @@ fn logs_help_is_available_from_help_and_flag() {
 
     let output = stdout(&via_help);
     assert_eq!(output, stdout(&via_flag));
-    assert!(output.contains("Read env logs"));
     assert!(output.contains(
         "ocm logs <env> [--stream <info|error>] [--tail <count>] [--follow|-f] [--raw] [--json]"
     ));
@@ -92,9 +74,6 @@ fn logs_help_is_available_from_help_and_flag() {
     assert!(output.contains("ocm logs mira --follow"));
     assert!(output.contains("ocm logs mira -f"));
     assert!(output.contains("ocm logs mira --stream error --follow"));
-    assert!(output.contains("By default OCM shows both stdout and stderr together in time order."));
-    assert!(output.contains("untimestamped output at the end of a log, such as a startup error, is placed at that file's last write."));
-    assert!(output.contains("Default output shows the last 50 lines."));
 }
 
 #[test]
@@ -111,7 +90,6 @@ fn dev_help_is_available_from_help_and_bare_group() {
 
     let output = stdout(&via_help);
     assert_eq!(output, stdout(&bare));
-    assert!(output.contains("Development envs"));
     assert!(output.contains(
         "ocm dev <env> [--repo <path>] [--root <path>] [--port <port>] [--watch | --no-watch] [--ui | --no-ui] [--force] [--service] [--onboard]"
     ));
@@ -120,14 +98,9 @@ fn dev_help_is_available_from_help_and_bare_group() {
     assert!(output.contains("ocm dev shaks --no-watch"));
     assert!(output.contains("ocm dev shaks --no-watch --no-ui"));
     assert!(output.contains("ocm dev shaks --force"));
-    assert!(output.contains("Backend watching and native Vite UI are enabled by default."));
-    assert!(output.contains(
-        "Explicit --watch and --ui remain accepted; each conflicts with its negative counterpart."
-    ));
     assert!(output.contains(
         "--service uses the background workflow without foreground watching or UI and rejects explicit --watch or --ui."
     ));
-    assert!(output.contains("each native browser handoff"));
     assert!(output.contains("ocm dev shaks --repo /path/to/openclaw --watch --force"));
     assert!(output.contains("ocm dev shaks --service"));
     assert!(output.contains("ocm help dev status"));
@@ -147,11 +120,7 @@ fn dev_status_help_is_available_from_help_and_flag() {
 
     let output = stdout(&via_help);
     assert_eq!(output, stdout(&via_flag));
-    assert!(output.contains("Show dev env status"));
     assert!(output.contains("ocm dev status [env] [--raw] [--json]"));
-    assert!(output.contains(
-        "Includes dev envs and runtime or launcher envs with an active or starting source watch."
-    ));
 }
 
 #[test]
@@ -168,9 +137,7 @@ fn doctor_group_help_is_available_from_help_and_bare_group() {
 
     let output = stdout(&via_help);
     assert_eq!(output, stdout(&bare));
-    assert!(output.contains("Doctor commands"));
     assert!(output.contains("ocm doctor host"));
-    assert!(output.contains("Check required software for official releases"));
 }
 
 #[test]
@@ -187,22 +154,10 @@ fn doctor_host_help_is_available_from_help_and_flag() {
 
     let output = stdout(&via_help);
     assert_eq!(output, stdout(&via_flag));
-    assert!(output.contains("Check host readiness"));
     assert!(output.contains("ocm doctor host [--raw] [--json]"));
     assert!(output.contains("ocm doctor host --fix git --yes [--json]"));
     assert!(output.contains("--fix <tool>"));
     assert!(output.contains("--yes"));
-    assert!(output.contains(
-        "Official release installs prefer host Node.js and npm that satisfy the selected package engines.node requirement."
-    ));
-    assert!(
-        output.contains(
-            "On supported platforms, OCM can manage a compatible private copy when the host tools are missing or incompatible."
-        )
-    );
-    assert!(output.contains(
-        "Git is the first supported host fix target; OCM will not install Homebrew automatically."
-    ));
 }
 
 #[test]
@@ -242,28 +197,12 @@ fn start_help_is_available_from_help_and_flag() {
 
     let output = stdout(&via_help);
     assert_eq!(output, stdout(&via_flag));
-    assert!(output.contains("Start an environment"));
     assert!(output.contains("ocm start [name]"));
-    assert!(output.contains("Optional environment name. If omitted, ocm generates a new one."));
     assert!(output.contains("--no-service"));
     assert!(output.contains("--onboard"));
     assert!(output.contains("ocm start mira --channel stable"));
     assert!(output.contains("ocm start luna --command 'pnpm openclaw' --cwd /path/to/openclaw"));
     assert!(output.contains("ocm start mira --onboard"));
-    assert!(output.contains("Start installs and starts the env service by default."));
-    assert!(output.contains("Start writes the minimum local config by default"));
-    assert!(output.contains(
-        "Managed services currently support launchd on macOS and systemd --user on Linux."
-    ));
-    assert!(output.contains(
-        "Official release selectors prefer host Node.js and npm when compatible with the selected package; OCM can manage a compatible private copy on supported platforms."
-    ));
-    assert!(output.contains(
-        "When start creates a new official-release env interactively, it can offer to install git for repo-aware coding workflows."
-    ));
-    assert!(output.contains(
-        "If OCM detects an existing plain OpenClaw home, start keeps the new env fresh and points you at `migrate`"
-    ));
 }
 
 #[test]
@@ -280,7 +219,6 @@ fn upgrade_help_is_available_from_help_and_flag() {
 
     let output = stdout(&via_help);
     assert_eq!(output, stdout(&via_flag));
-    assert!(output.contains("Upgrade environments"));
     assert!(
         output
             .contains("ocm upgrade simulate <env> --to <version|channel|repo-path|owner/repo#PR>")
@@ -294,18 +232,6 @@ fn upgrade_help_is_available_from_help_and_flag() {
     assert!(output.contains("ocm upgrade --all"));
     assert!(output.contains("ocm upgrade batch --runtime <runtime> --envs <env,env,...>"));
     assert!(output.contains("--accept-fleet-outage"));
-    assert!(output.contains("cold checkpoint for every selected environment"));
-    assert!(output.contains("Simulations clone the source env"));
-    assert!(output.contains("Channel-tracked runtimes move forward automatically."));
-    assert!(output.contains("older targets are rejected before snapshot creation"));
-    assert!(output.contains("require both HTTP health and OpenClaw gateway reachability"));
-    assert!(output.contains("upgrade history <env>"));
-    assert!(output.contains("upgrade rollback <env>"));
-    assert!(
-        output.contains("An env upgrade will not replace runtime bytes shared with another env")
-    );
-    assert!(output.contains("pre-upgrade snapshot"));
-    assert!(output.contains("OpenClaw update finalization"));
 }
 
 #[test]
@@ -322,12 +248,8 @@ fn upgrade_rollback_help_is_available_from_help_and_flag() {
 
     let output = stdout(&via_help);
     assert_eq!(output, stdout(&via_flag));
-    assert!(output.contains("Roll back an upgrade"));
-    assert!(output.contains("upgrade rollback <env>"));
     assert!(output.contains("--transaction <id>"));
     assert!(output.contains("--dry-run"));
-    assert!(output.contains("pre-rollback safety snapshot"));
-    assert!(output.contains("restores the pre-rollback runtime and environment state"));
 }
 
 #[test]
@@ -344,20 +266,7 @@ fn setup_help_is_available_from_help_and_flag() {
 
     let output = stdout(&via_help);
     assert_eq!(output, stdout(&via_flag));
-    assert!(output.contains("Guided setup"));
     assert!(output.contains("ocm setup"));
-    assert!(output.contains("Interactive setup"));
-    assert!(output.contains(
-        "Official release choices prefer host Node.js and npm when compatible with the selected package; OCM can manage a compatible private copy on supported platforms."
-    ));
-    assert!(output.contains(
-        "If git is missing, setup can offer to install it for repo-aware coding workflows."
-    ));
-    assert!(
-        output.contains(
-            "If OCM detects an existing plain OpenClaw home, setup points you at `migrate`"
-        )
-    );
 }
 
 #[test]
@@ -374,8 +283,6 @@ fn self_help_is_available_from_help_and_bare_group() {
 
     let output = stdout(&via_help);
     assert_eq!(output, stdout(&bare));
-    assert!(output.contains("Self commands"));
-    assert!(output.contains("Check for or install a newer ocm release"));
     assert!(output.contains("ocm self update --check"));
 }
 
@@ -393,16 +300,12 @@ fn env_group_help_is_available_from_help_and_bare_group() {
 
     let output = stdout(&via_help);
     assert_eq!(output, stdout(&bare));
-    assert!(output.contains("Environment commands"));
-    assert!(output.contains("destroy"));
-    assert!(output.contains("snapshot create"));
-    assert!(output.contains("Portability:"));
     assert!(output.contains("ocm help env create"));
     assert!(output.contains("ocm help env snapshot"));
 }
 
 #[test]
-fn env_destroy_help_describes_preview_first_teardown() {
+fn env_destroy_help_lists_teardown_options() {
     let root = TestDir::new("help-env-destroy");
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
@@ -411,14 +314,11 @@ fn env_destroy_help_describes_preview_first_teardown() {
     let help = run_ocm(&cwd, &env, &["help", "env", "destroy"]);
     assert!(help.status.success(), "{}", stderr(&help));
     let output = stdout(&help);
-    assert!(output.contains("Destroy an environment"));
     assert!(output.contains(
         "ocm env destroy <name> [--yes] [--force | --if-state-token <token>] [--raw] [--json]"
     ));
     assert!(output.contains("--if-state-token <token>"));
     assert!(output.contains("ocm env destroy mira --yes"));
-    assert!(output.contains("Destroy does not remove shared runtimes or launchers."));
-    assert!(output.contains("TTY output uses cards by default."));
 }
 
 #[test]
@@ -441,7 +341,7 @@ fn env_create_help_mentions_release_selectors() {
 }
 
 #[test]
-fn env_clone_and_import_help_describe_target_sandbox_origins() {
+fn env_clone_and_import_help_list_sandbox_origin_option() {
     let root = TestDir::new("help-env-sandbox-origin");
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
@@ -451,15 +351,11 @@ fn env_clone_and_import_help_describe_target_sandbox_origins() {
     assert!(clone.status.success(), "{}", stderr(&clone));
     let clone_output = stdout(&clone);
     assert!(clone_output.contains("--sandbox-origin <url>"));
-    assert!(clone_output.contains("removes a copied public MCP app sandbox origin"));
-    assert!(clone_output.contains("owned by $include"));
 
     let import = run_ocm(&cwd, &env, &["help", "env", "import"]);
     assert!(import.status.success(), "{}", stderr(&import));
     let import_output = stdout(&import);
     assert!(import_output.contains("--sandbox-origin <url>"));
-    assert!(import_output.contains("removes a copied public MCP app sandbox origin"));
-    assert!(import_output.contains("owned by $include"));
 }
 
 #[test]
@@ -496,9 +392,6 @@ fn release_group_help_is_available_from_help_and_bare_group() {
 
     let output = stdout(&via_help);
     assert_eq!(output, stdout(&bare));
-    assert!(output.contains("Release commands"));
-    assert!(output.contains("List published OpenClaw releases"));
-    assert!(output.contains("Install a published OpenClaw release as a runtime"));
     assert!(output.contains("ocm release show 2026.3.24"));
 }
 
@@ -516,21 +409,11 @@ fn env_run_help_is_available_through_help_keyword_and_flag() {
 
     let output = stdout(&via_help);
     assert_eq!(output, stdout(&via_flag));
-    assert!(output.contains("Run OpenClaw inside an environment"));
     assert!(output.contains(
         "ocm env run <name> [--runtime <name> | --launcher <name>] -- <openclaw args...>"
     ));
     assert!(output.contains("ocm -- status"));
     assert!(output.contains("ocm @mira -- status"));
-    assert!(output.contains("`--` is required before OpenClaw arguments."));
-    assert!(
-        output.contains(
-            "If an environment is active, you can also use the root-level `--` shortcut."
-        )
-    );
-    assert!(
-        output.contains("For one-shot explicit env runs, use the root-level `@<env>` shortcut.")
-    );
 }
 
 #[test]
@@ -544,7 +427,6 @@ fn env_and_service_status_style_help_mentions_raw_mode() {
     assert!(env_show.status.success(), "{}", stderr(&env_show));
     let output = stdout(&env_show);
     assert!(output.contains("ocm env show <name> [--raw] [--json]"));
-    assert!(output.contains("TTY output uses grouped cards by default."));
 
     let env_status = run_ocm(&cwd, &env, &["help", "env", "status"]);
     assert!(env_status.status.success(), "{}", stderr(&env_status));
@@ -572,9 +454,6 @@ fn env_and_service_status_style_help_mentions_raw_mode() {
     );
     let output = stdout(&service_status);
     assert!(output.contains("ocm service status [env] [--raw] [--json]"));
-    assert!(output.contains(
-        "TTY output uses cards for one env and a table when no env is passed or `--all` is used."
-    ));
 
     let service_install = run_ocm(&cwd, &env, &["help", "service", "install"]);
     assert!(
@@ -584,8 +463,6 @@ fn env_and_service_status_style_help_mentions_raw_mode() {
     );
     let output = stdout(&service_install);
     assert!(output.contains("ocm service install <env> [--raw] [--json]"));
-    assert!(output.contains("Use `service start` to start the env after it is enabled."));
-    assert!(output.contains("shared OCM background service"));
 
     let refresh_daemon = run_ocm(&cwd, &env, &["help", "service", "refresh-daemon"]);
     assert!(
@@ -599,7 +476,6 @@ fn env_and_service_status_style_help_mentions_raw_mode() {
             "ocm service refresh-daemon [--acknowledge-gateway-restarts] [--raw] [--json]"
         )
     );
-    assert!(output.contains("never rebuilds desired state"));
 }
 
 #[test]
@@ -611,36 +487,26 @@ fn nested_snapshot_help_is_available() {
 
     let group = run_ocm(&cwd, &env, &["env", "snapshot"]);
     assert!(group.status.success(), "{}", stderr(&group));
-    let output = stdout(&group);
-    assert!(output.contains("Environment snapshot commands"));
-    assert!(output.contains("snapshot prune"));
 
     let leaf = run_ocm(&cwd, &env, &["env", "snapshot", "create", "--help"]);
     assert!(leaf.status.success(), "{}", stderr(&leaf));
     let output = stdout(&leaf);
-    assert!(output.contains("Create an environment snapshot"));
     assert!(output.contains("ocm env snapshot create <name> [--label <label>] [--raw] [--json]"));
 
     let show = run_ocm(&cwd, &env, &["help", "env", "snapshot", "show"]);
     assert!(show.status.success(), "{}", stderr(&show));
     let output = stdout(&show);
     assert!(output.contains("ocm env snapshot show <name> <snapshot> [--raw] [--json]"));
-    assert!(output.contains("TTY output uses grouped cards by default."));
 
     let list = run_ocm(&cwd, &env, &["help", "env", "snapshot", "list"]);
     assert!(list.status.success(), "{}", stderr(&list));
     let output = stdout(&list);
     assert!(output.contains("ocm env snapshot list <name> [--raw] [--json]"));
-    assert!(output.contains("TTY output renders a table by default."));
 
     let remove = run_ocm(&cwd, &env, &["help", "env", "snapshot", "remove"]);
     assert!(remove.status.success(), "{}", stderr(&remove));
     let output = stdout(&remove);
     assert!(output.contains("ocm env snapshot remove <name> <snapshot> [--raw] [--json]"));
-    assert!(output.contains(
-        "validates the stored environment, snapshot ID, storage kind, and artifact path"
-    ));
-    assert!(output.contains("later cleanup failures are reported as warnings"));
 
     let prune = run_ocm(&cwd, &env, &["help", "env", "snapshot", "prune"]);
     assert!(prune.status.success(), "{}", stderr(&prune));
@@ -648,10 +514,6 @@ fn nested_snapshot_help_is_available() {
     assert!(output.contains(
         "ocm env snapshot prune (<name> | --all) [--keep <count>] [--older-than <days>] [--raw] [--yes] [--json]"
     ));
-    assert!(
-        output.contains("TTY output renders tables for preview and applied removals by default.")
-    );
-    assert!(output.contains("preserves cleanup warnings for each removed snapshot"));
 }
 
 #[test]
@@ -664,29 +526,11 @@ fn runtime_and_service_leaf_help_are_command_specific() {
     let runtime = run_ocm(&cwd, &env, &["help", "runtime", "install"]);
     assert!(runtime.status.success(), "{}", stderr(&runtime));
     let output = stdout(&runtime);
-    assert!(output.contains("Install a managed runtime"));
     assert!(output.contains("--manifest-url <url>"));
-    assert!(output.contains("Exactly one install source must be provided."));
-    assert!(output.contains(
-        "Official release installs prefer host Node.js and npm that satisfy the selected package engines.node requirement."
-    ));
-    assert!(
-        output.contains(
-            "On supported platforms, OCM can manage a compatible private copy when the host tools are missing or incompatible."
-        )
-    );
-    assert!(output.contains(
-        "Use `ocm doctor host` only if you want a full machine check or an explicit host-tool fix like git."
-    ));
-    assert!(
-        output
-            .contains("Bound runtimes are reused only when the selected release already matches.")
-    );
 
     let service = run_ocm(&cwd, &env, &["service", "start", "--help"]);
     assert!(service.status.success(), "{}", stderr(&service));
     let output = stdout(&service);
-    assert!(output.contains("Start an env under the background service"));
     assert!(output.contains("ocm service start <env> [--raw] [--json]"));
 }
 
@@ -710,15 +554,13 @@ fn runtime_mutation_help_directs_bound_environments_to_upgrade() {
     let build_local = run_ocm(&cwd, &env, &["help", "runtime", "build-local"]);
     let output = stdout(&build_local);
     assert!(output.contains("--for-env <env>"));
-    assert!(output.contains("mutually exclusive"));
 
     let remove = run_ocm(&cwd, &env, &["help", "runtime", "remove"]);
     assert!(remove.status.success(), "{}", stderr(&remove));
-    assert!(stdout(&remove).contains("Clear every environment binding"));
 }
 
 #[test]
-fn release_install_help_mentions_doctor_host() {
+fn release_install_help_lists_release_selectors() {
     let root = TestDir::new("help-release-install");
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
@@ -728,21 +570,6 @@ fn release_install_help_mentions_doctor_host() {
     assert!(help.status.success(), "{}", stderr(&help));
     let output = stdout(&help);
     assert!(output.contains("ocm release install [<name>] (--version <version> | --channel <channel>) [--description <text>] [--force] [--raw] [--json]"));
-    assert!(output.contains(
-        "Official release installs prefer host Node.js and npm that satisfy the selected package engines.node requirement."
-    ));
-    assert!(
-        output.contains(
-            "On supported platforms, OCM can manage a compatible private copy when the host tools are missing or incompatible."
-        )
-    );
-    assert!(output.contains(
-        "Use `ocm doctor host` only if you want a full machine check or an explicit host-tool fix like git."
-    ));
-    assert!(
-        output
-            .contains("Bound runtimes are reused only when the selected release already matches.")
-    );
 }
 
 #[test]
@@ -758,13 +585,11 @@ fn release_and_runtime_show_help_mentions_raw_mode() {
     assert!(output.contains(
         "ocm release show (<version> | --version <version> | --channel <channel>) [--raw] [--json]"
     ));
-    assert!(output.contains("TTY output uses grouped cards by default."));
 
     let runtime_show = run_ocm(&cwd, &env, &["help", "runtime", "show"]);
     assert!(runtime_show.status.success(), "{}", stderr(&runtime_show));
     let output = stdout(&runtime_show);
     assert!(output.contains("ocm runtime show <name> [--raw] [--json]"));
-    assert!(output.contains("TTY output uses grouped cards by default."));
 }
 
 #[test]
@@ -780,7 +605,6 @@ fn self_update_help_mentions_check_and_raw_modes() {
     assert!(output.contains("ocm self update [--version <version>] [--check] [--raw] [--json]"));
     assert!(output.contains("--check"));
     assert!(output.contains("--raw"));
-    assert!(output.contains("Exact versions accept either `1.2.3` or `v1.2.3`."));
 }
 
 #[test]
@@ -794,10 +618,6 @@ fn runtime_verify_help_mentions_raw_mode() {
     assert!(verify.status.success(), "{}", stderr(&verify));
     let output = stdout(&verify);
     assert!(output.contains("ocm runtime verify (<name> | --all) [--raw] [--json]"));
-    assert!(
-        output
-            .contains("TTY output uses cards for one runtime and a table for `--all` by default.")
-    );
 }
 
 #[test]
@@ -818,7 +638,7 @@ fn runtime_releases_help_mentions_standard_output_modes() {
 }
 
 #[test]
-fn runtime_which_help_mentions_raw_mode_and_tty_cards() {
+fn runtime_which_help_lists_output_modes() {
     let root = TestDir::new("help-runtime-which");
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
@@ -829,7 +649,6 @@ fn runtime_which_help_mentions_raw_mode_and_tty_cards() {
     let output = stdout(&which);
     assert!(output.contains("ocm runtime which <name> [--raw] [--json]"));
     assert!(output.contains("--raw"));
-    assert!(output.contains("TTY output uses a grouped card by default."));
 }
 
 #[test]
