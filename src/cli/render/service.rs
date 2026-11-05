@@ -429,19 +429,13 @@ fn service_status_raw(summary: &ServiceSummary) -> Vec<String> {
         format!("gatewayState: {}", gateway_state(summary)),
         format!(
             "restartHandoff: {}",
-            summary
-                .restart_handoff
-                .clone()
-                .unwrap_or_else(|| "unknown".to_string())
+            summary.restart_handoff.as_deref().unwrap_or("unknown")
         ),
         format!("ocmService: {daemon}"),
         format!("ocmCliVersion: {}", summary.ocm_cli_version),
         format!(
             "ocmServiceVersion: {}",
-            summary
-                .ocm_service_version
-                .clone()
-                .unwrap_or_else(|| "unknown".to_string())
+            summary.ocm_service_version.as_deref().unwrap_or("unknown")
         ),
         format!(
             "ocmServiceVersionStatus: {}",
@@ -451,8 +445,8 @@ fn service_status_raw(summary: &ServiceSummary) -> Vec<String> {
             "ocmServiceVersionNote: {}",
             summary
                 .ocm_service_version_note
-                .clone()
-                .unwrap_or_else(|| "none".to_string())
+                .as_deref()
+                .unwrap_or("none")
         ),
         format!(
             "childPid: {}",
@@ -463,22 +457,13 @@ fn service_status_raw(summary: &ServiceSummary) -> Vec<String> {
         ),
         format!(
             "stdoutPath: {}",
-            summary
-                .stdout_path
-                .clone()
-                .unwrap_or_else(|| "none".to_string())
+            summary.stdout_path.as_deref().unwrap_or("none")
         ),
         format!(
             "stderrPath: {}",
-            summary
-                .stderr_path
-                .clone()
-                .unwrap_or_else(|| "none".to_string())
+            summary.stderr_path.as_deref().unwrap_or("none")
         ),
-        format!(
-            "issue: {}",
-            summary.issue.clone().unwrap_or_else(|| "none".to_string())
-        ),
+        format!("issue: {}", summary.issue.as_deref().unwrap_or("none")),
     ]
 }
 
@@ -704,23 +689,14 @@ fn service_action_raw(summary: &ServiceActionSummary, _command_example: &str) ->
                 .map(|ready| ready.to_string())
                 .unwrap_or_else(|| "none".to_string())
         ),
-        format!(
-            "issue: {}",
-            summary.issue.clone().unwrap_or_else(|| "none".to_string())
-        ),
+        format!("issue: {}", summary.issue.as_deref().unwrap_or("none")),
         format!(
             "stdoutPath: {}",
-            summary
-                .stdout_path
-                .clone()
-                .unwrap_or_else(|| "none".to_string())
+            summary.stdout_path.as_deref().unwrap_or("none")
         ),
         format!(
             "stderrPath: {}",
-            summary
-                .stderr_path
-                .clone()
-                .unwrap_or_else(|| "none".to_string())
+            summary.stderr_path.as_deref().unwrap_or("none")
         ),
     ];
     lines.extend(

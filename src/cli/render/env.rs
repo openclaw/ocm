@@ -24,15 +24,7 @@ pub fn env_protected(name: &str, protected: bool, profile: RenderProfile) -> Vec
         "Environment",
         vec![
             KeyValueRow::accent("Name", name),
-            KeyValueRow::new(
-                "Protected",
-                if protected { "yes" } else { "no" },
-                if protected {
-                    Tone::Warning
-                } else {
-                    Tone::Muted
-                },
-            ),
+            bool_row("Protected", protected),
         ],
         profile.color,
     );
@@ -78,15 +70,7 @@ pub fn env_destroy_preview(
         vec![
             KeyValueRow::plain("Root", summary.root.clone()),
             optional_value_row("Worktree", summary.dev_worktree.clone()),
-            KeyValueRow::new(
-                "Protected",
-                if summary.protected { "yes" } else { "no" },
-                if summary.protected {
-                    Tone::Warning
-                } else {
-                    Tone::Muted
-                },
-            ),
+            bool_row("Protected", summary.protected),
             KeyValueRow::plain("Snapshots", summary.snapshot_count.to_string()),
             KeyValueRow::new(
                 "OCM service",
