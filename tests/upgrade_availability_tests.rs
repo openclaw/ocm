@@ -470,6 +470,133 @@ fn upgrade_preflight_refusal_keeps_tracked_source_running() {
     assert_refused_preflights(false, false);
 }
 
+#[cfg(unix)]
+#[test]
+fn upgrade_preflights_a_registered_runtime_entrypoint_symlink() {
+    for (case, advertised, status) in [
+        ("blocked", true, "blocked"),
+        ("ready", true, "ready"),
+        ("legacy", false, "blocked"),
+    ] {
+        let root = TestDir::new(&format!("upgrade-linked-preflight-{case}"));
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut env = ocm_env(&root);
+        install_fake_node_and_npm(&root, &mut env, "22.22.3");
+        let script = r#"#!/bin/sh
+case "$1" in
+  --version) echo 2026.8.14 ;;
+  update)
+    if [ "$2" = preflight ]; then
+      printf '%s\n' "$5" "$OPENCLAW_STATE_DIR" "$OPENCLAW_CONFIG_PATH" > "$OCM_TEST_PREFLIGHT_OBSERVATION"
+      cat "$OCM_TEST_PREFLIGHT_RECEIPT"
+      exit 0
+    fi
+    : > "$OCM_TEST_UPDATE_FINALIZE_STARTED"
+    printf '{"status":"ok","mode":"finalize","postUpdate":{}}\n'
+    ;;
+  gateway) printf '{"rpc":{"ok":true}}\n' ;;
+esac
+"#;
+        for (name, version) in [("old", "2026.8.13"), ("new", "2026.8.14")] {
+            let package = root.child(format!("packages/{name}"));
+            fs::create_dir_all(&package).unwrap();
+            support::write_executable_script(
+                &package.join("openclaw.mjs"),
+                &script.replace("2026.8.14", version),
+            );
+            let mut manifest = serde_json::json!({"name":"openclaw","version":version});
+            if name == "new" && advertised {
+                manifest["openclaw"] = serde_json::json!({"updatePreflightProtocol":1});
+            }
+            fs::write(package.join("package.json"), manifest.to_string()).unwrap();
+        }
+        let alias = root.child("bin with spaces/openclaw");
+        fs::create_dir_all(alias.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink("../packages/new/openclaw.mjs", &alias).unwrap();
+        // Metadata beside the alias does not describe the executable's package.
+        fs::write(
+            alias.with_file_name("package.json"),
+            r#"{"name":"alias-wrapper","version":"0.0.0"}"#,
+        )
+        .unwrap();
+        for (name, binary) in [
+            ("old", root.child("packages/old/openclaw.mjs")),
+            ("new", alias.clone()),
+        ] {
+            let added = run_ocm(
+                &cwd,
+                &env,
+                &["runtime", "add", name, "--path", &path_string(&binary)],
+            );
+            assert!(added.status.success(), "{}", stderr(&added));
+        }
+        let created = run_ocm(&cwd, &env, &["env", "create", "demo", "--runtime", "old"]);
+        assert!(created.status.success(), "{}", stderr(&created));
+        let environment = ocm::store::get_environment("demo", &env, &cwd).unwrap();
+        let registry = env_registry_path(&env, &cwd).unwrap();
+        let registry_before = fs::read(&registry).unwrap();
+        let observation = root.child("preflight-observation");
+        let receipt = root.child("preflight-receipt.json");
+        let finalizer = root.child("finalizer-started");
+        fs::write(
+            &receipt,
+            preflight_receipt_json(status, "2026.8.14").to_string(),
+        )
+        .unwrap();
+        for (key, path) in [
+            ("OCM_TEST_PREFLIGHT_OBSERVATION", &observation),
+            ("OCM_TEST_PREFLIGHT_RECEIPT", &receipt),
+            ("OCM_TEST_UPDATE_FINALIZE_STARTED", &finalizer),
+        ] {
+            env.insert(key.into(), path_string(path));
+        }
+        let upgraded = run_ocm(
+            &cwd,
+            &env,
+            &["upgrade", "demo", "--runtime", "new", "--json"],
+        );
+        let summary: Value = serde_json::from_slice(&upgraded.stdout)
+            .unwrap_or_else(|_| panic!("{case}: {}", stderr(&upgraded)));
+        assert_eq!(observation.exists(), advertised, "{case}: {summary}");
+        if advertised {
+            assert_preflight_observation(
+                &fs::read_to_string(&observation).unwrap(),
+                &fs::canonicalize(root.child("packages/old")).unwrap(),
+                &serde_json::to_value(&environment).unwrap(),
+            );
+        }
+        let current = ocm::store::get_environment("demo", &env, &cwd).unwrap();
+        if case == "blocked" {
+            assert!(!upgraded.status.success(), "{summary}");
+            assert_eq!(summary["outcome"], "failed", "{summary}");
+            assert!(
+                summary["note"]
+                    .as_str()
+                    .unwrap()
+                    .contains("candidate update preflight blocked"),
+                "{summary}"
+            );
+            assert!(summary["snapshotId"].is_null(), "{summary}");
+            assert_eq!(fs::read(&registry).unwrap(), registry_before);
+            assert_eq!(current.default_runtime.as_deref(), Some("old"));
+            assert!(!finalizer.exists(), "{summary}");
+        } else {
+            assert!(upgraded.status.success(), "{case}: {summary}");
+            assert_eq!(summary["outcome"], "switched", "{case}: {summary}");
+            assert!(summary["snapshotId"].is_string(), "{case}: {summary}");
+            assert_eq!(current.default_runtime.as_deref(), Some("new"));
+            assert!(finalizer.exists(), "{case}: {summary}");
+        }
+        assert_eq!(
+            ocm::store::get_runtime("new", &env, &cwd)
+                .unwrap()
+                .binary_path,
+            path_string(&alias)
+        );
+    }
+}
+
 #[test]
 fn upgrade_preflight_refuses_invalid_receipts_before_explicit_cutover() {
     assert_refused_preflights(false, true);
@@ -902,6 +1029,25 @@ fn upgrade_batch_continue_keeps_gateway_refused_before_cutover() {
         assert!(added.status.success(), "{}", stderr(&added));
     }
 
+    #[cfg(unix)]
+    {
+        let alias = root.child("bin/refused");
+        fs::create_dir_all(alias.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink("../packages/refused/openclaw.mjs", &alias).unwrap();
+        let added = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "runtime",
+                "add",
+                "refused-linked",
+                "--path",
+                &path_string(&alias),
+            ],
+        );
+        assert!(added.status.success(), "{}", stderr(&added));
+    }
+
     // demo runs a supervised Gateway; peer has no installed service.
     let port = health_server.port.to_string();
     for args in [
@@ -996,22 +1142,28 @@ fn upgrade_batch_continue_keeps_gateway_refused_before_cutover() {
     };
 
     // The default policy is continue; a refusal before cutover changes nothing.
-    let refused = batch("refused", &[]);
-    assert_eq!(refused["failurePolicy"], "continue", "{refused}");
-    assert_eq!(desired_running(), true, "{refused}");
-    assert_eq!(health_observation(health_server.port), Some(true));
-    for name in ["demo", "peer"] {
-        let item = result(&refused, name);
-        assert_eq!(item["outcome"], "failed", "{item}");
-        assert!(item["snapshotId"].is_null(), "{item}");
-        assert!(item["rollback"].is_null(), "{item}");
-        let note = item["note"].as_str().unwrap();
-        assert!(note.contains("failed before cutover"), "{note}");
-        assert!(
-            note.contains("candidate update preflight blocked"),
-            "{note}"
-        );
-        assert!(!note.contains("left the gateway stopped"), "{note}");
+    for runtime in [
+        "refused",
+        #[cfg(unix)]
+        "refused-linked",
+    ] {
+        let refused = batch(runtime, &[]);
+        assert_eq!(refused["failurePolicy"], "continue", "{refused}");
+        assert_eq!(desired_running(), true, "{refused}");
+        assert_eq!(health_observation(health_server.port), Some(true));
+        for name in ["demo", "peer"] {
+            let item = result(&refused, name);
+            assert_eq!(item["outcome"], "failed", "{item}");
+            assert!(item["snapshotId"].is_null(), "{item}");
+            assert!(item["rollback"].is_null(), "{item}");
+            let note = item["note"].as_str().unwrap();
+            assert!(note.contains("failed before cutover"), "{note}");
+            assert!(
+                note.contains("candidate update preflight blocked"),
+                "{note}"
+            );
+            assert!(!note.contains("left the gateway stopped"), "{note}");
+        }
     }
 
     // A failure after cutover still leaves the Gateway stopped for recovery.
