@@ -4,6 +4,10 @@ All notable changes to OCM are documented here.
 
 ## Unreleased
 
+### Changed
+
+- Refresh JSON5, HTTP, and ZIP dependencies while preserving Rust 1.88 support and the existing trusted certificate roots.
+
 ### Fixed
 
 - Honor an OpenClaw package's advertised upgrade preflight when a registered target runtime points to its entrypoint through a symlink. Blocked candidates are rejected before source shutdown; ready candidates and packages without the capability retain their existing upgrade behavior.
