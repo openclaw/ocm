@@ -1,6 +1,4 @@
-use crate::runtime::{
-    InstallRuntimeFromOfficialReleaseOptions, OfficialRuntimePrepareAction, RuntimeService,
-};
+use crate::runtime::{InstallRuntimeFromOfficialReleaseOptions, RuntimeService};
 
 use super::{Cli, render};
 
@@ -112,40 +110,17 @@ impl Cli {
                 "release install uses the canonical runtime name \"{runtime_name}\" for this selector"
             ));
         }
-        if let Some(code) = self.ensure_official_release_host_ready(Some(profile), json_flag)? {
-            return Ok(code);
-        }
-
-        let (meta, action) =
-            self.with_progress(format!("Installing runtime {runtime_name}"), || {
-                self.runtime_service().prepare_official_openclaw_runtime(
-                    InstallRuntimeFromOfficialReleaseOptions {
-                        name: runtime_name.clone(),
-                        version,
-                        channel,
-                        description,
-                        force,
-                    },
-                )
-            })?;
-
-        if json_flag {
-            self.print_json(&meta)?;
-            return Ok(0);
-        }
-
-        self.stdout_lines(match action {
-            OfficialRuntimePrepareAction::Installed => {
-                render::runtime::runtime_installed(&meta, profile, &self.command_example())
-            }
-            OfficialRuntimePrepareAction::Reused => {
-                render::runtime::runtime_reused(&meta, profile, &self.command_example())
-            }
-            OfficialRuntimePrepareAction::Updated => {
-                render::runtime::runtime_updated(&meta, profile, &self.command_example())
-            }
-        });
-        Ok(0)
+        self.install_official_runtime(
+            InstallRuntimeFromOfficialReleaseOptions {
+                name: runtime_name,
+                version,
+                channel,
+                description,
+                force,
+            },
+            json_flag,
+            profile,
+        )
     }
 
     pub(super) fn dispatch_release_command(
