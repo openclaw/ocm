@@ -4,6 +4,10 @@ All notable changes to OCM are documented here.
 
 ## Unreleased
 
+### Changed
+
+- Refresh JSON5, HTTP, and ZIP dependencies while preserving Rust 1.88 support and the existing trusted certificate roots.
+
 ### Fixed
 
 - Keep the gateway running when `ocm upgrade batch` refuses an environment before cutover under the default `--failure-policy continue`, as a single-environment upgrade and the rollback policy already did. Failures after cutover still leave the gateway stopped for external recovery, and environments without an installed service no longer report a stopped gateway.
@@ -44,8 +48,6 @@ All notable changes to OCM are documented here.
 - Handle Linux process observations for exited tasks without treating them as running or authorizing signals against them. ([#704](https://github.com/openclaw/ocm/pull/704))
 
 ### Changed
-
-- Refresh JSON5, HTTP, and ZIP dependencies while preserving Rust 1.88 support and the existing trusted certificate roots.
 
 - Refresh Git configuration support to gix-config 0.62.1 while retaining Rust 1.88 support, and update the pinned Rust cache and Python setup actions. Thanks @dependabot (#706, #707).
   ([#738](https://github.com/openclaw/ocm/pull/738))
