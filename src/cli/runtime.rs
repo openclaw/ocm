@@ -4,6 +4,7 @@ use crate::runtime::{
     OfficialRuntimePrepareAction, RuntimeService, UpdateRuntimeFromReleaseOptions,
 };
 
+use super::render::RenderProfile;
 use super::{Cli, render};
 
 impl Cli {
@@ -224,41 +225,17 @@ impl Cli {
                     );
                 }
                 let name = resolve_official_name()?;
-                if let Some(code) =
-                    self.ensure_official_release_host_ready(Some(profile), json_flag)?
-                {
-                    return Ok(code);
-                }
-                let (meta, action) =
-                    self.with_progress(format!("Installing runtime {name}"), || {
-                        self.runtime_service().prepare_official_openclaw_runtime(
-                            InstallRuntimeFromOfficialReleaseOptions {
-                                name: name.clone(),
-                                version,
-                                channel,
-                                description,
-                                force,
-                            },
-                        )
-                    })?;
-
-                if json_flag {
-                    self.print_json(&meta)?;
-                    return Ok(0);
-                }
-
-                self.stdout_lines(match action {
-                    OfficialRuntimePrepareAction::Installed => {
-                        render::runtime::runtime_installed(&meta, profile, &self.command_example())
-                    }
-                    OfficialRuntimePrepareAction::Reused => {
-                        render::runtime::runtime_reused(&meta, profile, &self.command_example())
-                    }
-                    OfficialRuntimePrepareAction::Updated => {
-                        render::runtime::runtime_updated(&meta, profile, &self.command_example())
-                    }
-                });
-                return Ok(0);
+                return self.install_official_runtime(
+                    InstallRuntimeFromOfficialReleaseOptions {
+                        name,
+                        version,
+                        channel,
+                        description,
+                        force,
+                    },
+                    json_flag,
+                    profile,
+                );
             }
             (None, None, None) => {
                 return Err(
@@ -279,6 +256,41 @@ impl Cli {
             profile,
             &self.command_example(),
         ));
+        Ok(0)
+    }
+
+    pub(super) fn install_official_runtime(
+        &self,
+        options: InstallRuntimeFromOfficialReleaseOptions,
+        json_flag: bool,
+        profile: RenderProfile,
+    ) -> Result<i32, String> {
+        if let Some(code) = self.ensure_official_release_host_ready(Some(profile), json_flag)? {
+            return Ok(code);
+        }
+
+        let (meta, action) =
+            self.with_progress(format!("Installing runtime {}", options.name), || {
+                self.runtime_service()
+                    .prepare_official_openclaw_runtime(options)
+            })?;
+
+        if json_flag {
+            self.print_json(&meta)?;
+            return Ok(0);
+        }
+
+        self.stdout_lines(match action {
+            OfficialRuntimePrepareAction::Installed => {
+                render::runtime::runtime_installed(&meta, profile, &self.command_example())
+            }
+            OfficialRuntimePrepareAction::Reused => {
+                render::runtime::runtime_reused(&meta, profile, &self.command_example())
+            }
+            OfficialRuntimePrepareAction::Updated => {
+                render::runtime::runtime_updated(&meta, profile, &self.command_example())
+            }
+        });
         Ok(0)
     }
 
