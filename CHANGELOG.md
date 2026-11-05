@@ -45,6 +45,8 @@ All notable changes to OCM are documented here.
 
 ### Changed
 
+- Refresh JSON5, HTTP, and ZIP dependencies while preserving Rust 1.88 support and the existing trusted certificate roots.
+
 - Refresh Git configuration support to gix-config 0.62.1 while retaining Rust 1.88 support, and update the pinned Rust cache and Python setup actions. Thanks @dependabot (#706, #707).
   ([#738](https://github.com/openclaw/ocm/pull/738))
 - Update the embedded certificate roots to webpki-roots 1.0.11, removing emSign C1/C3 authorities from OCM downloads. Connections whose only authority is a retired root now fail verification. Thanks @joshavant. ([#704](https://github.com/openclaw/ocm/pull/704))
