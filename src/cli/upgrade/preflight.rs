@@ -53,7 +53,15 @@ impl Cli {
         locks: &UpgradeCommandLocks<'_>,
     ) -> Result<(), String> {
         let generation = crate::infra::interrupt::generation();
-        let package_root = prepared_binary
+        // Resolve entrypoint links for package discovery only. Legacy standalone
+        // artifacts can still have an unpublished entrypoint during preparation.
+        let entrypoint = if prepared_binary.is_symlink() {
+            std::fs::canonicalize(prepared_binary)
+                .map_err(|error| format!("could not inspect candidate package: {error}"))?
+        } else {
+            prepared_binary.to_path_buf()
+        };
+        let package_root = entrypoint
             .parent()
             .ok_or("candidate entrypoint has no package directory")?;
         if !package_root.join("package.json").exists() {
