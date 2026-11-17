@@ -1,0 +1,31 @@
+Cloning into 'repo'...
+Note: switching to '6879db78f36bd86adfe2f6dec860d2b8520aa8d2'.
+
+You are in 'detached HEAD' state. You can look around, make experimental
+changes and commit them, and you can discard any commits you make in this
+state without impacting any branches by switching back to a branch.
+
+If you want to create a new branch to retain commits you create, you may
+do so (now or later) by using -c with the switch command. Example:
+
+  git switch -c <new-branch-name>
+
+Or undo this operation with:
+
+  git switch -
+
+Turn off this advice by setting config variable advice.detachedHead to false
+
+BASE
+6879db78f36bd86adfe2f6dec860d2b8520aa8d2
+PATCH_AND_LOCK
+9b018aaa4fd98ac2911c62ee88be6655afba1863
+e65ce614f7367356f9b4bd8127b316dc2197fcff
+Linux 7.0.0-1014-aws x86_64
+git version 2.53.0
+Python 3.14.4
+PASS: remote git diff --check HEAD
+PASS: only template HTML comments changed; all noncomment bytes, four headings, maintainer-edit requirement, checklists, impact/rationale and literal problem prompt preserved.
+Candidate template blob: 7ed808961706510c127820718f5818d62bfec303
+ .github/pull_request_template.md | 44 +++++++++++++++++++++++++---------------
+ 1 file changed, 28 insertions(+), 16 deletions(-)
