@@ -44,6 +44,21 @@ pub(crate) fn ensure_dir(path: &Path) -> Result<(), String> {
     fs::create_dir_all(path).map_err(|error| error.to_string())
 }
 
+/// Keep new managed paths private without changing existing directory modes.
+pub(crate) fn ensure_private_dir_on_create(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+            .map_err(|error| error.to_string())
+    }
+    #[cfg(not(unix))]
+    ensure_dir(path)
+}
+
 #[derive(Debug)]
 pub(crate) struct ExclusiveFileLock {
     file: File,
