@@ -6,6 +6,7 @@ All notable changes to OCM are documented here.
 
 ### Changed
 
+- Refresh HTTP downloads to ureq 3.5.2 and ZIP handling to zip 9.5.1 while retaining Rust 1.88 support. Thanks @dependabot (#1012, #1013).
 - Refresh JSON5, HTTP, and ZIP dependencies while preserving Rust 1.88 support and the existing trusted certificate roots.
 
 ### Fixed
