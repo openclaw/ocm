@@ -5453,6 +5453,51 @@ fn set_mode(path: &Path, mode: u32) {
 }
 
 #[cfg(unix)]
+#[test]
+fn fresh_environment_creation_keeps_its_state_ancestors_private() {
+    let root = TestDir::new("fresh-environment-modes");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let store = root.child("new-store");
+    let mut env = ocm_env(&root);
+    env.insert("OCM_HOME".into(), store.to_string_lossy().into_owned());
+
+    let create = run_ocm_with_umask(&cwd, &env, 0o002, &["env", "create", "fresh"]);
+    assert!(create.status.success(), "{}", stderr(&create));
+    for path in [
+        store.clone(),
+        store.join("envs"),
+        store.join("envs/fresh"),
+        store.join("envs/fresh/.openclaw"),
+    ] {
+        assert_eq!(directory_mode(&path), 0o700, "{}", path.display());
+    }
+
+    let external = root.child("existing-env");
+    fs::create_dir(&external).unwrap();
+    for path in [&store, &store.join("envs"), &external] {
+        set_mode(path, 0o750);
+    }
+    let create = run_ocm_with_umask(
+        &cwd,
+        &env,
+        0o002,
+        &[
+            "env",
+            "create",
+            "existing",
+            "--root",
+            external.to_str().unwrap(),
+        ],
+    );
+    assert!(create.status.success(), "{}", stderr(&create));
+    for path in [&store, &store.join("envs"), &external] {
+        assert_eq!(directory_mode(path), 0o750, "{}", path.display());
+    }
+    assert_eq!(directory_mode(&external.join(".openclaw")), 0o700);
+}
+
+#[cfg(unix)]
 const COPIED_DIRECTORY_MODES: [(&str, u32); 7] = [
     ("", 0o700),
     ("agents/main/agent", 0o700),

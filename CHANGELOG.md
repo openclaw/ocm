@@ -11,6 +11,7 @@ All notable changes to OCM are documented here.
 
 ### Fixed
 
+- Create new managed environment and state directories privately on Unix, so a group-writable shell umask cannot prevent OpenClaw Gateway startup. Existing directory permissions are preserved.
 - Honor an OpenClaw package's advertised upgrade preflight when a registered target runtime points to its entrypoint through a symlink. Blocked candidates are rejected before source shutdown; ready candidates and packages without the capability retain their existing upgrade behavior.
 - Keep the gateway running when `ocm upgrade batch` refuses an environment before cutover under the default `--failure-policy continue`, as a single-environment upgrade and the rollback policy already did. Failures after cutover still leave the gateway stopped for external recovery, and environments without an installed service no longer report a stopped gateway.
 - Remove the incomplete environment root and import staging when `env clone` or `env import` is stopped by SIGINT, SIGTERM or SIGHUP, and exit with status 130. Retrying the same name now succeeds instead of failing on a non-empty root that no OCM command could remove. Signals ignored at startup, as under `nohup`, stay ignored.

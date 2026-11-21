@@ -19,8 +19,8 @@ use serde::{Deserialize, Serialize};
 use std::os::unix::fs::DirBuilderExt;
 
 use super::common::{
-    copy_dir_with_sqlite_snapshots, copy_environment_dir, copy_path, ensure_dir, path_exists,
-    read_json, write_json,
+    copy_dir_with_sqlite_snapshots, copy_environment_dir, copy_path, ensure_dir,
+    ensure_private_dir_on_create, path_exists, read_json, write_json,
 };
 use super::dev_sources::{DevSourceRemoval, ensure_root_outside_dev_sources};
 use super::gateway_ports::{
@@ -888,8 +888,9 @@ fn create_environment_with_runtime_validation(
         env,
         cwd,
     )?;
-    ensure_dir(&paths.root)?;
-    ensure_dir(&paths.state_dir)?;
+    // OpenClaw validates the ancestors of its state-backed temporary directory.
+    ensure_private_dir_on_create(&paths.root)?;
+    ensure_private_dir_on_create(&paths.state_dir)?;
     ensure_dir(&paths.workspace_dir)?;
 
     let created_at = now_utc();

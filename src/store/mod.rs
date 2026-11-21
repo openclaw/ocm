@@ -151,8 +151,8 @@ pub fn now_utc() -> OffsetDateTime {
 
 pub fn ensure_store(env: &BTreeMap<String, String>, cwd: &Path) -> Result<StorePaths, String> {
     let stores = resolve_store_paths(env, cwd)?;
-    ensure_dir(&stores.home)?;
-    ensure_dir(&stores.envs_dir)?;
+    common::ensure_private_dir_on_create(&stores.home)?;
+    common::ensure_private_dir_on_create(&stores.envs_dir)?;
     ensure_dir(&stores.launchers_dir)?;
     ensure_dir(&stores.runtimes_dir)?;
     ensure_dir(&stores.snapshots_dir)?;
