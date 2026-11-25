@@ -4,6 +4,10 @@ All notable changes to OCM are documented here.
 
 ## Unreleased
 
+### Added
+
+- Add `env clone --keep-identity` to copy OpenClaw's local client credentials along with the state database they are bound to. Without them, current OpenClaw refuses `doctor --fix` and state migrations in the clone ("Local credentials are missing"). The default clone still resets identity.
+
 ### Changed
 
 - Refresh HTTP downloads to ureq 3.5.2 and ZIP handling to zip 9.5.1 while retaining Rust 1.88 support. Thanks @dependabot (#1012, #1013).

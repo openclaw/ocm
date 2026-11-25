@@ -1288,7 +1288,7 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
             "Clone an environment",
             "Copy an environment root and metadata into a new isolated environment.",
             vec![format!(
-                "{cmd} env clone <source> <target> [--root <path>] [--sandbox-origin <url>] [--raw] [--json]"
+                "{cmd} env clone <source> <target> [--root <path>] [--sandbox-origin <url>] [--keep-identity] [--raw] [--json]"
             )],
             &[
                 (
@@ -1300,6 +1300,10 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
                     "Set the clone's dedicated public MCP app sandbox origin",
                 ),
                 (
+                    "--keep-identity",
+                    "Keep OpenClaw's local client credentials so the clone passes doctor and state migrations",
+                ),
+                (
                     "--raw",
                     "Force plain line output instead of the TTY receipt view",
                 ),
@@ -1308,6 +1312,7 @@ pub fn env_command_help(cmd: &str, action: &str) -> Option<String> {
             vec![format!("{cmd} env clone mira rowan")],
             &[
                 "Clone resets environment identity while preserving the copied workspace and env config.",
+                "--keep-identity copies the client credentials that the copied state database is bound to. The clone then shares the source's device identity, so do not run both against the same paired clients.",
                 "Dev source bindings are not copied.",
                 "The new root must not equal, contain, or sit inside any registered environment root, including aliases. It must also stay clear of OCM_HOME itself and the store directories OCM keeps there, such as runtimes and snapshots. Protection flags do not permit overlap.",
                 "OCM checks root overlap before creating or copying environment state.",

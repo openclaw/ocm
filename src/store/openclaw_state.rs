@@ -3528,6 +3528,7 @@ impl<'a> OpenClawSqliteCopy<'a> {
         matches!(
             components.as_slice(),
             ["state", "openclaw.sqlite" | "openclaw-quarantine.sqlite"]
+                | ["client", "credentials.sqlite"]
                 | ["agents", _, "agent", "openclaw-agent.sqlite"]
                 | ["plugins", "workboard", "workboard.sqlite"]
                 | ["plugins", "team-reports", "team-reports.sqlite"]

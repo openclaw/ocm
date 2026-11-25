@@ -1602,6 +1602,7 @@ mod tests {
         }
         let operational = [
             "state/openclaw-quarantine.sqlite",
+            "client/credentials.sqlite",
             "agents/main/agent/openclaw-agent.sqlite",
             "plugins/workboard/workboard.sqlite",
             "plugins/team-reports/team-reports.sqlite",

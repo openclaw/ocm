@@ -158,6 +158,7 @@ fn clone_environment_normalizes_relative_custom_root() {
             source_name: "source".to_string(),
             name: "target".to_string(),
             root: Some("./env-clones/../env-clones/target".to_string()),
+            keep_identity: false,
         },
         &env,
         &cwd,
