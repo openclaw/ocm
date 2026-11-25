@@ -787,10 +787,16 @@ fn clone_environment_keeps_client_credentials_only_when_requested() {
     )
     .unwrap();
     let source_root = std::path::Path::new(&source.root);
-    write_text(
-        &source_root.join(".openclaw/client/credentials.sqlite"),
-        "synthetic credential store",
-    );
+    let credentials_path = source_root.join(".openclaw/client/credentials.sqlite");
+    fs::create_dir_all(credentials_path.parent().unwrap()).unwrap();
+    // OpenClaw keeps this store in DELETE journal mode; the copy must be a
+    // coherent SQLite snapshot, not loose database and journal files.
+    Connection::open(&credentials_path)
+        .unwrap()
+        .execute_batch(
+            "PRAGMA journal_mode=DELETE; CREATE TABLE identity(id); INSERT INTO identity VALUES('primary');",
+        )
+        .unwrap();
 
     for (name, keep_identity) in [("reset", false), ("kept", true)] {
         let cloned = clone_environment(
@@ -807,6 +813,14 @@ fn clone_environment_keeps_client_credentials_only_when_requested() {
         let credentials =
             std::path::Path::new(&cloned.root).join(".openclaw/client/credentials.sqlite");
         assert_eq!(credentials.exists(), keep_identity, "{name}");
+        if keep_identity {
+            let copied =
+                Connection::open_with_flags(&credentials, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .unwrap()
+                    .query_row("SELECT id FROM identity", [], |row| row.get::<_, String>(0))
+                    .unwrap();
+            assert_eq!(copied, "primary");
+        }
     }
 }
 
