@@ -237,6 +237,9 @@ pub struct CloneEnvironmentOptions {
     pub source_name: String,
     pub name: String,
     pub root: Option<String>,
+    /// Keep OpenClaw's local client credentials, which the copied state
+    /// database is bound to. The clone then shares the source's device identity.
+    pub keep_identity: bool,
 }
 
 #[derive(Clone, Debug)]

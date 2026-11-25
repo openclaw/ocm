@@ -602,6 +602,7 @@ impl Cli {
         let (args, root) = Self::consume_option(args, "--root")?;
         let (args, sandbox_origin) = Self::consume_option(args, "--sandbox-origin")?;
         let sandbox_origin = Self::require_option_value(sandbox_origin, "--sandbox-origin")?;
+        let (args, keep_identity) = Self::consume_flag(args, "--keep-identity");
         let Some(source_name) = args.first() else {
             return Err("source environment name is required".to_string());
         };
@@ -622,6 +623,7 @@ impl Cli {
                         source_name: source_name.clone(),
                         name: target_name.clone(),
                         root,
+                        keep_identity,
                     },
                     sandbox_origin,
                 )

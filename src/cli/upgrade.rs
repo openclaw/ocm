@@ -2084,6 +2084,7 @@ impl Cli {
                 source_name: source_name.to_string(),
                 name: simulation_name.clone(),
                 root: None,
+                keep_identity: false,
             })?;
         let setup = (|| {
             let (_, _lock) = self.environment_service().lock_simulation(&cloned)?;

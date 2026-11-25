@@ -980,6 +980,7 @@ fn clone_environment_with_policy(
     cwd: &Path,
 ) -> Result<CloneEnvironmentResult, String> {
     let sandbox_origin = normalize_new_environment_sandbox_origin(sandbox_origin)?;
+    let keep_identity = options.keep_identity;
     let source_name = validate_name(&options.source_name, "Environment name")?;
     let name = validate_name(&options.name, "Environment name")?;
     let _lock = lock_env_registry_until_cancelled(env, cwd)?;
@@ -1063,6 +1064,16 @@ fn clone_environment_with_policy(
         preserved_files.extend(super::openclaw_state::cloned_shared_database_paths(
             &target_paths,
         )?);
+        if keep_identity {
+            // The copied state database is bound to these local credentials;
+            // without them OpenClaw refuses the clone's state migrations.
+            let client = target_paths.state_dir.join("client");
+            if path_exists(&client) {
+                for entry in fs::read_dir(&client).map_err(|error| error.to_string())? {
+                    preserved_files.insert(entry.map_err(|error| error.to_string())?.path());
+                }
+            }
+        }
         let created_at = now_utc();
         let target_runtime = OpenClawWorkspaceRuntime::for_env(&name, Some(gateway_port));
         if matches!(policy, CloneEnvironmentPolicy::Standard) {
@@ -2515,6 +2526,7 @@ mod tests {
                 source_name: "source".to_string(),
                 name: "blocked-simulation".to_string(),
                 root: Some(nested.display().to_string()),
+                keep_identity: false,
             },
             &env,
             &cwd,
@@ -2539,6 +2551,7 @@ mod tests {
                 source_name: "source".to_string(),
                 name: "shared-simulation".to_string(),
                 root: None,
+                keep_identity: false,
             },
             &env,
             &cwd,
@@ -2567,6 +2580,7 @@ mod tests {
                 source_name: "source".to_string(),
                 name: "simulation".to_string(),
                 root: None,
+                keep_identity: false,
             },
             &env,
             &cwd,

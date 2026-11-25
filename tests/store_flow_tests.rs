@@ -370,6 +370,7 @@ fn environment_clone_copies_the_root_and_resets_identity_metadata() {
             source_name: "source".to_string(),
             name: "target".to_string(),
             root: None,
+            keep_identity: false,
         },
         &env,
         &cwd,
@@ -427,6 +428,7 @@ fn clone_environment_skips_busy_ports_when_assigning_a_new_identity() {
             source_name: source.name,
             name: "target".to_string(),
             root: None,
+            keep_identity: false,
         },
         &env,
         &cwd,
@@ -467,6 +469,7 @@ fn clone_environment_assigns_a_new_port_when_the_source_port_was_auto_assigned()
             source_name: source.name,
             name: "target".to_string(),
             root: None,
+            keep_identity: false,
         },
         &env,
         &cwd,
@@ -515,6 +518,7 @@ fn clone_environment_skips_the_global_openclaw_port_family() {
             source_name: source.name,
             name: "target".to_string(),
             root: None,
+            keep_identity: false,
         },
         &env,
         &cwd,
@@ -576,6 +580,7 @@ fn clone_environment_rewrites_env_scoped_config_paths_and_ports() {
             source_name: "source".to_string(),
             name: "target".to_string(),
             root: None,
+            keep_identity: false,
         },
         &env,
         &cwd,
@@ -643,6 +648,7 @@ fn clone_environment_materializes_a_config_symlink_without_rewriting_its_target(
             source_name: "source".to_string(),
             name: "target".to_string(),
             root: None,
+            keep_identity: false,
         },
         &env,
         &cwd,
@@ -731,6 +737,7 @@ fn clone_environment_clears_copied_runtime_state_outside_workspace_and_config() 
             source_name: "source".to_string(),
             name: "target".to_string(),
             root: None,
+            keep_identity: false,
         },
         &env,
         &cwd,
@@ -752,6 +759,54 @@ fn clone_environment_clears_copied_runtime_state_outside_workspace_and_config() 
     assert!(!cloned_root.join(".openclaw/openclaw.json.bak").exists());
     if let Ok(config_raw) = fs::read_to_string(cloned_root.join(".openclaw/openclaw.json")) {
         assert!(!config_raw.contains(&source_root.display().to_string()));
+    }
+}
+
+#[test]
+fn clone_environment_keeps_client_credentials_only_when_requested() {
+    let root = TestDir::new("store-env-clone-keep-identity");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    add_test_launcher("stable", &env, &cwd);
+
+    let source = create_environment(
+        CreateEnvironmentOptions {
+            name: "source".to_string(),
+            root: None,
+            gateway_port: Some(19789),
+            service_enabled: false,
+            service_running: false,
+            default_runtime: None,
+            default_launcher: Some("stable".to_string()),
+            dev: None,
+            protected: false,
+        },
+        &env,
+        &cwd,
+    )
+    .unwrap();
+    let source_root = std::path::Path::new(&source.root);
+    write_text(
+        &source_root.join(".openclaw/client/credentials.sqlite"),
+        "synthetic credential store",
+    );
+
+    for (name, keep_identity) in [("reset", false), ("kept", true)] {
+        let cloned = clone_environment(
+            CloneEnvironmentOptions {
+                source_name: "source".to_string(),
+                name: name.to_string(),
+                root: None,
+                keep_identity,
+            },
+            &env,
+            &cwd,
+        )
+        .unwrap();
+        let credentials =
+            std::path::Path::new(&cloned.root).join(".openclaw/client/credentials.sqlite");
+        assert_eq!(credentials.exists(), keep_identity, "{name}");
     }
 }
 

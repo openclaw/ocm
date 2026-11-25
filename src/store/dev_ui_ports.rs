@@ -381,6 +381,7 @@ mod tests {
                 source_name: original.name.clone(),
                 name: "cloned".to_string(),
                 root: None,
+                keep_identity: false,
             },
             &env,
             root.path(),
